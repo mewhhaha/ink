@@ -37,12 +37,19 @@ const REQUIRED_PEN_RUNTIME_FILES: &[&str] = &[
 
 const OPTIONAL_PEN_NOTICE_FILES: &[&str] = &["LICENSE", "THIRD_PARTY_NOTICES.md"];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DemoAssets {
+    Empty,
+    ProceduralPbr3d,
+}
+
 struct PenDemoSpec {
     slug: &'static str,
     title: &'static str,
     summary: &'static str,
     controls: &'static str,
     file: &'static str,
+    assets: DemoAssets,
 }
 
 struct WasmExampleSpec {
@@ -57,11 +64,36 @@ struct WasmExampleSpec {
 
 const PEN_DEMOS: &[PenDemoSpec] = &[
     PenDemoSpec {
+        slug: "mini_doom",
+        title: "Mini Doom — Corridor Blaster",
+        summary: "Playable 3D retro corridor shooter with plasma bolts, dynamic lights, cyber-demons, and minimap.",
+        controls: "WASD / Arrows or on-screen controls to move & turn, drag viewport to look, Space or click to fire.",
+        file: "examples/mini_doom.blot",
+        assets: DemoAssets::ProceduralPbr3d,
+    },
+    PenDemoSpec {
+        slug: "mini_minecraft",
+        title: "Mini Minecraft — Voxel Island",
+        summary: "Interactive 3D voxel island with raycast mining & building, trees, glowing lanterns, and day/night.",
+        controls: "Click or tap blocks to mine/build; pick blocks & Day/Night on the left; drag or Q/E to orbit.",
+        file: "examples/mini_minecraft.blot",
+        assets: DemoAssets::ProceduralPbr3d,
+    },
+    PenDemoSpec {
+        slug: "gi_lighting",
+        title: "3D GI & Lighting Scenarios",
+        summary: "Live 3D sanctuary switching between Sunlit DDGI, Cornell bounce, 48-Light Night, Volumetric Dusk, and Neon LTC.",
+        controls: "Switch lighting scenarios (1–5), toggle DDGI / RT tiers, adjust Sun Angle & Fog, or drag to orbit.",
+        file: "examples/gi_lighting.blot",
+        assets: DemoAssets::ProceduralPbr3d,
+    },
+    PenDemoSpec {
         slug: "sketch_ui",
         title: "Drawful Sketch UI",
         summary: "Hand-drawn immediate-mode widgets, 5 fps line boil, themes, and a doodle pad.",
         controls: "Click or press Tab / Shift+Tab, Arrows, and Enter to use widgets; draw inside the chalkboard pad.",
         file: "examples/sketch_ui.blot",
+        assets: DemoAssets::Empty,
     },
     PenDemoSpec {
         slug: "d2_lighting",
@@ -69,6 +101,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "2D rigid body casting real-time global illumination shadows around a wall.",
         controls: "Click anywhere in the room to launch the glowing orb across the wall.",
         file: "examples/d2_lighting.blot",
+        assets: DemoAssets::Empty,
     },
     PenDemoSpec {
         slug: "physics_sandbox",
@@ -76,6 +109,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "Wireframe rigid-body crate tower hit by a swinging distance-joint pendulum.",
         controls: "Press KICK! or RESET, toggle AUTO ORBIT, and adjust GRAVITY or CAM YAW.",
         file: "examples/physics_sandbox.blot",
+        assets: DemoAssets::Empty,
     },
     PenDemoSpec {
         slug: "nav_playground",
@@ -83,6 +117,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "Convex polygon navmesh, A* corridor, funnel path, and six ORCA crowd agents.",
         controls: "Click anywhere in the arena to move the goal; tweak CLEARANCE or click SWAP.",
         file: "examples/nav_playground.blot",
+        assets: DemoAssets::Empty,
     },
     PenDemoSpec {
         slug: "ik_rig",
@@ -90,6 +125,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "Two-bone analytic IK and a 6-bone FABRIK chain tracking a spring target.",
         controls: "Move the pointer across the stage, click for trauma shake, or adjust sliders.",
         file: "examples/ik_rig.blot",
+        assets: DemoAssets::Empty,
     },
 ];
 
@@ -707,6 +743,252 @@ fn render_wasm_example_html(
     }))
 }
 
+const GLOW_WGSL: &str = r#"struct Scene {
+  view: mat4x4f,
+  projection: mat4x4f,
+};
+struct Draw {
+  model: mat4x4f,
+  normal: mat4x4f,
+  color: vec4f,
+  settings: vec4f,
+  parameters: vec4f,
+  extra: array<vec4f, 32>,
+  surface: array<vec4f, 5>,
+};
+@group(0) @binding(0) var<uniform> scene: Scene;
+@group(1) @binding(0) var<uniform> draw: Draw;
+
+@vertex fn vertex(@location(0) position: vec3f) -> @builtin(position) vec4f {
+  return scene.projection * scene.view * draw.model * vec4f(position, 1.0);
+}
+
+@fragment fn fragment() -> @location(0) vec4f {
+  let boost = max(1.0, max(draw.surface[4].w, draw.parameters.x));
+  return vec4f(draw.color.rgb * boost, draw.color.a);
+}
+"#;
+
+fn find_pen_lit_shader(root: &Path) -> Result<PathBuf> {
+    if let Ok(pen_root) = std::env::var("PEN_ROOT") {
+        let p = PathBuf::from(pen_root).join("crates/pen/templates/new/src/assets/lit.wgsl");
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    let candidate = root.join("../pen/crates/pen/templates/new/src/assets/lit.wgsl");
+    ensure!(
+        candidate.is_file(),
+        "sibling Pen lit.wgsl shader not found at {}",
+        candidate.display()
+    );
+    Ok(candidate)
+}
+
+fn generate_unit_box_mesh_json() -> String {
+    let positions: [f32; 72] = [
+        0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, -0.5, -0.5, -0.5, -0.5,
+        -0.5, 0.5, -0.5, 0.5, 0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, -0.5,
+        -0.5, 0.5, -0.5, -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, -0.5, 0.5, -0.5, -0.5, 0.5, -0.5,
+        -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, -0.5, -0.5, -0.5, -0.5,
+        -0.5, -0.5, 0.5, -0.5, 0.5, 0.5, -0.5,
+    ];
+    let normals: [f32; 72] = [
+        1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0,
+        -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+        0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0,
+        0.0, -1.0,
+    ];
+    let uvs: [f32; 48] = [
+        0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0,
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0,
+    ];
+    let indices: [u32; 36] = [
+        0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11, 12, 13, 14, 12, 14, 15, 16, 17,
+        18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
+    ];
+    serde_json::json!({
+        "positions": positions.as_slice(),
+        "normals": normals.as_slice(),
+        "uvs": uvs.as_slice(),
+        "indices": indices.as_slice(),
+    })
+    .to_string()
+}
+
+fn generate_unit_sphere_mesh_json(lon_segs: u32, lat_segs: u32) -> String {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    let radius = 0.5_f32;
+    for lat in 0..=lat_segs {
+        let v = lat as f32 / lat_segs as f32;
+        let theta = v * std::f32::consts::PI;
+        let st = theta.sin();
+        let ct = theta.cos();
+        for lon in 0..=lon_segs {
+            let u = lon as f32 / lon_segs as f32;
+            let phi = u * std::f32::consts::TAU;
+            let nx = st * phi.cos();
+            let ny = ct;
+            let nz = st * phi.sin();
+            positions.extend_from_slice(&[nx * radius, ny * radius, nz * radius]);
+            normals.extend_from_slice(&[nx, ny, nz]);
+            uvs.extend_from_slice(&[u, v]);
+        }
+    }
+    let stride = lon_segs + 1;
+    for lat in 0..lat_segs {
+        for lon in 0..lon_segs {
+            let v00 = lat * stride + lon;
+            let v01 = v00 + 1;
+            let v10 = v00 + stride;
+            let v11 = v10 + 1;
+            indices.extend_from_slice(&[v00, v01, v10, v01, v11, v10]);
+        }
+    }
+    serde_json::json!({
+        "positions": positions,
+        "normals": normals,
+        "uvs": uvs,
+        "indices": indices,
+    })
+    .to_string()
+}
+
+fn write_procedural_pbr_assets(root: &Path, assets_dir: &Path) -> Result<()> {
+    let lit_src = find_pen_lit_shader(root)?;
+    copy_file_checked(&lit_src, &assets_dir.join("lit.wgsl"))?;
+    std::fs::write(assets_dir.join("glow.wgsl"), GLOW_WGSL)?;
+    std::fs::write(
+        assets_dir.join("box.mesh.json"),
+        generate_unit_box_mesh_json(),
+    )?;
+    std::fs::write(
+        assets_dir.join("sphere.mesh.json"),
+        generate_unit_sphere_mesh_json(20, 10),
+    )?;
+
+    // Shared procedural PBR & emissive material table (indices 0..=18).
+    let materials: &[(&str, serde_json::Value)] = &[
+        (
+            "stone.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.46, 0.48, 0.52, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "dark_stone.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.20, 0.22, 0.27, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "grass.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.30, 0.62, 0.24, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "dirt.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.46, 0.30, 0.18, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "wood.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.56, 0.37, 0.21, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "leaves.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.20, 0.48, 0.19, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "brick.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.64, 0.27, 0.22, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "sand.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.84, 0.76, 0.52, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "water.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.14, 0.54, 0.78, 0.80], "lighting": "lit", "blend": true }),
+        ),
+        (
+            "plaster.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.88, 0.86, 0.82, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "crimson.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.78, 0.14, 0.14, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "emerald.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.14, 0.68, 0.26, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "gold.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.92, 0.74, 0.26, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "cobalt.material.json",
+            serde_json::json!({ "shader": "lit.wgsl", "color": [0.22, 0.44, 0.84, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "glow_amber.material.json",
+            serde_json::json!({ "shader": "glow.wgsl", "color": [1.0, 0.68, 0.22, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 4.5 } }),
+        ),
+        (
+            "glow_cyan.material.json",
+            serde_json::json!({ "shader": "glow.wgsl", "color": [0.22, 0.90, 1.0, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 5.0 } }),
+        ),
+        (
+            "glow_crimson.material.json",
+            serde_json::json!({ "shader": "glow.wgsl", "color": [1.0, 0.22, 0.26, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 5.0 } }),
+        ),
+        (
+            "glow_violet.material.json",
+            serde_json::json!({ "shader": "glow.wgsl", "color": [0.74, 0.34, 1.0, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 4.5 } }),
+        ),
+        (
+            "glow_white.material.json",
+            serde_json::json!({ "shader": "glow.wgsl", "color": [1.0, 0.97, 0.92, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 5.5 } }),
+        ),
+    ];
+
+    let mut mat_names = Vec::with_capacity(materials.len());
+    for (name, val) in materials {
+        std::fs::write(assets_dir.join(name), val.to_string() + "\n")?;
+        mat_names.push(*name);
+    }
+
+    let catalog = serde_json::json!({
+        "meshes": ["box.mesh.json", "sphere.mesh.json"],
+        "materials": mat_names,
+        "sounds": [],
+    });
+    std::fs::write(
+        assets_dir.join("catalog.json"),
+        serde_json::to_string_pretty(&catalog)? + "\n",
+    )?;
+    Ok(())
+}
+
+fn copy_assets_dir(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_assets_dir(&path, &target)?;
+        } else if path.is_file() {
+            std::fs::copy(&path, &target)
+                .with_context(|| format!("copying {} -> {}", path.display(), target.display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_pen_demo(
     root: &Path,
@@ -721,12 +1003,20 @@ fn build_pen_demo(
 ) -> Result<()> {
     let proj = staging_root.join(spec.slug);
     let _ = std::fs::remove_dir_all(&proj);
-    std::fs::create_dir_all(proj.join("src/assets"))?;
+    let assets_dir = proj.join("src/assets");
+    std::fs::create_dir_all(&assets_dir)?;
     copy_file_checked(&root.join(spec.file), &proj.join("src/main.blot"))?;
-    std::fs::write(
-        proj.join("src/assets/catalog.json"),
-        "{\"meshes\":[],\"materials\":[]}\n",
-    )?;
+    match spec.assets {
+        DemoAssets::Empty => {
+            std::fs::write(
+                assets_dir.join("catalog.json"),
+                "{\"meshes\":[],\"materials\":[]}\n",
+            )?;
+        }
+        DemoAssets::ProceduralPbr3d => {
+            write_procedural_pbr_assets(root, &assets_dir)?;
+        }
+    }
     let pen_json = serde_json::json!({
         "game": { "name": spec.slug, "title": format!("Ink — {}", spec.title) },
         "plugins": {
@@ -787,6 +1077,7 @@ fn build_pen_demo(
 
     let demo_out = out_dir.join("demos").join(spec.slug);
     std::fs::create_dir_all(demo_out.join("assets"))?;
+    copy_assets_dir(&export_dir.join("assets"), &demo_out.join("assets"))?;
     for name in ["game.wasm", "catalog.json", "game.json"] {
         copy_file_checked(&export_dir.join(name), &demo_out.join(name))?;
     }

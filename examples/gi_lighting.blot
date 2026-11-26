@@ -1,0 +1,423 @@
+// Interactive 3D GI & Lighting Scenarios showcase for Pen (native + web).
+// Switches live between 5 architectural lighting setups:
+//   0: Sunlit DDGI Atrium (physical sky, clouds, cascaded sun shadows, live GPU DDGI)
+//   1: Cornell Bounce GI (red/green walls, overhead LTC softbox, DDGI + SSGI bounce)
+//   2: 48-Light Night Sanctuary (colored orbiting point-light clusters + HDR bloom)
+//   3: Volumetric Dusk (low golden sun, 3D froxel height fog + glowing local mist volumes)
+//   4: Neon LTC Gallery (dual cyan/crimson LTC area light walls + metallic reflections)
+import { Vec2, Vec3 } from "std/vector"
+import * as color from "ink/color"
+import * as events from "ink/events"
+import * as math from "ink/math"
+import * as pen_events from "ink/pen/events"
+import * as host_frame from "ink/pen/host"
+import * as program from "ink/pen/program"
+import * as persist from "ink/persist"
+import * as preferences from "ink/preferences"
+import * as render from "ink/render"
+import * as services from "ink/services"
+import * as sound from "ink/sound"
+import * as sketch from "ink/ui/sketch"
+import * as tree from "ink/ui/tree"
+import * as protocol from "pen/protocol"
+
+private const mesh_box: U32 = 0
+private const mesh_sphere: U32 = 1
+private const mat_stone: U32 = 0
+private const mat_dark_stone: U32 = 1
+private const mat_plaster: U32 = 9
+private const mat_crimson: U32 = 10
+private const mat_emerald: U32 = 11
+private const mat_gold: U32 = 12
+private const mat_cobalt: U32 = 13
+private const mat_glow_amber: U32 = 14
+private const mat_glow_cyan: U32 = 15
+private const mat_glow_crimson: U32 = 16
+private const mat_glow_violet: U32 = 17
+private const mat_glow_white: U32 = 18
+
+type GiScalars is data = $GiScalars {
+  ui: sketch.State,
+  time: F32,
+  scenario: U32, // 0=SUN, 1=CORNELL, 2=NIGHT, 3=FOG, 4=NEON
+  ddgi_on: Bool,
+  rt_tier: U32, // 0..3
+  sun_angle: F32,
+  fog_amount: F32,
+  cam_yaw: F32,
+  cam_pitch: F32,
+  auto_orbit: Bool,
+  dragging: Bool,
+  last_x: F32,
+  last_y: F32,
+}
+
+type GiState = {
+  scalars: #[GiScalars],
+}
+
+private func init_scalars () : GiScalars =>
+  return $GiScalars {
+    ui: sketch.init_state (),
+    time: 0.0,
+    scenario: 0,
+    ddgi_on: true,
+    rt_tier: 0,
+    sun_angle: 0.55,
+    fog_amount: 0.45,
+    cam_yaw: 0.22,
+    cam_pitch: 0.18,
+    auto_orbit: true,
+    dragging: false,
+    last_x: 0.0,
+    last_y: 0.0,
+  }
+
+private func pbr (mesh: U32) -> (mat: U32) -> (pos: Vec3) -> (yaw: F32) -> (scale: Vec3) -> (metal: F32) -> (rough: F32) : render.Draw =>
+  let d = render.placed mesh mat pos yaw scale
+  d.parameters := $Some (math.vec4 metal rough 0.0 0.0)
+  return d
+
+private func build_frame (state: own GiState) -> (dt: F32) -> (viewport: Vec2) -> (evs: &[events.Event]) : (GiState, render.FrameAccess, #[tree.StoredNode], #[U32]) =>
+  let sc = state.scalars[0]
+  let logical = math.vec2 960.0 600.0
+  let fit = sketch.fit_top_left logical viewport
+  let mapped = sketch.map_events fit evs
+  let s = sketch.feed_events (&mapped[0..mapped.length]) sc.ui
+  let safe_dt = clamp 0.0 0.05 dt
+  sc.time := sc.time + safe_dt
+
+  let panel_right = 272.0
+  for i in 0 .. evs.length:
+    let raw_ev = evs[i]
+    let log_ev = mapped[i]
+    case raw_ev of
+      $events.PointerDown { button, x, y } => do:
+        let lx = case log_ev of
+          $events.PointerDown { x: mx } => mx
+          _ => 0.0
+        if button == 0 and lx > panel_right:
+          sc.dragging := true
+          sc.auto_orbit := false
+          sc.last_x := x
+          sc.last_y := y
+        break ()
+      $events.PointerMove { x, y } => do:
+        if sc.dragging:
+          let dx = x - sc.last_x
+          let dy = y - sc.last_y
+          sc.last_x := x
+          sc.last_y := y
+          sc.cam_yaw := clamp (-0.82) 0.82 (sc.cam_yaw - dx * 0.0055)
+          sc.cam_pitch := clamp 0.04 0.72 (sc.cam_pitch + dy * 0.004)
+        break ()
+      $events.PointerUp { button } => do:
+        if button == 0:
+          sc.dragging := false
+        break ()
+      $events.KeyDown code => do:
+        if code >= 49 and code <= 53:
+          sc.scenario := code - 49
+        break ()
+      $events.FocusLost => do:
+        sc.dragging := false
+        break ()
+      _ => ()
+
+  if sc.auto_orbit:
+    sc.cam_yaw := 0.36 * sin (sc.time * 0.42)
+
+  let frame = render.empty_frame ()
+  let settings = frame.settings[0]
+  let (sy, cy) = sin_cos sc.cam_yaw
+  let (sp, cp) = sin_cos sc.cam_pitch
+  let dist = 11.4
+  let target = math.vec3 (-1.2) 2.25 0.0
+  let eye = math.vec3 (target.x + sy * cp * dist) (target.y + sp * dist) (target.z + cy * cp * dist)
+  let look = math.look_rotation (target - eye) math.up
+  let aspect = max 0.5 (viewport.x / max 1.0 viewport.y)
+  settings.view := math.Mat4.view eye look
+  settings.projection := math.Mat4.perspective 1.65 aspect 0.1 120.0
+  settings.post_look.tonemap := color.tonemap_agx_mode
+  settings.post_look.sharpness := 0.2
+  settings.features.ddgi := sc.ddgi_on
+  settings.features.ray_tracing := sc.rt_tier
+  settings.ssgi := sc.ddgi_on
+  settings.occlusion := true
+  settings.shadow.distance := 32.0
+  settings.shadow.softness := 0.025
+
+  let (sa_s, sa_c) = sin_cos sc.sun_angle
+  if sc.scenario == 0:
+    // 0: Sunlit DDGI Atrium
+    settings.features.physical_sky := true
+    settings.clouds.cover := 0.42
+    settings.clouds.drift := math.vec2 (sc.time * 0.2) (sc.time * 0.09)
+    settings.lighting := $render.Lighting {
+      clear: math.vec4 0.22 0.38 0.62 1.0,
+      ambient: math.vec3 0.24 0.28 0.36,
+      direction: (math.vec3 (-sa_c * 0.65) (-0.72) (-sa_s * 0.65)).normalized,
+      color: math.vec3 3.2 2.75 2.25,
+    }
+    settings.fog.density := 0.0
+  else:
+    if sc.scenario == 1:
+      // 1: Cornell Bounce GI
+      settings.features.physical_sky := false
+      settings.clouds.cover := 0.0
+      settings.lighting := $render.Lighting {
+        clear: math.vec4 0.02 0.02 0.03 1.0,
+        ambient: math.vec3 0.05 0.05 0.06,
+        direction: (math.vec3 (-0.15) (-0.95) (-0.2)).normalized,
+        color: math.vec3 0.16 0.16 0.18,
+      }
+      settings.fog.density := 0.0
+      @storage.push frame.area_lights ($render.AreaLight {
+        kind: render.area_light_rect,
+        position: math.vec3 0.0 5.15 0.0,
+        right: math.right,
+        up: math.forward,
+        color: math.vec3 1.0 0.95 0.86,
+        intensity: 14.0,
+        width: 4.4,
+        height: 3.4,
+        range: 20.0,
+        cookie_material: 0,
+        two_sided: false,
+      })
+      @storage.push frame.draws (pbr mesh_box mat_glow_white (math.vec3 0.0 5.24 0.0) 0.0 (math.vec3 4.4 0.12 3.4) 0.0 0.1)
+    else:
+      if sc.scenario == 2:
+        // 2: 48-Light Night Sanctuary
+        settings.features.physical_sky := false
+        settings.clouds.cover := 0.0
+        settings.lighting := $render.Lighting {
+          clear: math.vec4 0.015 0.02 0.045 1.0,
+          ambient: math.vec3 0.04 0.045 0.07,
+          direction: (math.vec3 (-0.35) (-0.85) (-0.35)).normalized,
+          color: math.vec3 0.12 0.16 0.28,
+        }
+        settings.fog.density := sc.fog_amount * 0.02
+        settings.fog.albedo := math.vec3 0.08 0.10 0.18
+        for li in 0 .. 48:
+          let fi = U32.to_f32 li
+          let ang = (fi / 48.0) * 6.2831853 + sc.time * (if li % 2 == 0 then 0.28 else (-0.22))
+          let (ls, lc) = sin_cos ang
+          let ring = if li < 16 then 1.85 else (if li < 32 then 2.95 else 3.85)
+          let ly = 0.85 + U32.to_f32 (li % 4) * 0.92 + sin (sc.time * 1.9 + fi) * 0.22
+          let lpos = math.vec3 (lc * ring) ly (ls * ring * 0.82)
+          let lcol = if li < 16 then math.vec3 1.8 0.72 0.18 else (if li < 32 then math.vec3 0.20 1.35 1.95 else math.vec3 1.25 0.32 1.85)
+          let lmat = if li < 16 then mat_glow_amber else (if li < 32 then mat_glow_cyan else mat_glow_violet)
+          @storage.push frame.lights ($render.PointLight {
+            position: lpos,
+            radius: 6.5,
+            intensity: lcol,
+            direction: math.up,
+            inner: 1.0,
+            outer: (-1.0),
+            shadow: false,
+            id: li + 1,
+          })
+          if li % 2 == 0:
+            @storage.push frame.draws (pbr mesh_sphere lmat lpos 0.0 (math.vec3 0.19 0.19 0.19) 0.0 0.1)
+      else:
+        if sc.scenario == 3:
+          // 3: Volumetric Dusk & Mist
+          settings.features.physical_sky := true
+          settings.clouds.cover := 0.55
+          settings.clouds.drift := math.vec2 (sc.time * 0.28) (sc.time * 0.12)
+          settings.lighting := $render.Lighting {
+            clear: math.vec4 0.22 0.12 0.09 1.0,
+            ambient: math.vec3 0.16 0.11 0.12,
+            direction: (math.vec3 (-sa_c * 0.88) (-0.36) (-sa_s * 0.88)).normalized,
+            color: math.vec3 4.2 1.85 0.85,
+          }
+          settings.volumetrics := 1
+          settings.fog.radius := 0.0
+          settings.fog.density := 0.02 + sc.fog_amount * 0.065
+          settings.fog.height := 5.2
+          settings.fog.distance := 34.0
+          settings.fog.albedo := math.vec3 1.0 0.74 0.48
+          settings.fog.anisotropy := 0.72
+          settings.fog.sun := 1.8
+          settings.fog.ambient := 0.7
+          settings.fog.noise := 0.38
+          settings.fog.noise_scale := 3.2
+          settings.fog.drift := math.vec3 (sc.time * 0.35) 0.0 (sc.time * 0.18)
+          @storage.push frame.fog_volumes ($render.FogVolume {
+            shape: 1,
+            centre: math.vec3 0.0 1.7 0.2,
+            extent: math.vec3 4.2 1.9 4.2,
+            density: 0.08 + sc.fog_amount * 0.14,
+            albedo: math.vec3 1.0 0.72 0.42,
+            emission: math.vec3 0.09 0.045 0.015,
+            falloff: 0.75,
+          })
+          @storage.push frame.lights (render.point_light (math.vec3 (-2.6) 1.6 2.2) 10.5 (math.vec3 4.0 2.0 0.65))
+          @storage.push frame.lights (render.point_light (math.vec3 2.6 1.6 2.2) 10.5 (math.vec3 4.0 2.0 0.65))
+          @storage.push frame.draws (pbr mesh_sphere mat_glow_amber (math.vec3 (-2.6) 1.6 2.2) 0.0 (math.vec3 0.30 0.30 0.30) 0.0 0.1)
+          @storage.push frame.draws (pbr mesh_sphere mat_glow_amber (math.vec3 2.6 1.6 2.2) 0.0 (math.vec3 0.30 0.30 0.30) 0.0 0.1)
+        else:
+          // 4: Neon LTC Area Gallery
+          settings.features.physical_sky := false
+          settings.clouds.cover := 0.0
+          settings.lighting := $render.Lighting {
+            clear: math.vec4 0.018 0.018 0.03 1.0,
+            ambient: math.vec3 0.04 0.04 0.06,
+            direction: (math.vec3 0.0 (-1.0) 0.0).normalized,
+            color: math.vec3 0.10 0.10 0.14,
+          }
+          settings.fog.density := sc.fog_amount * 0.022
+          settings.fog.albedo := math.vec3 0.09 0.11 0.18
+          @storage.push frame.area_lights ($render.AreaLight {
+            kind: render.area_light_rect,
+            position: math.vec3 (-4.2) 2.6 0.2,
+            right: math.forward,
+            up: math.up,
+            color: math.vec3 0.18 0.92 1.0,
+            intensity: 14.5,
+            width: 4.4,
+            height: 3.0,
+            range: 20.0,
+            cookie_material: 0,
+            two_sided: true,
+          })
+          @storage.push frame.area_lights ($render.AreaLight {
+            kind: render.area_light_rect,
+            position: math.vec3 4.2 2.6 0.2,
+            right: math.forward,
+            up: math.up,
+            color: math.vec3 1.0 0.18 0.45,
+            intensity: 14.5,
+            width: 4.4,
+            height: 3.0,
+            range: 20.0,
+            cookie_material: 0,
+            two_sided: true,
+          })
+          @storage.push frame.draws (pbr mesh_box mat_glow_cyan (math.vec3 (-4.42) 2.6 0.2) 0.0 (math.vec3 0.16 3.0 4.4) 0.0 0.1)
+          @storage.push frame.draws (pbr mesh_box mat_glow_crimson (math.vec3 4.42 2.6 0.2) 0.0 (math.vec3 0.16 3.0 4.4) 0.0 0.1)
+
+  frame.settings[0] := settings
+
+  // Architectural Sanctuary + Cornell Bounce Box geometry
+  // Courtyard floor & raised central plinth
+  let floor_rough = if sc.scenario == 4 then 0.18 else 0.48
+  @storage.push frame.draws (pbr mesh_box mat_dark_stone (math.vec3 0.0 (-0.25) 0.0) 0.0 (math.vec3 16.0 0.5 16.0) 0.12 floor_rough)
+  @storage.push frame.draws (pbr mesh_box mat_plaster (math.vec3 0.0 0.2 0.0) 0.0 (math.vec3 6.8 0.4 5.6) 0.0 0.85)
+  // Back wall
+  @storage.push frame.draws (pbr mesh_box mat_plaster (math.vec3 0.0 2.75 (-3.6)) 0.0 (math.vec3 9.6 5.5 0.45) 0.0 0.88)
+  // Open slatted pergola roof for Sunlit & Volumetric Dusk (casts shadow shafts!), solid ceiling for Cornell/48L/LTC
+  if sc.scenario == 0 or sc.scenario == 3:
+    for bi in 0 .. 5:
+      let bz = (-3.0) + U32.to_f32 bi * 1.45
+      @storage.push frame.draws (pbr mesh_box mat_stone (math.vec3 0.0 5.45 bz) 0.0 (math.vec3 9.8 0.34 0.56) 0.05 0.78)
+  else:
+    @storage.push frame.draws (pbr mesh_box mat_stone (math.vec3 0.0 5.45 0.0) 0.0 (math.vec3 9.8 0.35 7.6) 0.05 0.82)
+  // Vivid Crimson (left) & Emerald (right) bounce walls (for Cornell & Sunlit color bleed)
+  @storage.push frame.draws (pbr mesh_box mat_crimson (math.vec3 (-4.8) 2.75 0.0) 0.0 (math.vec3 0.35 5.5 7.2) 0.0 0.86)
+  @storage.push frame.draws (pbr mesh_box mat_emerald (math.vec3 4.8 2.75 0.0) 0.0 (math.vec3 0.35 5.5 7.2) 0.0 0.86)
+  // Four colonnade pillars casting crisp directional & volumetric shadow shafts
+  for pi in 0 .. 4:
+    let px = if pi % 2 == 0 then (-3.3) else 3.3
+    let pz = if pi < 2 then (-1.8) else 2.2
+    @storage.push frame.draws (pbr mesh_box mat_stone (math.vec3 px 2.7 pz) 0.0 (math.vec3 0.72 5.4 0.72) 0.05 0.65)
+    @storage.push frame.draws (pbr mesh_box mat_plaster (math.vec3 px 0.25 pz) 0.0 (math.vec3 1.05 0.5 1.05) 0.0 0.75)
+
+  // Hero GI & PBR showcase objects on the central dais
+  // 1. Central matte white plaster sphere (clearly displays colored GI bounce & shadow penumbra)
+  @storage.push frame.draws (pbr mesh_sphere mat_plaster (math.vec3 0.0 1.45 0.1) 0.0 (math.vec3 2.1 2.1 2.1) 0.0 0.92)
+  // 2. Left brushed-gold metallic sphere on pedestal (specular & area-light reflections)
+  @storage.push frame.draws (pbr mesh_box mat_dark_stone (math.vec3 (-2.05) 0.8 (-0.4)) 0.3 (math.vec3 1.05 0.85 1.05) 0.15 0.45)
+  @storage.push frame.draws (pbr mesh_sphere mat_gold (math.vec3 (-2.05) 1.85 (-0.4)) sc.time (math.vec3 1.25 1.25 1.25) 0.94 0.16)
+  // 3. Right smooth cobalt metallic-gloss sphere on pedestal
+  @storage.push frame.draws (pbr mesh_box mat_dark_stone (math.vec3 2.05 0.8 (-0.4)) (-0.3) (math.vec3 1.05 0.85 1.05) 0.15 0.45)
+  @storage.push frame.draws (pbr mesh_sphere mat_cobalt (math.vec3 2.05 1.85 (-0.4)) (-sc.time) (math.vec3 1.25 1.25 1.25) 0.84 0.12)
+  // 4. Floating rotating arcane crystal above the central sphere
+  let crystal_y = 3.25 + sin (sc.time * 2.1) * 0.18
+  let crystal_mat = if sc.scenario == 3 then mat_glow_amber else (if sc.scenario == 4 then mat_glow_violet else mat_glow_cyan)
+  @storage.push frame.draws (pbr mesh_box crystal_mat (math.vec3 0.0 crystal_y 0.1) (sc.time * 0.9) (math.vec3 0.48 0.75 0.48) 0.0 0.1)
+
+  // Sketch UI Scenario & GI controls panel
+  let ui = sketch.begin s logical sc.time sketch.chalkboard_theme
+  ui := sketch.panel "3D GI & LIGHTING" (math.vec4 14.0 14.0 246.0 374.0) self
+  ui := sketch.muted_label "Keys 1-5; drag to look" self
+  let modes: #[Text] = #["SUN", "GI", "48L", "FOG", "LTC"]
+  let (next_scen, ui) = sketch.radio "SCENARIO" (&modes[0..modes.length]) sc.scenario ui
+  let (next_ddgi, ui) = sketch.toggle "DDGI 3D BOUNCE" sc.ddgi_on ui
+  let rts: #[Text] = #["OFF", "T1", "T2", "T3"]
+  let (next_rt, ui) = sketch.radio "RT / RESTIR" (&rts[0..rts.length]) sc.rt_tier ui
+  let (next_sun, ui) = sketch.slider "SUN ANGLE" sc.sun_angle (-1.2) 1.6 ui
+  let (next_fog, ui) = sketch.slider "FOG / MIST" sc.fog_amount 0.0 1.0 ui
+  let (next_orbit, ui) = sketch.toggle "AUTO ORBIT" sc.auto_orbit ui
+  ui := sketch.end_panel self
+  ui := sketch.apply_fit fit self
+
+  let (next_ui, frame, nodes, labels) = sketch.finish_with_tree ui frame
+  sc.ui := next_ui
+  sc.scenario := next_scen
+  sc.ddgi_on := next_ddgi
+  sc.rt_tier := next_rt
+  sc.sun_angle := next_sun
+  sc.fog_amount := next_fog
+  sc.auto_orbit := next_orbit
+  state.scalars[0] := sc
+  return (state, frame, nodes, labels)
+
+private const schema: U32 = 1
+
+private func encode (frame: render.FrameAccess) -> (nodes: &[tree.StoredNode]) -> (labels: &[U32]) -> (out: own #[F32]) : #[F32] =>
+  let kept = preferences.make
+    ($preferences.Quality { msaa: 1, fxaa: false, scale: 1.0, filtering: 4, shadows: 1024,
+      occlusion: true, sky: true, fog: 0.5, effects: true, bloom: true, reflections: 0, volumetrics: 1 })
+    ($preferences.Volumes { master: 0.0, effects: 0.0, music: 0.0 })
+    ($preferences.Controls { left_handed: false })
+  let audio = sound.empty_access ()
+  let next: #[U32] = #[1]
+  let requests: #[services.Request] = #[]
+  let waiting: #[services.Request] = #[]
+  let filling: #[services.Filling] = #[]
+  let answers: #[services.Answer] = #[]
+  let statuses: #[U32] = #[]
+  let payload: #[F32] = #[]
+  let service_state = services.access next requests waiting filling answers statuses payload
+  return host_frame.append_frame schema (persist.requests ()) (sound.read audio) kept nodes
+    labels (render.finish frame) (&service_state.outbox[0..0]) service_state out
+
+private func dispatch (state: own GiState) -> (operation: U32) -> (payload: &[F32]) -> (out: own #[F32]) : (GiState, #[F32]) =>
+  if operation == 1:
+    state.scalars[0] := init_scalars ()
+    return (state, program.append #[0.0] out)
+  if operation == 2:
+    let raw: #[protocol.Event] = #[]
+    let input = protocol.decode_input_into payload raw
+    let evs: #[events.Event] = #[]
+    for r in input.events:
+      @storage.push evs (pen_events.from_packet r)
+    let (next_state, frame, nodes, labels) = build_frame state input.elapsed (math.vec2 input.width input.height) (&evs[0..evs.length])
+    return (next_state, encode frame (&nodes[0..nodes.length]) (&labels[0..labels.length]) out)
+  if operation == 3:
+    let sc = state.scalars[0]
+    return (state, program.append #[U32.to_f32 sc.scenario, sc.sun_angle] out)
+  if operation == 4:
+    return (state, program.append #[1.0] out)
+  return (state, out)
+
+io main (host: #[F32] -> #[F32] ! {Foreign}) : Unit ! {Foreign} =>
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
+  let scalars: #[GiScalars] = #[init_scalars ()]
+  let state: GiState = { scalars }
+  use _ <- program.run dispatch (func (own s) -> (_: Bool) => s) state schema false incoming outgoing host
+  return ()
+
+io test_gi_lighting () : #[F32] =>
+  let scalars: #[GiScalars] = #[init_scalars ()]
+  let state: GiState = { scalars }
+  let empty_evs: #[events.Event] = #[]
+  let (_, frame0, nodes0, _) = build_frame state (1.0 / 60.0) (math.vec2 960.0 600.0) (&empty_evs[0..0])
+  let key3: #[events.Event] = #[$events.KeyDown 51] // scenario 2: 48-Light Night
+  let state2: GiState = { scalars: #[init_scalars ()] }
+  let (_, frame2, _, _) = build_frame state2 (1.0 / 60.0) (math.vec2 960.0 600.0) (&key3[0..key3.length])
+  let ok = frame0.draws.length >= 16 and frame2.lights.length == 48 and nodes0.length >= 6
+  return if ok then #[1.0, 0.0] else #[1.0, 1.0]

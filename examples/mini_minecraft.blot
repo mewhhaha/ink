@@ -1,0 +1,524 @@
+// Playable 3D Mini Minecraft voxel island sandbox for Pen (native + web).
+// Combines exposed-surface voxel meshing, 3D ray-voxel picking (`ink/math`),
+// wireframe selection outline (`ink/render/lines`), physical sky & cascaded sun shadows
+// (`ink/render/shadow`), dynamic Glowstone night lighting, and `ink/ui/sketch` HUD.
+import { Vec2, Vec3 } from "std/vector"
+import * as color from "ink/color"
+import * as events from "ink/events"
+import * as keys from "ink/input/keys"
+import * as math from "ink/math"
+import * as pen_events from "ink/pen/events"
+import * as host_frame from "ink/pen/host"
+import * as program from "ink/pen/program"
+import * as persist from "ink/persist"
+import * as preferences from "ink/preferences"
+import * as render from "ink/render"
+import * as lines from "ink/render/lines"
+import * as services from "ink/services"
+import * as sound from "ink/sound"
+import * as sketch from "ink/ui/sketch"
+import * as tree from "ink/ui/tree"
+import * as protocol from "pen/protocol"
+
+// Shared procedural 3D PBR catalog indices (0=box mesh).
+private const mesh_box: U32 = 0
+private const mat_stone: U32 = 0
+private const mat_grass: U32 = 2
+private const mat_dirt: U32 = 3
+private const mat_wood: U32 = 4
+private const mat_leaves: U32 = 5
+private const mat_brick: U32 = 6
+private const mat_sand: U32 = 7
+private const mat_water: U32 = 8
+private const mat_glow_amber: U32 = 14
+
+// Voxel block IDs
+private const blk_air: U32 = 0
+private const blk_grass: U32 = 1
+private const blk_dirt: U32 = 2
+private const blk_stone: U32 = 3
+private const blk_wood: U32 = 4
+private const blk_leaves: U32 = 5
+private const blk_brick: U32 = 6
+private const blk_sand: U32 = 7
+private const blk_water: U32 = 8
+private const blk_glow: U32 = 9
+
+private const world_w: U32 = 12
+private const world_h: U32 = 8
+private const world_d: U32 = 12
+
+type VoxelScalars is data = $VoxelScalars {
+  ui: sketch.State,
+  time: F32,
+  cam_yaw: F32,
+  cam_pitch: F32,
+  cam_dist: F32,
+  tool_mode: U32, // 0 = BUILD, 1 = MINE
+  palette_idx: U32, // 0..4 -> grass, stone, wood, brick, glow
+  night_mode: Bool,
+  auto_orbit: Bool,
+  dragging: Bool,
+  last_x: F32,
+  last_y: F32,
+  drag_dist: F32,
+  ptr_x: F32,
+  ptr_y: F32,
+  keys_held: U32,
+}
+
+type VoxelState = {
+  scalars: #[VoxelScalars],
+  blocks: #[U32],
+}
+
+private func idx3 (x: U32) -> (y: U32) -> (z: U32) : U32 =>
+  return (y * world_d + z) * world_w + x
+
+private func set_block (blocks: own #[U32]) -> (x: U32) -> (y: U32) -> (z: U32) -> (b: U32) : #[U32] =>
+  if x < world_w and y < world_h and z < world_d:
+    blocks[idx3 x y z] := b
+  return blocks
+
+private func get_block (blocks: &[U32]) -> (x: U32) -> (y: U32) -> (z: U32) : U32 =>
+  if x >= world_w or y >= world_h or z >= world_d:
+    return blk_air
+  return blocks[idx3 x y z]
+
+private func seed_island (blocks: own #[U32]) : #[U32] =>
+  @storage.truncate blocks 0
+  let total = world_w * world_h * world_d
+  for _ in 0 .. total:
+    @storage.push blocks blk_air
+  // Sculpt layered island: stone bed, dirt mid, grass hills, sand cove, water pond
+  for z in 1 .. (world_d - 1):
+    for x in 1 .. (world_w - 1):
+      let fx = U32.to_f32 x - 5.5
+      let fz = U32.to_f32 z - 5.5
+      let r2 = fx * fx + fz * fz
+      if r2 < 29.0:
+        let is_pond = x >= 6 and x <= 9 and z >= 6 and z <= 9
+        let hill = if x <= 5 and z <= 5 then 3 else (if x <= 6 and z <= 6 then 2 else 1)
+        let top_y = if is_pond then 1 else hill
+        for y in 0 .. (top_y + 1):
+          let b = if y == 0 then blk_stone else (if y < top_y then blk_dirt else (if is_pond then blk_water else (if r2 > 20.0 then blk_sand else blk_grass)))
+          blocks := set_block self x y z b
+  // Blocky oak tree 1 on hilltop
+  blocks := set_block self 3 4 3 blk_wood
+  blocks := set_block self 3 5 3 blk_wood
+  for lz in 2 .. 5:
+    for lx in 2 .. 5:
+      blocks := set_block self lx 6 lz blk_leaves
+  blocks := set_block self 3 7 3 blk_leaves
+  // Tree 2 near meadow
+  blocks := set_block self 8 2 3 blk_wood
+  blocks := set_block self 8 3 3 blk_wood
+  for lz in 2 .. 5:
+    for lx in 7 .. 10:
+      blocks := set_block self lx 4 lz blk_leaves
+  blocks := set_block self 8 5 3 blk_leaves
+  // Cozy brick cottage corner + glowing lanterns
+  blocks := set_block self 4 3 7 blk_brick
+  blocks := set_block self 5 3 7 blk_brick
+  blocks := set_block self 4 4 7 blk_brick
+  blocks := set_block self 4 3 8 blk_brick
+  blocks := set_block self 5 2 6 blk_glow
+  blocks := set_block self 7 2 5 blk_glow
+  blocks := set_block self 3 4 5 blk_glow
+  return blocks
+
+private func init_scalars () : VoxelScalars =>
+  return $VoxelScalars {
+    ui: sketch.init_state (),
+    time: 0.0,
+    cam_yaw: 0.68,
+    cam_pitch: 0.56,
+    cam_dist: 15.5,
+    tool_mode: 0,
+    palette_idx: 4,
+    night_mode: false,
+    auto_orbit: false,
+    dragging: false,
+    last_x: 0.0,
+    last_y: 0.0,
+    drag_dist: 0.0,
+    ptr_x: 600.0,
+    ptr_y: 300.0,
+    keys_held: 0,
+  }
+
+private func block_material (b: U32) : U32 =>
+  case b of
+    1 => mat_grass
+    2 => mat_dirt
+    3 => mat_stone
+    4 => mat_wood
+    5 => mat_leaves
+    6 => mat_brick
+    7 => mat_sand
+    8 => mat_water
+    9 => mat_glow_amber
+    _ => mat_stone
+
+private func palette_block (idx: U32) : U32 =>
+  case idx of
+    0 => blk_grass
+    1 => blk_stone
+    2 => blk_wood
+    3 => blk_brick
+    _ => blk_glow
+
+private func voxel_center (x: U32) -> (y: U32) -> (z: U32) : Vec3 =>
+  return math.vec3 (U32.to_f32 x - 5.5) (U32.to_f32 y + 0.5) (U32.to_f32 z - 5.5)
+
+private func is_exposed (blocks: &[U32]) -> (x: U32) -> (y: U32) -> (z: U32) : Bool =>
+  if x == 0 or x + 1 >= world_w or y == 0 or y + 1 >= world_h or z == 0 or z + 1 >= world_d:
+    return true
+  if get_block blocks (x - 1) y z == blk_air:
+    return true
+  if get_block blocks (x + 1) y z == blk_air:
+    return true
+  if get_block blocks x (y - 1) z == blk_air:
+    return true
+  if get_block blocks x (y + 1) z == blk_air:
+    return true
+  if get_block blocks x y (z - 1) == blk_air:
+    return true
+  if get_block blocks x y (z + 1) == blk_air:
+    return true
+  return false
+
+private func push_wire_cube (c: Vec3) -> (half: F32) -> (col: math.Vec4) -> (segs: own #[lines.Segment]) : #[lines.Segment] =>
+  let st = $lines.LineStyle { width_px: 2.8, dash_len_px: 0.0, gap_len_px: 0.0, feather_px: 1.0, layer: $lines.OnTop }
+  let x0 = c.x - half
+  let x1 = c.x + half
+  let y0 = c.y - half
+  let y1 = c.y + half
+  let z0 = c.z - half
+  let z1 = c.z + half
+  segs := lines.push_segment (math.vec3 x0 y0 z0) (math.vec3 x1 y0 z0) col st self
+  segs := lines.push_segment (math.vec3 x0 y1 z0) (math.vec3 x1 y1 z0) col st self
+  segs := lines.push_segment (math.vec3 x0 y0 z1) (math.vec3 x1 y0 z1) col st self
+  segs := lines.push_segment (math.vec3 x0 y1 z1) (math.vec3 x1 y1 z1) col st self
+  segs := lines.push_segment (math.vec3 x0 y0 z0) (math.vec3 x0 y1 z0) col st self
+  segs := lines.push_segment (math.vec3 x1 y0 z0) (math.vec3 x1 y1 z0) col st self
+  segs := lines.push_segment (math.vec3 x0 y0 z1) (math.vec3 x0 y1 z1) col st self
+  segs := lines.push_segment (math.vec3 x1 y0 z1) (math.vec3 x1 y1 z1) col st self
+  segs := lines.push_segment (math.vec3 x0 y0 z0) (math.vec3 x0 y0 z1) col st self
+  segs := lines.push_segment (math.vec3 x1 y0 z0) (math.vec3 x1 y0 z1) col st self
+  segs := lines.push_segment (math.vec3 x0 y1 z0) (math.vec3 x0 y1 z1) col st self
+  return lines.push_segment (math.vec3 x1 y1 z0) (math.vec3 x1 y1 z1) col st segs
+
+// Raycast all exposed voxels; returns (hit, vx, vy, vz, nx_s, ny_s, nz_s) with normal offset +1 (0=-1, 1=0, 2=+1).
+private func pick_voxel (blocks: &[U32]) -> (ray: math.Ray) : (Bool, U32, U32, U32, U32, U32, U32) =>
+  let prep = math.prepare_ray ray
+  let best_t = 1e20
+  let hit = false
+  let hx: U32 = 0
+  let hy: U32 = 0
+  let hz: U32 = 0
+  for y in 0 .. world_h:
+    for z in 0 .. world_d:
+      for x in 0 .. world_w:
+        if blocks[idx3 x y z] != blk_air and is_exposed blocks x y z:
+          let c = voxel_center x y z
+          if let $Some t = math.ray_aabb_prepared prep c.x c.y c.z 0.5 0.5 0.5:
+            if t > 0.05 and t < best_t:
+              best_t := t
+              hit := true
+              hx := x
+              hy := y
+              hz := z
+  if not hit:
+    return (false, 0, 0, 0, 1, 1, 1)
+  let c = voxel_center hx hy hz
+  let p = math.vec3 (ray.origin.x + ray.direction.x * best_t - c.x) (ray.origin.y + ray.direction.y * best_t - c.y) (ray.origin.z + ray.direction.z * best_t - c.z)
+  let ax = abs p.x
+  let ay = abs p.y
+  let az = abs p.z
+  if ax >= ay and ax >= az:
+    return (true, hx, hy, hz, if p.x >= 0.0 then 2 else 0, 1, 1)
+  if ay >= ax and ay >= az:
+    return (true, hx, hy, hz, 1, if p.y >= 0.0 then 2 else 0, 1)
+  return (true, hx, hy, hz, 1, 1, if p.z >= 0.0 then 2 else 0)
+
+private func build_frame (state: own VoxelState) -> (dt: F32) -> (viewport: Vec2) -> (evs: &[events.Event]) : (VoxelState, render.FrameAccess, #[tree.StoredNode], #[U32]) =>
+  let sc = state.scalars[0]
+  let logical = math.vec2 960.0 600.0
+  let fit = sketch.fit_top_left logical viewport
+  let mapped = sketch.map_events fit evs
+  let s = sketch.feed_events (&mapped[0..mapped.length]) sc.ui
+  let safe_dt = clamp 0.0 0.05 dt
+  sc.time := sc.time + safe_dt
+
+  let click_stage = false
+  let click_alt = false
+  let click_px = 0.0
+  let click_py = 0.0
+  let panel_right = 256.0
+  for i in 0 .. evs.length:
+    let raw_ev = evs[i]
+    let log_ev = mapped[i]
+    case raw_ev of
+      $events.PointerMove { x, y } => do:
+        sc.ptr_x := x
+        sc.ptr_y := y
+        if sc.dragging:
+          let dx = x - sc.last_x
+          let dy = y - sc.last_y
+          sc.last_x := x
+          sc.last_y := y
+          sc.drag_dist := sc.drag_dist + abs dx + abs dy
+          sc.cam_yaw := sc.cam_yaw - dx * 0.0065
+          sc.cam_pitch := clamp 0.2 1.25 (sc.cam_pitch + dy * 0.0055)
+        break ()
+      $events.PointerDown { button, x, y } => do:
+        let lx = case log_ev of
+          $events.PointerDown { x: mx } => mx
+          _ => 0.0
+        if lx > panel_right:
+          sc.ptr_x := x
+          sc.ptr_y := y
+          if button == 0:
+            sc.dragging := true
+            sc.last_x := x
+            sc.last_y := y
+            sc.drag_dist := 0.0
+          else:
+            if button == 2:
+              click_stage := true
+              click_alt := true
+              click_px := x
+              click_py := y
+        break ()
+      $events.PointerUp { button, x, y } => do:
+        if button == 0 and sc.dragging:
+          if sc.drag_dist < 8.0:
+            click_stage := true
+            click_px := x
+            click_py := y
+          sc.dragging := false
+        break ()
+      $events.Wheel { delta } => do:
+        sc.cam_dist := clamp 8.0 26.0 (sc.cam_dist - delta * 0.6)
+        break ()
+      $events.KeyDown code => do:
+        if code == keys.q or code == keys.a or code == keys.left:
+          sc.keys_held := sc.keys_held | 1
+        if code == keys.e or code == keys.d or code == keys.right:
+          sc.keys_held := sc.keys_held | 2
+        if code == keys.w or code == keys.up:
+          sc.keys_held := sc.keys_held | 4
+        if code == keys.s or code == keys.down:
+          sc.keys_held := sc.keys_held | 8
+        if code == 49:
+          sc.palette_idx := 0
+        if code == 50:
+          sc.palette_idx := 1
+        if code == 51:
+          sc.palette_idx := 2
+        if code == 52:
+          sc.palette_idx := 3
+        if code == 53:
+          sc.palette_idx := 4
+        if code == keys.m:
+          sc.tool_mode := 1 - sc.tool_mode
+        if code == keys.n:
+          sc.night_mode := not sc.night_mode
+        break ()
+      $events.KeyUp code => do:
+        if code == keys.q or code == keys.a or code == keys.left:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ 1)
+        if code == keys.e or code == keys.d or code == keys.right:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ 2)
+        if code == keys.w or code == keys.up:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ 4)
+        if code == keys.s or code == keys.down:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ 8)
+        break ()
+      $events.FocusLost => do:
+        sc.keys_held := 0
+        sc.dragging := false
+        break ()
+      _ => ()
+
+  if sc.auto_orbit:
+    sc.cam_yaw := sc.cam_yaw + safe_dt * 0.25
+  if (sc.keys_held & 1) != 0:
+    sc.cam_yaw := sc.cam_yaw - safe_dt * 1.4
+  if (sc.keys_held & 2) != 0:
+    sc.cam_yaw := sc.cam_yaw + safe_dt * 1.4
+  if (sc.keys_held & 4) != 0:
+    sc.cam_dist := max 8.0 (sc.cam_dist - safe_dt * 8.0)
+  if (sc.keys_held & 8) != 0:
+    sc.cam_dist := min 26.0 (sc.cam_dist + safe_dt * 8.0)
+
+  // Camera framing
+  let (sp, cp) = sin_cos sc.cam_pitch
+  let (sy, cy) = sin_cos sc.cam_yaw
+  let target = math.vec3 0.0 2.0 0.0
+  let eye = math.vec3 (sy * cp * sc.cam_dist) (2.0 + sp * sc.cam_dist) (cy * cp * sc.cam_dist)
+  let fwd = (target - eye).normalized
+  let look = math.look_rotation fwd math.up
+  let cam_right = math.Quat.rotate look math.right
+  let cam_up = math.Quat.rotate look math.up
+  let aspect = max 0.5 (viewport.x / max 1.0 viewport.y)
+  let focal_y = 1.8
+
+  // Build pick ray from pointer
+  let rx_px = if click_stage then click_px else sc.ptr_x
+  let ry_px = if click_stage then click_py else sc.ptr_y
+  let ndc_x = (rx_px / max 1.0 viewport.x) * 2.0 - 1.0
+  let ndc_y = 1.0 - (ry_px / max 1.0 viewport.y) * 2.0
+  let ray_dir = (fwd + cam_right * (ndc_x * aspect / focal_y) + cam_up * (ndc_y / focal_y)).normalized
+  let bview = &state.blocks[0..state.blocks.length]
+  let (hit, hx, hy, hz, nx_s, ny_s, nz_s) = pick_voxel bview ($math.Ray { origin: eye, direction: ray_dir })
+
+  // Apply mine or build edit on click/tap
+  if click_stage and hit:
+    let do_mine = if click_alt then sc.tool_mode == 0 else sc.tool_mode == 1
+    if do_mine:
+      if hy > 0:
+        state.blocks := set_block self hx hy hz blk_air
+    else:
+      let px_ok = (nx_s != 0 or hx > 0) and (nx_s != 2 or hx + 1 < world_w)
+      let py_ok = (ny_s != 0 or hy > 0) and (ny_s != 2 or hy + 1 < world_h)
+      let pz_ok = (nz_s != 0 or hz > 0) and (nz_s != 2 or hz + 1 < world_d)
+      if px_ok and py_ok and pz_ok:
+        let tx = hx + nx_s - 1
+        let ty = hy + ny_s - 1
+        let tz = hz + nz_s - 1
+        state.blocks := set_block self tx ty tz (palette_block sc.palette_idx)
+
+  // Build 3D WebGPU frame
+  let frame = render.empty_frame ()
+  let settings = frame.settings[0]
+  settings.view := math.Mat4.view eye look
+  settings.projection := math.Mat4.perspective focal_y aspect 0.1 120.0
+  settings.post_look.tonemap := color.tonemap_agx_mode
+  settings.features.physical_sky := false
+  if sc.night_mode:
+    settings.lighting := $render.Lighting {
+      clear: math.vec4 0.02 0.03 0.07 1.0,
+      ambient: math.vec3 0.05 0.07 0.14,
+      direction: (math.vec3 (-0.4) (-0.85) (-0.3)).normalized,
+      color: math.vec3 0.16 0.22 0.38,
+    }
+    settings.clouds.cover := 0.0
+  else:
+    settings.lighting := $render.Lighting {
+      clear: math.vec4 0.38 0.68 0.96 1.0,
+      ambient: math.vec3 0.34 0.40 0.48,
+      direction: (math.vec3 (-0.48) (-0.78) (-0.40)).normalized,
+      color: math.vec3 2.55 2.40 2.10,
+    }
+    settings.clouds.cover := 0.0
+  settings.shadow.distance := 36.0
+  settings.shadow.softness := 0.02
+  frame.settings[0] := settings
+
+  // Emit only exposed voxels + warm point lights for every Glowstone block
+  let bview2 = &state.blocks[0..state.blocks.length]
+  let glow_lights: U32 = 0
+  for y in 0 .. world_h:
+    for z in 0 .. world_d:
+      for x in 0 .. world_w:
+        let b = bview2[idx3 x y z]
+        if b != blk_air and is_exposed bview2 x y z:
+          let pos = voxel_center x y z
+          let d = render.placed mesh_box (block_material b) pos 0.0 (math.vec3 0.99 0.99 0.99)
+          let rough = if b == blk_water then 0.12 else (if b == blk_stone or b == blk_brick then 0.72 else 0.88)
+          d.parameters := $Some (math.vec4 0.0 rough 0.0 0.0)
+          @storage.push frame.draws d
+          if b == blk_glow and glow_lights < 24:
+            let gain = if sc.night_mode then 3.8 else 1.2
+            @storage.push frame.lights (render.point_light pos 7.5 (math.vec3 (1.0 * gain) (0.72 * gain) (0.32 * gain)))
+            glow_lights := glow_lights + 1
+
+  // Build Sketch UI panel + 3D wireframe voxel highlight
+  let ui = sketch.begin s logical sc.time sketch.chalkboard_theme
+  if hit:
+    let hcol = if sc.tool_mode == 1 then math.vec4 1.0 0.38 0.35 0.95 else math.vec4 0.35 0.96 1.0 0.95
+    ui.segments := push_wire_cube (voxel_center hx hy hz) 0.515 hcol self
+
+  ui := sketch.panel "VOXEL ISLAND" (math.vec4 14.0 14.0 232.0 342.0) self
+  ui := sketch.muted_label "Tap blocks; drag to orbit" self
+  let tools: #[Text] = #["BUILD", "MINE"]
+  let (next_tool, ui) = sketch.radio "TOOL" (&tools[0..tools.length]) sc.tool_mode ui
+  let blocks_lbl: #[Text] = #["GRS", "STN", "WOD", "BRK", "GLW"]
+  let (next_pal, ui) = sketch.radio "BLOCK" (&blocks_lbl[0..blocks_lbl.length]) sc.palette_idx ui
+  let (night_on, ui) = sketch.toggle "NIGHT LIGHTS" sc.night_mode ui
+  let (orbit_on, ui) = sketch.toggle "AUTO ORBIT" sc.auto_orbit ui
+  let (next_yaw, ui) = sketch.slider "ORBIT" sc.cam_yaw (-3.14) 3.14 ui
+  let (reset_hit, ui) = sketch.button "RESET ISLAND" ui
+  ui := sketch.end_panel self
+  ui := sketch.apply_fit fit self
+
+  let (next_ui, frame, nodes, labels) = sketch.finish_with_tree ui frame
+  sc.ui := next_ui
+  sc.tool_mode := next_tool
+  sc.palette_idx := next_pal
+  sc.night_mode := night_on
+  sc.auto_orbit := orbit_on
+  sc.cam_yaw := next_yaw
+  if reset_hit:
+    state.blocks := seed_island self
+  state.scalars[0] := sc
+  return (state, frame, nodes, labels)
+
+private const schema: U32 = 1
+
+private func encode (frame: render.FrameAccess) -> (nodes: &[tree.StoredNode]) -> (labels: &[U32]) -> (out: own #[F32]) : #[F32] =>
+  let kept = preferences.make
+    ($preferences.Quality { msaa: 1, fxaa: false, scale: 1.0, filtering: 4, shadows: 1024,
+      occlusion: false, sky: true, fog: 0.0, effects: true, bloom: true, reflections: 0, volumetrics: 0 })
+    ($preferences.Volumes { master: 0.0, effects: 0.0, music: 0.0 })
+    ($preferences.Controls { left_handed: false })
+  let audio = sound.empty_access ()
+  let next: #[U32] = #[1]
+  let requests: #[services.Request] = #[]
+  let waiting: #[services.Request] = #[]
+  let filling: #[services.Filling] = #[]
+  let answers: #[services.Answer] = #[]
+  let statuses: #[U32] = #[]
+  let payload: #[F32] = #[]
+  let service_state = services.access next requests waiting filling answers statuses payload
+  return host_frame.append_frame schema (persist.requests ()) (sound.read audio) kept nodes
+    labels (render.finish frame) (&service_state.outbox[0..0]) service_state out
+
+private func dispatch (state: own VoxelState) -> (operation: U32) -> (payload: &[F32]) -> (out: own #[F32]) : (VoxelState, #[F32]) =>
+  if operation == 1:
+    state.scalars[0] := init_scalars ()
+    state.blocks := seed_island self
+    return (state, program.append #[1.0] out)
+  if operation == 2:
+    let raw: #[protocol.Event] = #[]
+    let input = protocol.decode_input_into payload raw
+    let evs: #[events.Event] = #[]
+    for r in input.events:
+      @storage.push evs (pen_events.from_packet r)
+    let (next_state, frame, nodes, labels) = build_frame state input.elapsed (math.vec2 input.width input.height) (&evs[0..evs.length])
+    return (next_state, encode frame (&nodes[0..nodes.length]) (&labels[0..labels.length]) out)
+  if operation == 3:
+    let sc = state.scalars[0]
+    return (state, program.append #[sc.cam_yaw, U32.to_f32 sc.palette_idx] out)
+  if operation == 4:
+    return (state, program.append #[1.0] out)
+  return (state, out)
+
+io main (host: #[F32] -> #[F32] ! {Foreign}) : Unit ! {Foreign} =>
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
+  let scalars: #[VoxelScalars] = #[init_scalars ()]
+  let blocks = seed_island #[]
+  let state: VoxelState = { scalars, blocks }
+  use _ <- program.run dispatch (func (own s) -> (_: Bool) => s) state schema false incoming outgoing host
+  return ()
+
+io test_mini_minecraft () : #[F32] =>
+  let scalars: #[VoxelScalars] = #[init_scalars ()]
+  let state: VoxelState = { scalars, blocks: seed_island #[] }
+  let empty_evs: #[events.Event] = #[]
+  let (_, frame, nodes, _) = build_frame state (1.0 / 60.0) (math.vec2 960.0 600.0) (&empty_evs[0..0])
+  let ok = frame.draws.length > 100 and frame.lights.length >= 3 and nodes.length >= 6
+  return if ok then #[1.0, 0.0] else #[1.0, 1.0]

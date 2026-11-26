@@ -1,0 +1,647 @@
+// Playable 3D Mini Doom retro corridor shooter for Pen (native + web).
+// Uses procedural PBR boxes/spheres (`ink/render`), dynamic corridor & bolt lighting,
+// trauma shake & weapon recoil (`ink/feel`), top-right 2D minimap (`ink/render/d2` + `lines`),
+// and desktop + mobile touch controls (`ink/ui/sketch`).
+import { Vec2, Vec3 } from "std/vector"
+import * as color from "ink/color"
+import * as events from "ink/events"
+import * as feel from "ink/feel"
+import * as keys from "ink/input/keys"
+import * as math from "ink/math"
+import * as pen_events from "ink/pen/events"
+import * as host_frame from "ink/pen/host"
+import * as program from "ink/pen/program"
+import * as persist from "ink/persist"
+import * as preferences from "ink/preferences"
+import * as render from "ink/render"
+import * as d2 from "ink/render/d2"
+import * as lines from "ink/render/lines"
+import * as services from "ink/services"
+import * as sound from "ink/sound"
+import * as sketch from "ink/ui/sketch"
+import * as tree from "ink/ui/tree"
+import * as protocol from "pen/protocol"
+
+// Shared procedural 3D PBR catalog indices (meshes: 0=box, 1=sphere).
+private const mesh_box: U32 = 0
+private const mesh_sphere: U32 = 1
+private const mat_stone: U32 = 0
+private const mat_dark_stone: U32 = 1
+private const mat_wood: U32 = 4
+private const mat_brick: U32 = 6
+private const mat_crimson: U32 = 10
+private const mat_gold: U32 = 12
+private const mat_cobalt: U32 = 13
+private const mat_glow_amber: U32 = 14
+private const mat_glow_cyan: U32 = 15
+private const mat_glow_crimson: U32 = 16
+
+private const map_w: U32 = 12
+private const map_h: U32 = 12
+private const tile_size: F32 = 2.4
+private const max_enemies: U32 = 6
+private const max_bolts: U32 = 12
+
+private const bit_fwd: U32 = 1
+private const bit_back: U32 = 2
+private const bit_left: U32 = 4
+private const bit_right: U32 = 8
+private const bit_strafe_l: U32 = 16
+private const bit_strafe_r: U32 = 32
+
+type Enemy is data = $Enemy {
+  x: F32,
+  z: F32,
+  hp: U32,
+  alive: Bool,
+  hit_flash: F32,
+  respawn_t: F32,
+  home_x: F32,
+  home_z: F32,
+  phase: F32,
+}
+
+type Bolt is data = $Bolt {
+  x: F32,
+  y: F32,
+  z: F32,
+  vx: F32,
+  vz: F32,
+  life: F32,
+  active: Bool,
+}
+
+type DoomScalars is data = $DoomScalars {
+  ui: sketch.State,
+  time: F32,
+  px: F32,
+  pz: F32,
+  yaw: F32,
+  bob: F32,
+  hp: F32,
+  kills: U32,
+  wave: U32,
+  fire_cd: F32,
+  muzzle_t: F32,
+  hurt_t: F32,
+  recoil: F32,
+  keys_held: U32,
+  dragging_look: Bool,
+  last_ptr_x: F32,
+  drag_dist: F32,
+  trauma: feel.Trauma,
+}
+
+// Structural record of caller-owned flat arrays so program.run releases temp owners every frame.
+type DoomState = {
+  scalars: #[DoomScalars],
+  tiles: #[U32],
+  enemies: #[Enemy],
+  bolts: #[Bolt],
+}
+
+private func build_map () : #[U32] =>
+  // 0 = floor, 1 = brick wall, 2 = dark steel pillar, 3 = reactor core column
+  return #[
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
+    1, 0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 1,
+    1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
+    1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    1, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 1,
+    1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1,
+    1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 1,
+    1, 0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 1,
+    1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  ]
+
+private func init_scalars () : DoomScalars =>
+  return $DoomScalars {
+    ui: sketch.init_state (),
+    time: 0.0,
+    px: 3.6 * tile_size,
+    pz: 10.3 * tile_size,
+    yaw: -0.18,
+    bob: 0.0,
+    hp: 100.0,
+    kills: 0,
+    wave: 1,
+    fire_cd: 0.0,
+    muzzle_t: 0.0,
+    hurt_t: 0.0,
+    recoil: 0.0,
+    keys_held: 0,
+    dragging_look: false,
+    last_ptr_x: 0.0,
+    drag_dist: 0.0,
+    trauma: feel.trauma_new 1.8 20.0 (math.vec3 0.14 0.14 0.0) math.zero3 666,
+  }
+
+private func seed_enemies (dst: own #[Enemy]) : #[Enemy] =>
+  @storage.truncate dst 0
+  let xs: #[F32] = #[4.4, 9.5, 8.5, 2.5, 6.5, 9.5]
+  let zs: #[F32] = #[7.6, 2.2, 5.5, 5.5, 3.2, 9.5]
+  for i in 0 .. max_enemies:
+    let hx = xs[i] * tile_size
+    let hz = zs[i] * tile_size
+    @storage.push dst ($Enemy {
+      x: hx,
+      z: hz,
+      hp: 3,
+      alive: true,
+      hit_flash: 0.0,
+      respawn_t: 0.0,
+      home_x: hx,
+      home_z: hz,
+      phase: U32.to_f32 i * 1.15,
+    })
+  return dst
+
+private func seed_bolts (dst: own #[Bolt]) : #[Bolt] =>
+  @storage.truncate dst 0
+  for _ in 0 .. max_bolts:
+    @storage.push dst ($Bolt { x: 0.0, y: 0.0, z: 0.0, vx: 0.0, vz: 0.0, life: 0.0, active: false })
+  return dst
+
+private func tile_solid (tiles: &[U32]) -> (wx: F32) -> (wz: F32) : Bool =>
+  if wx < 0.0 or wz < 0.0:
+    return true
+  let gx = F32.to_u32 (floor (wx / tile_size))
+  let gz = F32.to_u32 (floor (wz / tile_size))
+  if gx >= map_w or gz >= map_h:
+    return true
+  return tiles[gz * map_w + gx] != 0
+
+private func can_stand (tiles: &[U32]) -> (x: F32) -> (z: F32) -> (r: F32) : Bool =>
+  if tile_solid tiles (x - r) (z - r):
+    return false
+  if tile_solid tiles (x + r) (z - r):
+    return false
+  if tile_solid tiles (x - r) (z + r):
+    return false
+  if tile_solid tiles (x + r) (z + r):
+    return false
+  return true
+
+private func pbr_draw (mesh: U32) -> (mat: U32) -> (pos: Vec3) -> (yaw: F32) -> (scale: Vec3) -> (metal: F32) -> (rough: F32) : render.Draw =>
+  let d = render.placed mesh mat pos yaw scale
+  d.parameters := $Some (math.vec4 metal rough 0.0 0.0)
+  return d
+
+private func spawn_bolt (bolts: own #[Bolt]) -> (x: F32) -> (z: F32) -> (fx: F32) -> (fz: F32) : #[Bolt] =>
+  let speed = 22.0
+  for i in 0 .. bolts.length:
+    if not bolts[i].active:
+      bolts[i] := $Bolt {
+        x: x + fx * 0.55,
+        y: 1.05,
+        z: z + fz * 0.55,
+        vx: fx * speed,
+        vz: fz * speed,
+        life: 1.5,
+        active: true,
+      }
+      return bolts
+  bolts[0] := $Bolt {
+    x: x + fx * 0.55,
+    y: 1.05,
+    z: z + fz * 0.55,
+    vx: fx * speed,
+    vz: fz * speed,
+    life: 1.5,
+    active: true,
+  }
+  return bolts
+
+private func build_frame (state: own DoomState) -> (dt: F32) -> (viewport: Vec2) -> (evs: &[events.Event]) : (DoomState, render.FrameAccess, #[tree.StoredNode], #[U32]) =>
+  let sc = state.scalars[0]
+  let logical = math.vec2 960.0 600.0
+  let fit = sketch.fit_logical logical viewport
+  let mapped = sketch.map_events fit evs
+  let s = sketch.feed_events (&mapped[0..mapped.length]) sc.ui
+  let safe_dt = clamp 0.0 0.05 dt
+  sc.time := sc.time + safe_dt
+  sc.fire_cd := max 0.0 (sc.fire_cd - safe_dt)
+  sc.muzzle_t := max 0.0 (sc.muzzle_t - safe_dt)
+  sc.hurt_t := max 0.0 (sc.hurt_t - safe_dt)
+  sc.recoil := max 0.0 (sc.recoil - safe_dt * 4.5)
+
+  let want_fire = false
+  let want_reset = false
+  let panel_x_limit = 232.0
+  for ev in mapped:
+    case ev of
+      $events.KeyDown code => do:
+        if code == keys.w or code == keys.up:
+          sc.keys_held := sc.keys_held | bit_fwd
+        if code == keys.s or code == keys.down:
+          sc.keys_held := sc.keys_held | bit_back
+        if code == keys.left or code == keys.q:
+          sc.keys_held := sc.keys_held | bit_left
+        if code == keys.right or code == keys.e:
+          sc.keys_held := sc.keys_held | bit_right
+        if code == keys.a:
+          sc.keys_held := sc.keys_held | bit_strafe_l
+        if code == keys.d:
+          sc.keys_held := sc.keys_held | bit_strafe_r
+        if code == keys.space:
+          want_fire := true
+        if code == keys.r:
+          want_reset := true
+        break ()
+      $events.KeyUp code => do:
+        if code == keys.w or code == keys.up:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ bit_fwd)
+        if code == keys.s or code == keys.down:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ bit_back)
+        if code == keys.left or code == keys.q:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ bit_left)
+        if code == keys.right or code == keys.e:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ bit_right)
+        if code == keys.a:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ bit_strafe_l)
+        if code == keys.d:
+          sc.keys_held := sc.keys_held & (0xFFFFFFFF ^ bit_strafe_r)
+        break ()
+      $events.PointerDown { button, x, y } => do:
+        if button == 0 and x > panel_x_limit and y > 16.0:
+          sc.dragging_look := true
+          sc.last_ptr_x := x
+          sc.drag_dist := 0.0
+        break ()
+      $events.PointerMove { x, y } => do:
+        if sc.dragging_look:
+          let dx = x - sc.last_ptr_x
+          sc.last_ptr_x := x
+          sc.drag_dist := sc.drag_dist + abs dx
+          sc.yaw := sc.yaw - dx * 0.0055
+        break ()
+      $events.PointerUp { button, x, y } => do:
+        if button == 0 and sc.dragging_look:
+          if sc.drag_dist < 10.0:
+            want_fire := true
+          sc.dragging_look := false
+        break ()
+      $events.FocusLost => do:
+        sc.keys_held := 0
+        sc.dragging_look := false
+        break ()
+      _ => ()
+
+  // Build Sketch HUD + mobile touch controls first so button presses take effect this frame.
+  let ui = sketch.begin s logical sc.time sketch.chalkboard_theme
+  ui := sketch.panel "DOOM HUD" (math.vec4 14.0 14.0 226.0 298.0) self
+  ui := sketch.progress "HEALTH" (sc.hp / 100.0) self
+  ui := sketch.muted_label "Drag to turn; tap to fire" self
+  let (fire_btn, ui) = sketch.button "FIRE PLASMA!" ui
+  ui := sketch.row_begin 2 self
+  let (turn_l_btn, ui) = sketch.button "< TURN" ui
+  let (turn_r_btn, ui) = sketch.button "TURN >" ui
+  ui := sketch.row_end self
+  ui := sketch.row_begin 2 self
+  let (fwd_btn, ui) = sketch.button "STEP FWD" ui
+  let (back_btn, ui) = sketch.button "BACK" ui
+  ui := sketch.row_end self
+  let (reset_btn, ui) = sketch.button "RESET RUN" ui
+  ui := sketch.end_panel self
+
+  if fire_btn:
+    want_fire := true
+  if reset_btn:
+    want_reset := true
+  if turn_l_btn:
+    sc.yaw := sc.yaw + 0.36
+  if turn_r_btn:
+    sc.yaw := sc.yaw - 0.36
+
+  // Continuous movement from keyboard or held touch buttons
+  let turn_rate = 2.35
+  if (sc.keys_held & bit_left) != 0:
+    sc.yaw := sc.yaw + turn_rate * safe_dt
+  if (sc.keys_held & bit_right) != 0:
+    sc.yaw := sc.yaw - turn_rate * safe_dt
+
+  let (sy, cy) = sin_cos sc.yaw
+  let fx = -sy
+  let fz = -cy
+  let rx = cy
+  let rz = -sy
+
+  let move_f = 0.0
+  let move_s = 0.0
+  if (sc.keys_held & bit_fwd) != 0:
+    move_f := move_f + 1.0
+  if (sc.keys_held & bit_back) != 0:
+    move_f := move_f - 1.0
+  if (sc.keys_held & bit_strafe_r) != 0:
+    move_s := move_s + 1.0
+  if (sc.keys_held & bit_strafe_l) != 0:
+    move_s := move_s - 1.0
+  if fwd_btn:
+    move_f := move_f + 12.0
+  if back_btn:
+    move_f := move_f - 10.0
+
+  let walk_speed = 5.4
+  let dx = (fx * move_f + rx * move_s) * walk_speed * safe_dt
+  let dz = (fz * move_f + rz * move_s) * walk_speed * safe_dt
+  let pr = 0.42
+  if can_stand (&state.tiles[0..state.tiles.length]) (sc.px + dx) sc.pz pr:
+    sc.px := sc.px + dx
+  if can_stand (&state.tiles[0..state.tiles.length]) sc.px (sc.pz + dz) pr:
+    sc.pz := sc.pz + dz
+  let moved_len = sqrt (dx * dx + dz * dz)
+  if moved_len > 0.001:
+    sc.bob := sc.bob + safe_dt * 10.5
+
+  // Fire plasma bolt
+  if want_fire and sc.fire_cd <= 0.0 and sc.hp > 0.0:
+    state.bolts := spawn_bolt self sc.px sc.pz fx fz
+    sc.fire_cd := 0.22
+    sc.muzzle_t := 0.09
+    sc.recoil := 1.0
+    sc.trauma := feel.add_trauma 0.28 self
+
+  if want_reset or sc.hp <= 0.0:
+    let kept_ui = sc.ui
+    sc := init_scalars ()
+    sc.ui := kept_ui
+    state.enemies := seed_enemies self
+    state.bolts := seed_bolts self
+
+  // Update bolts & check enemy/wall hits
+  let bolt_count = state.bolts.length
+  let enemy_count = state.enemies.length
+  for bi in 0 .. bolt_count:
+    let b = state.bolts[bi]
+    if b.active:
+      let nx = b.x + b.vx * safe_dt
+      let nz = b.z + b.vz * safe_dt
+      let nlife = b.life - safe_dt
+      let hit_wall = tile_solid (&state.tiles[0..state.tiles.length]) nx nz
+      if nlife <= 0.0 or hit_wall:
+        b.active := false
+      else:
+        b.x := nx
+        b.z := nz
+        b.life := nlife
+        for ei in 0 .. enemy_count:
+          let en = state.enemies[ei]
+          if en.alive:
+            let edx = en.x - b.x
+            let edz = en.z - b.z
+            if edx * edx + edz * edz < 0.72:
+              b.active := false
+              en.hit_flash := 0.14
+              if en.hp > 1:
+                en.hp := en.hp - 1
+              else:
+                en.hp := 0
+                en.alive := false
+                en.respawn_t := 5.5
+                sc.kills := sc.kills + 1
+                sc.hp := min 100.0 (sc.hp + 8.0)
+                sc.trauma := feel.add_trauma 0.45 self
+              state.enemies[ei] := en
+              break
+      state.bolts[bi] := b
+
+  // Update enemies (patrol + chase player + melee contact damage)
+  for ei in 0 .. enemy_count:
+    let en = state.enemies[ei]
+    en.hit_flash := max 0.0 (en.hit_flash - safe_dt)
+    if en.alive:
+      let tx = sc.px - en.x
+      let tz = sc.pz - en.z
+      let dist = sqrt (tx * tx + tz * tz)
+      let speed = if dist < 11.0 then 1.65 else 0.9
+      let dir_x = if dist < 11.0 and dist > 0.1 then tx / dist else cos (sc.time * 0.7 + en.phase)
+      let dir_z = if dist < 11.0 and dist > 0.1 then tz / dist else sin (sc.time * 0.7 + en.phase)
+      let ex = en.x + dir_x * speed * safe_dt
+      let ez = en.z + dir_z * speed * safe_dt
+      let ok_x = can_stand (&state.tiles[0..state.tiles.length]) ex en.z 0.45
+      if ok_x:
+        en.x := ex
+      let ok_z = can_stand (&state.tiles[0..state.tiles.length]) en.x ez 0.45
+      if ok_z:
+        en.z := ez
+      if dist < 1.05 and sc.hurt_t <= 0.0:
+        sc.hp := max 0.0 (sc.hp - 14.0)
+        sc.hurt_t := 0.75
+        sc.trauma := feel.add_trauma 0.65 self
+    else:
+      en.respawn_t := en.respawn_t - safe_dt
+      if en.respawn_t <= 0.0:
+        en.x := en.home_x
+        en.z := en.home_z
+        en.hp := 3
+        en.alive := true
+        en.hit_flash := 0.2
+    state.enemies[ei] := en
+
+  sc.trauma := feel.step_trauma safe_dt self
+  let shake = feel.sample_shake sc.trauma
+
+  // Build 3D WebGPU RenderFrame
+  let frame = render.empty_frame ()
+  let settings = frame.settings[0]
+  settings.lighting := $render.Lighting {
+    clear: math.vec4 0.05 0.03 0.05 1.0,
+    ambient: math.vec3 0.17 0.15 0.19,
+    direction: (math.vec3 (-0.3) (-0.9) (-0.2)).normalized,
+    color: math.vec3 0.36 0.32 0.38,
+  }
+  settings.fog.radius := 0.0
+  settings.fog.density := 0.028
+  settings.fog.height := 8.0
+  settings.fog.albedo := math.vec3 0.14 0.08 0.07
+  settings.post_look.tonemap := color.tonemap_agx_mode
+  let eye = math.vec3 (sc.px + shake.offset.x) (1.28 + sin sc.bob * 0.055 + shake.offset.y) sc.pz
+  let look_dir = math.vec3 fx (sc.recoil * 0.045) fz
+  let look = math.look_rotation look_dir math.up
+  let aspect = max 0.5 (viewport.x / max 1.0 viewport.y)
+  settings.view := math.Mat4.view eye look
+  settings.projection := math.Mat4.perspective 1.65 aspect 0.1 80.0
+  frame.settings[0] := settings
+
+  // Floor & ceiling slabs
+  let center_xz = U32.to_f32 map_w * tile_size * 0.5
+  let span_xz = U32.to_f32 map_w * tile_size
+  @storage.push frame.draws (pbr_draw mesh_box mat_stone (math.vec3 center_xz (-0.2) center_xz) 0.0 (math.vec3 span_xz 0.4 span_xz) 0.18 0.62)
+  @storage.push frame.draws (pbr_draw mesh_box mat_dark_stone (math.vec3 center_xz 3.2 center_xz) 0.0 (math.vec3 span_xz 0.4 span_xz) 0.08 0.85)
+
+  // Dungeon walls, pillars, and central glowing reactor core
+  for gz in 0 .. map_h:
+    for gx in 0 .. map_w:
+      let cell = state.tiles[gz * map_w + gx]
+      if cell != 0:
+        let wx = (U32.to_f32 gx + 0.5) * tile_size
+        let wz = (U32.to_f32 gz + 0.5) * tile_size
+        if cell == 1:
+          @storage.push frame.draws (pbr_draw mesh_box mat_brick (math.vec3 wx 1.62 wz) 0.0 (math.vec3 tile_size 2.75 tile_size) 0.06 0.72)
+          @storage.push frame.draws (pbr_draw mesh_box mat_dark_stone (math.vec3 wx 0.22 wz) 0.0 (math.vec3 (tile_size + 0.06) 0.44 (tile_size + 0.06)) 0.35 0.5)
+        else:
+          if cell == 2:
+            @storage.push frame.draws (pbr_draw mesh_box mat_stone (math.vec3 wx 1.5 wz) 0.0 (math.vec3 1.35 3.0 1.35) 0.45 0.42)
+            @storage.push frame.draws (pbr_draw mesh_box mat_glow_amber (math.vec3 wx 2.65 wz) 0.0 (math.vec3 1.45 0.16 1.45) 0.0 0.2)
+          else:
+            @storage.push frame.draws (pbr_draw mesh_box mat_cobalt (math.vec3 wx 0.55 wz) 0.0 (math.vec3 1.5 1.1 1.5) 0.6 0.3)
+            @storage.push frame.draws (pbr_draw mesh_sphere mat_glow_cyan (math.vec3 wx (1.65 + sin (sc.time * 2.4) * 0.14) wz) sc.time (math.vec3 0.95 0.95 0.95) 0.0 0.1)
+
+  // Corridor ceiling lamps & warm flickering torch lights
+  let lamp_xs: #[F32] = #[2.5, 9.5, 5.5, 3.5, 9.5]
+  let lamp_zs: #[F32] = #[2.5, 2.5, 6.5, 9.5, 9.5]
+  for li in 0 .. 5:
+    let lx = lamp_xs[li] * tile_size
+    let lz = lamp_zs[li] * tile_size
+    let flick = 0.90 + 0.10 * sin (sc.time * 7.5 + U32.to_f32 li * 2.1)
+    let is_core = li == 2
+    let lmat = if is_core then mat_glow_cyan else mat_glow_amber
+    let lcol = if is_core then math.vec3 1.2 3.8 4.8 else math.vec3 (4.8 * flick) (2.6 * flick) (1.1 * flick)
+    if not is_core:
+      @storage.push frame.draws (pbr_draw mesh_box lmat (math.vec3 lx 2.92 lz) 0.0 (math.vec3 0.75 0.14 0.75) 0.0 0.2)
+    @storage.push frame.lights (render.point_light (math.vec3 lx 2.25 lz) 15.0 lcol)
+
+  // Cyber-demons (armored torso + shoulder pauldrons + chest core + glowing crimson eyes)
+  for ei in 0 .. state.enemies.length:
+    let en = state.enemies[ei]
+    if en.alive:
+      let bob_y = abs (sin (sc.time * 5.2 + en.phase)) * 0.12
+      let face_yaw = math.atan2 (sc.px - en.x) (sc.pz - en.z)
+      let body_mat = if en.hit_flash > 0.0 then mat_glow_amber else mat_crimson
+      @storage.push frame.draws (pbr_draw mesh_box body_mat (math.vec3 en.x (0.85 + bob_y) en.z) face_yaw (math.vec3 0.84 1.15 0.62) 0.25 0.42)
+      @storage.push frame.draws (pbr_draw mesh_box mat_stone (math.vec3 en.x (1.28 + bob_y) en.z) face_yaw (math.vec3 1.22 0.28 0.56) 0.65 0.35)
+      @storage.push frame.draws (pbr_draw mesh_box mat_glow_amber (math.vec3 en.x (0.98 + bob_y) en.z) face_yaw (math.vec3 0.30 0.24 0.66) 0.0 0.1)
+      @storage.push frame.draws (pbr_draw mesh_box mat_dark_stone (math.vec3 en.x (1.62 + bob_y) en.z) face_yaw (math.vec3 0.56 0.44 0.52) 0.35 0.45)
+      @storage.push frame.draws (pbr_draw mesh_box mat_glow_crimson (math.vec3 en.x (1.66 + bob_y) en.z) face_yaw (math.vec3 0.46 0.12 0.56) 0.0 0.1)
+      @storage.push frame.lights (render.point_light (math.vec3 en.x 1.45 en.z) 5.5 (math.vec3 2.0 0.45 0.25))
+
+  // Flying cyan plasma bolts + dynamic corridor lights
+  for bi in 0 .. state.bolts.length:
+    let b = state.bolts[bi]
+    if b.active:
+      @storage.push frame.draws (pbr_draw mesh_sphere mat_glow_cyan (math.vec3 b.x b.y b.z) 0.0 (math.vec3 0.30 0.30 0.30) 0.0 0.1)
+      @storage.push frame.lights (render.point_light (math.vec3 b.x b.y b.z) 8.5 (math.vec3 0.8 3.2 4.8))
+
+  // First-person plasma blaster barrel + glowing cyan energy coils mounted in front of camera
+  let gun_back = 0.52 - sc.recoil * 0.12
+  let gun_pos = math.vec3 (eye.x + fx * gun_back + rx * 0.22) (eye.y - 0.24 - sc.recoil * 0.04) (eye.z + fz * gun_back + rz * 0.22)
+  @storage.push frame.draws (pbr_draw mesh_box mat_cobalt gun_pos sc.yaw (math.vec3 0.15 0.14 0.52) 0.8 0.25)
+  let coil_pos = math.vec3 (gun_pos.x + fx * 0.06) (gun_pos.y + 0.08) (gun_pos.z + fz * 0.06)
+  @storage.push frame.draws (pbr_draw mesh_box mat_glow_cyan coil_pos sc.yaw (math.vec3 0.06 0.04 0.26) 0.0 0.1)
+  let tip_pos = math.vec3 (gun_pos.x + fx * 0.26) (gun_pos.y + 0.03) (gun_pos.z + fz * 0.26)
+  let tip_mat = if sc.muzzle_t > 0.0 then mat_glow_cyan else mat_gold
+  @storage.push frame.draws (pbr_draw mesh_box tip_mat tip_pos sc.yaw (math.vec3 0.10 0.10 0.12) 0.7 0.2)
+  if sc.muzzle_t > 0.0:
+    @storage.push frame.lights (render.point_light tip_pos 8.5 (math.vec3 0.9 3.6 5.0))
+
+  // Center reticle + top-right 2D dungeon minimap overlay
+  let cx = logical.x * 0.5
+  let cy = logical.y * 0.5
+  let cross_col = if sc.hurt_t > 0.0 then math.vec4 1.0 0.25 0.25 0.95 else math.vec4 0.35 0.96 1.0 0.9
+  let cross_st = $lines.LineStyle { width_px: 2.0, dash_len_px: 0.0, gap_len_px: 0.0, feather_px: 1.0, layer: $lines.OnTop }
+  ui.segments := lines.push_segment_2d (math.vec2 (cx - 10.0) cy) (math.vec2 (cx - 4.0) cy) cross_col cross_st self
+  ui.segments := lines.push_segment_2d (math.vec2 (cx + 4.0) cy) (math.vec2 (cx + 10.0) cy) cross_col cross_st self
+  ui.segments := lines.push_segment_2d (math.vec2 cx (cy - 10.0)) (math.vec2 cx (cy - 4.0)) cross_col cross_st self
+  ui.segments := lines.push_segment_2d (math.vec2 cx (cy + 4.0)) (math.vec2 cx (cy + 10.0)) cross_col cross_st self
+
+  // Top-right minimap
+  let cell_px = 11.0
+  let mm_w = U32.to_f32 map_w * cell_px
+  let mm_x = logical.x - mm_w - 22.0
+  let mm_y = 18.0
+  let mm_bg = d2.rounded_rect (math.vec4 (mm_x - 6.0) (mm_y - 6.0) (mm_w + 12.0) (mm_w + 12.0)) (math.vec4 8.0 8.0 8.0 8.0) (math.vec4 0.06 0.08 0.11 0.82)
+  mm_bg.border_color := math.vec4 0.35 0.45 0.60 0.75
+  mm_bg.border_width_px := 1.5
+  mm_bg.overlay := true
+  @storage.push ui.shapes mm_bg
+  for gz in 0 .. map_h:
+    for gx in 0 .. map_w:
+      let cell = state.tiles[gz * map_w + gx]
+      if cell != 0:
+        let col = if cell == 3 then math.vec4 0.25 0.92 1.0 0.95 else math.vec4 0.42 0.28 0.26 0.9
+        let box = d2.rounded_rect (math.vec4 (mm_x + U32.to_f32 gx * cell_px) (mm_y + U32.to_f32 gz * cell_px) (cell_px - 1.0) (cell_px - 1.0)) (math.vec4 1.5 1.5 1.5 1.5) col
+        box.overlay := true
+        @storage.push ui.shapes box
+  for ei in 0 .. state.enemies.length:
+    let en = state.enemies[ei]
+    if en.alive:
+      let ex = mm_x + (en.x / tile_size) * cell_px
+      let ez = mm_y + (en.z / tile_size) * cell_px
+      let edot = d2.circle (math.vec2 ex ez) 3.6 (math.vec4 1.0 0.28 0.25 0.95)
+      edot.overlay := true
+      @storage.push ui.shapes edot
+  let pmx = mm_x + (sc.px / tile_size) * cell_px
+  let pmz = mm_y + (sc.pz / tile_size) * cell_px
+  let pdot = d2.circle (math.vec2 pmx pmz) 4.0 (math.vec4 0.35 0.95 1.0 1.0)
+  pdot.overlay := true
+  @storage.push ui.shapes pdot
+  ui.segments := lines.push_segment_2d (math.vec2 pmx pmz) (math.vec2 (pmx + fx * 10.0) (pmz + fz * 10.0)) (math.vec4 1.0 0.95 0.65 1.0) cross_st self
+
+  ui := sketch.apply_fit fit self
+  let (next_ui, frame, nodes, labels) = sketch.finish_with_tree ui frame
+  sc.ui := next_ui
+  state.scalars[0] := sc
+  return (state, frame, nodes, labels)
+
+private const schema: U32 = 1
+
+private func encode (frame: render.FrameAccess) -> (nodes: &[tree.StoredNode]) -> (labels: &[U32]) -> (out: own #[F32]) : #[F32] =>
+  let kept = preferences.make
+    ($preferences.Quality { msaa: 1, fxaa: false, scale: 1.0, filtering: 4, shadows: 0,
+      occlusion: false, sky: false, fog: 0.4, effects: true, bloom: true, reflections: 0, volumetrics: 0 })
+    ($preferences.Volumes { master: 0.0, effects: 0.0, music: 0.0 })
+    ($preferences.Controls { left_handed: false })
+  let audio = sound.empty_access ()
+  let next: #[U32] = #[1]
+  let requests: #[services.Request] = #[]
+  let waiting: #[services.Request] = #[]
+  let filling: #[services.Filling] = #[]
+  let answers: #[services.Answer] = #[]
+  let statuses: #[U32] = #[]
+  let payload: #[F32] = #[]
+  let service_state = services.access next requests waiting filling answers statuses payload
+  return host_frame.append_frame schema (persist.requests ()) (sound.read audio) kept nodes
+    labels (render.finish frame) (&service_state.outbox[0..0]) service_state out
+
+private func dispatch (state: own DoomState) -> (operation: U32) -> (payload: &[F32]) -> (out: own #[F32]) : (DoomState, #[F32]) =>
+  if operation == 1:
+    state.scalars[0] := init_scalars ()
+    state.enemies := seed_enemies self
+    state.bolts := seed_bolts self
+    return (state, program.append #[100.0, 0.0] out)
+  if operation == 2:
+    let raw: #[protocol.Event] = #[]
+    let input = protocol.decode_input_into payload raw
+    let evs: #[events.Event] = #[]
+    for r in input.events:
+      @storage.push evs (pen_events.from_packet r)
+    let (next_state, frame, nodes, labels) = build_frame state input.elapsed (math.vec2 input.width input.height) (&evs[0..evs.length])
+    return (next_state, encode frame (&nodes[0..nodes.length]) (&labels[0..labels.length]) out)
+  if operation == 3:
+    let sc = state.scalars[0]
+    return (state, program.append #[sc.hp, U32.to_f32 sc.kills] out)
+  if operation == 4:
+    return (state, program.append #[1.0] out)
+  return (state, out)
+
+io main (host: #[F32] -> #[F32] ! {Foreign}) : Unit ! {Foreign} =>
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
+  let scalars: #[DoomScalars] = #[init_scalars ()]
+  let tiles = build_map ()
+  let enemies = seed_enemies #[]
+  let bolts = seed_bolts #[]
+  let state: DoomState = { scalars, tiles, enemies, bolts }
+  use _ <- program.run dispatch (func (own s) -> (_: Bool) => s) state schema false incoming outgoing host
+  return ()
+
+io test_mini_doom () : #[F32] =>
+  let scalars: #[DoomScalars] = #[init_scalars ()]
+  let state: DoomState = { scalars, tiles: build_map (), enemies: seed_enemies #[], bolts: seed_bolts #[] }
+  let fire_evs: #[events.Event] = #[$events.KeyDown keys.space]
+  let (state, frame, nodes, _) = build_frame state (1.0 / 60.0) (math.vec2 960.0 600.0) (&fire_evs[0..fire_evs.length])
+  let ok = frame.draws.length > 50 and frame.lights.length >= 6 and state.bolts[0].active and nodes.length >= 6
+  return if ok then #[1.0, 0.0] else #[1.0, 1.0]
