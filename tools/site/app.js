@@ -1,37 +1,7 @@
 // Detail-page controller: lazy source viewer + Blot ABI 8 Wasm runner.
+import { highlightBlot } from './blot-highlight.js';
 
 const TRAP_SITE_OFFSET = 772;
-const KEYWORDS = new Set([
-  'import', 'as', 'from', 'type', 'is', 'data', 'trait', 'effect', 'opaque', 'impl', 'where',
-  'func', 'io', 'private', 'const', 'let', 'own', 'self', 'if', 'then', 'else', 'for', 'in',
-  'case', 'of', 'return', 'break', 'continue', 'do', 'use', 'with', 'test', 'expect_trap',
-  'and', 'or', 'not', 'true', 'false', 'panic', 'copy', 'freeze',
-]);
-
-function escapeHtml(text) {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function highlightBlot(source) {
-  const re = /\/\/[^\n]*|"(?:\\.|[^"\\])*"|@[A-Za-z_][A-Za-z0-9_.]*|\$[A-Za-z_][A-Za-z0-9_.]*|\b0x[0-9a-fA-F]+\b|\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b/g;
-  let out = '';
-  let last = 0;
-  for (const m of source.matchAll(re)) {
-    if (m.index > last) out += escapeHtml(source.slice(last, m.index));
-    const tok = m[0];
-    let cls = '';
-    if (tok.startsWith('//')) cls = 'tok-com';
-    else if (tok.startsWith('"')) cls = 'tok-str';
-    else if (tok.startsWith('@')) cls = 'tok-int';
-    else if (tok.startsWith('$')) cls = 'tok-con';
-    else if (/^\d/.test(tok)) cls = 'tok-num';
-    else if (KEYWORDS.has(tok)) cls = 'tok-kw';
-    out += cls ? `<span class="${cls}">${escapeHtml(tok)}</span>` : escapeHtml(tok);
-    last = m.index + tok.length;
-  }
-  if (last < source.length) out += escapeHtml(source.slice(last));
-  return out;
-}
 
 // ── On-demand source disclosure ─────────────────────────────────────────────
 function initSourceDisclosures() {

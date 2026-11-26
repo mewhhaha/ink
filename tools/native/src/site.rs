@@ -20,6 +20,7 @@ use std::{
 
 const STYLE_CSS: &str = include_str!("../../site/style.css");
 const APP_JS: &str = include_str!("../../site/app.js");
+const BLOT_HIGHLIGHT_JS: &str = include_str!("../../site/blot-highlight.js");
 const DEMO_JS: &str = include_str!("../../site/demo.js");
 const DEMOS_SW_JS: &str = include_str!("../../site/demos-sw.js");
 const RETIRE_ROOT_SW_JS: &str = include_str!("../../site/service-worker.js");
@@ -806,6 +807,7 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
     std::fs::write(out_dir.join("index.html"), render_index_html(has_docs))?;
     std::fs::write(out_dir.join("style.css"), STYLE_CSS)?;
     std::fs::write(out_dir.join("app.js"), APP_JS)?;
+    std::fs::write(out_dir.join("blot-highlight.js"), BLOT_HIGHLIGHT_JS)?;
     std::fs::write(out_dir.join("demo.js"), DEMO_JS)?;
     std::fs::write(out_dir.join("service-worker.js"), RETIRE_ROOT_SW_JS)?;
     std::fs::write(out_dir.join(".nojekyll"), "")?;
