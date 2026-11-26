@@ -462,7 +462,6 @@ struct SiteMeta {
 
 struct DetailPage<'a> {
     body_class: &'a str,
-    category: &'a str,
     title: &'a str,
     slug: &'a str,
     has_docs: bool,
@@ -475,7 +474,6 @@ struct DetailPage<'a> {
 fn render_detail_html(page: &DetailPage) -> String {
     let DetailPage {
         body_class,
-        category,
         title,
         slug,
         has_docs,
@@ -485,7 +483,6 @@ fn render_detail_html(page: &DetailPage) -> String {
         scripts,
     } = page;
     let title = escape_html(title);
-    let category = escape_html(category);
     let drawer = render_drawer_html(slug, *has_docs);
 
     format!(
@@ -502,10 +499,7 @@ fn render_detail_html(page: &DetailPage) -> String {
   <header class="topbar">
     <div class="topbar-inner">
       <button class="tool-btn drawer-trigger" id="drawer-trigger" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="examples-drawer" aria-label="All examples">{ICON_GRID}<span class="tool-label">Examples</span></button>
-      <div class="topbar-heading">
-        <p class="topbar-context"><a class="brand" href="../../">{ICON_BRAND}<span>Ink</span></a><span class="topbar-sep" aria-hidden="true">/</span><span>{category}</span></p>
-        <h1 class="topbar-title" title="{title}">{title}</h1>
-      </div>
+      <h1 class="topbar-title" title="{title}">{title}</h1>
       <div class="topbar-actions">{actions}</div>
     </div>
   </header>
@@ -653,7 +647,6 @@ fn render_pen_demo_html(
         format!("  <script type=\"module\" src=\"../../demo.js?v={runtime_version}\"></script>\n");
     render_detail_html(&DetailPage {
         body_class: "page-demo",
-        category: "WebGPU demo",
         title: spec.title,
         slug: spec.slug,
         has_docs,
@@ -704,7 +697,6 @@ fn render_wasm_example_html(
         format!("  <script id=\"example-spec\" type=\"application/json\">{json}</script>\n");
     Ok(render_detail_html(&DetailPage {
         body_class: "page-example",
-        category: "Blot Wasm example",
         title: spec.title,
         slug: spec.slug,
         has_docs,
@@ -1071,6 +1063,7 @@ mod tests {
             assert_drawer_lists_everything(&html, &format!("../../demos/{}/", demo.slug));
             assert!(!html.contains("restart-btn"));
             assert!(!html.contains("Restart"));
+            assert!(!html.contains("topbar-context"));
             for id in ["stage", "game", "loading", "status", "fullscreen-btn"] {
                 assert_eq!(html.matches(&format!("id=\"{id}\"")).count(), 1, "{id}");
             }
