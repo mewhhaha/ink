@@ -34,18 +34,49 @@ func flow () : Flow =>
 // cost zero (duplicates collapse). Directions are zeroed.
 func begin_into (flow: own Flow) -> (g: navigation.Grid) -> (goals: &[U32]) : Flow =>
   let n = g.costs.length
-  @storage.truncate flow.costs 0
-  @storage.truncate flow.directions 0
-  for _ in 0 .. n:
-    @storage.push flow.costs navigation.unreachable
-    @storage.push flow.directions 0.0
-    @storage.push flow.directions 0.0
-  flow.heap := heap.clear flow.heap
+  let $Flow { costs, directions, heap: h } = flow
+  let $heap.Heap { keys, ties, ids } = h
+  let c_len = costs.length
+  let c_common = min c_len n
+  for i in 0 .. c_common:
+    costs[i] := navigation.unreachable
+  for i in c_common .. n:
+    @storage.push costs navigation.unreachable
+  if c_len > n:
+    @storage.truncate costs n
+  let d_n = n * 2
+  let d_len = directions.length
+  let d_common = min d_len d_n
+  for i in 0 .. d_common:
+    directions[i] := 0.0
+  for i in d_common .. d_n:
+    @storage.push directions 0.0
+  if d_len > d_n:
+    @storage.truncate directions d_n
+  @storage.truncate keys 0
+  @storage.truncate ties 0
+  @storage.truncate ids 0
   for goal in goals:
-    if goal < n and g.costs[goal] > 0.0 and flow.costs[goal] != 0.0:
-      flow.costs[goal] := 0.0
-      flow.heap := heap.push flow.heap 0.0 0.0 goal
-  return flow
+    if goal < n and g.costs[goal] > 0.0 and costs[goal] != 0.0:
+      costs[goal] := 0.0
+      let k = ids.length
+      @storage.push keys 0.0
+      @storage.push ties 0.0
+      @storage.push ids goal
+      for 0 .. 32:
+        if k == 0:
+          break
+        let parent = (k - 1) / 2
+        let pk = keys[parent]
+        let pi = ids[parent]
+        if pk < 0.0 or (pk == 0.0 and pi < goal):
+          break
+        keys[k] := pk
+        ids[k] := pi
+        k := parent
+      keys[k] := 0.0
+      ids[k] := goal
+  return $Flow { costs, directions, heap: $heap.Heap { keys, ties, ids } }
 
 // Expands at most `limit` cells; returns the flow and whether the queue is
 // empty (the field is final). Stale queue entries are skipped without cost.
@@ -55,70 +86,123 @@ func step_into (flow: own Flow) -> (g: navigation.Grid) -> (limit: U32) : (Flow,
   let n = g.costs.length
   if width == 0 or height == 0 or flow.costs.length != n or flow.directions.length != n * 2 or width > 4294967295 / height or width * height != n:
     return (flow, true)
+  let $Flow { costs, directions, heap: h } = flow
+  let $heap.Heap { keys, ties, ids } = h
+  if keys.length != ids.length or ties.length != ids.length:
+    return panic "navigation heap lanes have mismatched lengths"
+  let g_costs = g.costs
   let expanded = 0
   for 0 .. 4294967295:
-    if flow.heap.ids.length == 0 or expanded >= limit:
+    let h_len = ids.length
+    if h_len == 0 or expanded >= limit:
       break
-    let cell = heap.top flow.heap
-    let key = heap.top_key flow.heap
-    flow.heap := heap.pop flow.heap
-    if cell >= n or key > flow.costs[cell]:
+    let cell = ids[0]
+    let key = keys[0]
+    let last = h_len - 1
+    let moved_k = keys[last]
+    let moved_t = ties[last]
+    let moved_i = ids[last]
+    @storage.truncate keys last
+    @storage.truncate ties last
+    @storage.truncate ids last
+    if last > 0:
+      let k = 0
+      for 0 .. 32:
+        let left = k * 2 + 1
+        if left >= last:
+          break
+        let child = left
+        let ck = keys[left]
+        let ct = ties[left]
+        let ci = ids[left]
+        let right = left + 1
+        if right < last:
+          let rk = keys[right]
+          let rt = ties[right]
+          let ri = ids[right]
+          if rk < ck or (rk == ck and (rt > ct or (rt == ct and ri < ci))):
+            child := right
+            ck := rk
+            ct := rt
+            ci := ri
+        if not (ck < moved_k or (ck == moved_k and (ct > moved_t or (ct == moved_t and ci < moved_i)))):
+          break
+        keys[k] := ck
+        ties[k] := ct
+        ids[k] := ci
+        k := child
+      keys[k] := moved_k
+      ties[k] := moved_t
+      ids[k] := moved_i
+    if cell >= n or key > costs[cell]:
       continue
     expanded := self + 1
     let x = cell % width
     let y = cell / width
     // `cell` is entered by the neighbour that moves into it.
-    let entering = g.costs[cell]
-    let w_l = x > 0 and g.costs[cell - 1] > 0.0
-    let w_r = x + 1 < width and g.costs[cell + 1] > 0.0
-    let w_u = y > 0 and g.costs[cell - width] > 0.0
-    let w_d = y + 1 < height and g.costs[cell + width] > 0.0
+    let entering = g_costs[cell]
+    let w_l = x > 0 and g_costs[cell - 1] > 0.0
+    let w_r = x + 1 < width and g_costs[cell + 1] > 0.0
+    let w_u = y > 0 and g_costs[cell - width] > 0.0
+    let w_d = y + 1 < height and g_costs[cell + width] > 0.0
     let ortho_cost = key + entering
     if ortho_cost < navigation.unreachable:
-      if w_l:
-        let from = cell - 1
-        if ortho_cost < flow.costs[from]:
-          flow.costs[from] := ortho_cost
-          flow.heap := heap.push flow.heap ortho_cost 0.0 from
-      if w_r:
-        let from = cell + 1
-        if ortho_cost < flow.costs[from]:
-          flow.costs[from] := ortho_cost
-          flow.heap := heap.push flow.heap ortho_cost 0.0 from
-      if w_u:
-        let from = cell - width
-        if ortho_cost < flow.costs[from]:
-          flow.costs[from] := ortho_cost
-          flow.heap := heap.push flow.heap ortho_cost 0.0 from
-      if w_d:
-        let from = cell + width
-        if ortho_cost < flow.costs[from]:
-          flow.costs[from] := ortho_cost
-          flow.heap := heap.push flow.heap ortho_cost 0.0 from
+      for dir in 0 .. 4:
+        let ok = if dir == 0 then w_l else if dir == 1 then w_r else if dir == 2 then w_u else w_d
+        if ok:
+          let from = if dir == 0 then cell - 1 else if dir == 1 then cell + 1 else if dir == 2 then cell - width else cell + width
+          if ortho_cost < costs[from]:
+            costs[from] := ortho_cost
+            let pk_idx = ids.length
+            @storage.push keys ortho_cost
+            @storage.push ties 0.0
+            @storage.push ids from
+            for 0 .. 32:
+              if pk_idx == 0:
+                break
+              let parent = (pk_idx - 1) / 2
+              let pk = keys[parent]
+              let pt = ties[parent]
+              let pi = ids[parent]
+              if not (ortho_cost < pk or (ortho_cost == pk and (0.0 > pt or (0.0 == pt and from < pi)))):
+                break
+              keys[pk_idx] := pk
+              ties[pk_idx] := pt
+              ids[pk_idx] := pi
+              pk_idx := parent
+            keys[pk_idx] := ortho_cost
+            ties[pk_idx] := 0.0
+            ids[pk_idx] := from
     let diag_cost = key + diag_len * entering
     if diag_cost < navigation.unreachable:
-      if w_u and w_l:
-        let from = cell - width - 1
-        if g.costs[from] > 0.0 and diag_cost < flow.costs[from]:
-          flow.costs[from] := diag_cost
-          flow.heap := heap.push flow.heap diag_cost 0.0 from
-      if w_u and w_r:
-        let from = cell - width + 1
-        if g.costs[from] > 0.0 and diag_cost < flow.costs[from]:
-          flow.costs[from] := diag_cost
-          flow.heap := heap.push flow.heap diag_cost 0.0 from
-      if w_d and w_l:
-        let from = cell + width - 1
-        if g.costs[from] > 0.0 and diag_cost < flow.costs[from]:
-          flow.costs[from] := diag_cost
-          flow.heap := heap.push flow.heap diag_cost 0.0 from
-      if w_d and w_r:
-        let from = cell + width + 1
-        if g.costs[from] > 0.0 and diag_cost < flow.costs[from]:
-          flow.costs[from] := diag_cost
-          flow.heap := heap.push flow.heap diag_cost 0.0 from
-  let done = flow.heap.ids.length == 0
-  return (flow, done)
+      for dir in 0 .. 4:
+        let ok = if dir == 0 then (w_u and w_l) else if dir == 1 then (w_u and w_r) else if dir == 2 then (w_d and w_l) else (w_d and w_r)
+        if ok:
+          let from = if dir == 0 then cell - width - 1 else if dir == 1 then cell - width + 1 else if dir == 2 then cell + width - 1 else cell + width + 1
+          if g_costs[from] > 0.0 and diag_cost < costs[from]:
+            costs[from] := diag_cost
+            let pk_idx = ids.length
+            @storage.push keys diag_cost
+            @storage.push ties 0.0
+            @storage.push ids from
+            for 0 .. 32:
+              if pk_idx == 0:
+                break
+              let parent = (pk_idx - 1) / 2
+              let pk = keys[parent]
+              let pt = ties[parent]
+              let pi = ids[parent]
+              if not (diag_cost < pk or (diag_cost == pk and (0.0 > pt or (0.0 == pt and from < pi)))):
+                break
+              keys[pk_idx] := pk
+              ties[pk_idx] := pt
+              ids[pk_idx] := pi
+              pk_idx := parent
+            keys[pk_idx] := diag_cost
+            ties[pk_idx] := 0.0
+            ids[pk_idx] := from
+  let done = ids.length == 0
+  return ($Flow { costs, directions, heap: $heap.Heap { keys, ties, ids } }, done)
 
 // Writes each cell's direction from the current costs: the legal move into the
 // reached neighbour minimizing step cost + that neighbour's cost (first wins

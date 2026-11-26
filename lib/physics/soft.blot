@@ -84,37 +84,39 @@ private func scaled_delta (a: Vec3) -> (b: Vec3) : (F32, Vec3) =>
   let inv = 1.0 / s_len
   return (dist, $Vec3 { x: sx * inv, y: sy * inv, z: sz * inv })
 
-private func resolve_collider (p: Vec3) -> (r: F32) -> (c: Collider) : Maybe Vec3 =>
+private func resolve_collider_pre (p: Vec3) -> (r: F32) -> (c: Collider) : Maybe Vec3 =>
   return case c of
     $Sphere { center, radius } => do:
       let min_d = max 0.0 radius + max 0.0 r
       if not (is_finite min_d):
         break $Nothing
-      let d = p - center
-      let raw = vector.Vec3.length d
-      let dist = raw
-      let dir = math.up
-      if is_finite raw:
-        if raw >= min_d:
+      let dx = p.x - center.x
+      let dy = p.y - center.y
+      let dz = p.z - center.z
+      let d2 = dx * dx + dy * dy + dz * dz
+      let min_d2 = min_d * min_d
+      if is_finite d2 and is_finite min_d2:
+        if d2 >= min_d2:
           break $Some p
-        dir := unit_or d math.up
-      else:
-        let (sdist, sdir) = scaled_delta center p
-        dist := sdist
-        if not (is_finite dist) or dist >= min_d:
-          break $Some p
-        dir := if dist > 0.000001 and math.finite3 sdir then sdir else math.up
+        let dist = sqrt d2
+        let dir = if dist > 0.0 then $Vec3 { x: dx / dist, y: dy / dist, z: dz / dist } else math.up
+        let resolved = center + dir * min_d
+        break if math.finite3 resolved then $Some resolved else $Nothing
+      let (sdist, sdir) = scaled_delta center p
+      if not (is_finite sdist) or sdist >= min_d:
+        break $Some p
+      let dir = if sdist > 0.000001 and math.finite3 sdir then sdir else math.up
       let resolved = center + dir * min_d
       break if math.finite3 resolved then $Some resolved else $Nothing
     $Plane { normal, distance } => do:
-      let n = unit_or normal math.up
+      let n = normal
       let min_d = max 0.0 r
-      let signed = vector.Vec3.dot n p - distance
+      let signed = n.x * p.x + n.y * p.y + n.z * p.z - distance
       if is_finite signed:
         if signed >= min_d:
           break $Some p
         let pen = min_d - signed
-        let resolved = p + n * pen
+        let resolved = $Vec3 { x: p.x + n.x * pen, y: p.y + n.y * pen, z: p.z + n.z * pen }
         break if is_finite pen and math.finite3 resolved then $Some resolved else $Nothing
       let hs = (n.x * (p.x * 0.5) + n.y * (p.y * 0.5) + n.z * (p.z * 0.5)) - distance * 0.5
       if not (is_finite hs):
@@ -122,7 +124,7 @@ private func resolve_collider (p: Vec3) -> (r: F32) -> (c: Collider) : Maybe Vec
       if hs >= min_d * 0.5:
         break $Some p
       let pen = min_d - 2.0 * hs
-      let resolved = p + n * pen
+      let resolved = $Vec3 { x: p.x + n.x * pen, y: p.y + n.y * pen, z: p.z + n.z * pen }
       break if is_finite pen and math.finite3 resolved then $Some resolved else $Nothing
 
 // Step a cloth or rope particle system with XPBD distance constraints.
@@ -134,12 +136,23 @@ func step_cloth (gravity: Vec3) -> (wind: Vec3) -> (drag: F32) -> (dt: F32) -> (
   for pt in particles:
     if not (math.finite3 pt.position and math.finite3 pt.previous and is_finite pt.inv_mass and is_finite pt.radius) or pt.inv_mass < 0.0 or pt.radius < 0.0:
       return (false, particles)
-  for c in colliders:
-    let ok = case c of
-      $Sphere { center, radius } => math.finite3 center and is_finite radius
-      $Plane { normal, distance } => math.finite3 normal and is_finite distance
-    if not ok:
-      return (false, particles)
+  let pre_colliders: #[Collider] = #[]
+  let has_colliders = colliders.length > 0
+  if has_colliders:
+    for c in colliders:
+      let valid = case c of
+        $Sphere { center, radius } => do:
+          if not (math.finite3 center and is_finite radius):
+            break false
+          @storage.push pre_colliders c
+          break true
+        $Plane { normal, distance } => do:
+          if not (math.finite3 normal and is_finite distance):
+            break false
+          @storage.push pre_colliders ($Plane { normal: unit_or normal math.up, distance })
+          break true
+      if not valid:
+        return (false, particles)
   for link in links:
     if link.a >= count or link.b >= count or not (is_finite link.rest and is_finite link.compliance) or link.rest < 0.0 or link.compliance < 0.0:
       return (false, particles)
@@ -147,98 +160,149 @@ func step_cloth (gravity: Vec3) -> (wind: Vec3) -> (drag: F32) -> (dt: F32) -> (
   if dt == 0.0 or dt2 <= 0.0 or not (is_finite dt2):
     return (true, particles)
   let damp = clamp 0.0 1.0 (1.0 - clamp 0.0 1.0 drag)
-  let accel = (gravity + wind) * dt2
-  if not (math.finite3 accel):
+  let accel_x = (gravity.x + wind.x) * dt2
+  let accel_y = (gravity.y + wind.y) * dt2
+  let accel_z = (gravity.z + wind.z) * dt2
+  if not (is_finite accel_x and is_finite accel_y and is_finite accel_z):
     return (false, particles)
-  let work = @storage.copy particles
+  let pos = @array.fill (count * 3) 0.0
   for i in 0 .. count:
-    let pt = work[i]
+    let pt = particles[i]
+    let o = i * 3
     if pt.inv_mass > 0.0:
-      let vel = (pt.position - pt.previous) * damp
-      let next_p = pt.position + vel + accel
-      if not (math.finite3 vel and math.finite3 next_p):
+      let vx = (pt.position.x - pt.previous.x) * damp
+      let vy = (pt.position.y - pt.previous.y) * damp
+      let vz = (pt.position.z - pt.previous.z) * damp
+      let nx = pt.position.x + vx + accel_x
+      let ny = pt.position.y + vy + accel_y
+      let nz = pt.position.z + vz + accel_z
+      if not (is_finite vx and is_finite vy and is_finite vz and is_finite nx and is_finite ny and is_finite nz):
         return (false, particles)
-      work[i] := $Particle { position: next_p, previous: pt.position, inv_mass: pt.inv_mass, radius: pt.radius }
+      pos[o] := nx
+      pos[o + 1] := ny
+      pos[o + 2] := nz
+    else:
+      pos[o] := pt.position.x
+      pos[o + 1] := pt.position.y
+      pos[o + 2] := pt.position.z
   let iters = min 4096 (max 1 iterations)
   for 0 .. iters:
     for link in links:
-      let pa = work[link.a]
-      let pb = work[link.b]
-      let wa = max 0.0 pa.inv_mass
-      let wb = max 0.0 pb.inv_mass
-      let w_sum = wa + wb
+      let a = link.a
+      let b = link.b
+      let wa = max 0.0 particles[a].inv_mass
+      let wb = max 0.0 particles[b].inv_mass
       if wa > 0.0 or wb > 0.0:
-        let delta = pb.position - pa.position
-        let raw_dist = vector.Vec3.length delta
-        let dist = raw_dist
-        let dir = math.zero3
-        if is_finite raw_dist:
-          if raw_dist > 0.000001:
-            dir := delta * (1.0 / raw_dist)
+        let ao = a * 3
+        let bo = b * 3
+        let ax = pos[ao]
+        let ay = pos[ao + 1]
+        let az = pos[ao + 2]
+        let bx = pos[bo]
+        let by = pos[bo + 1]
+        let bz = pos[bo + 2]
+        let dx = bx - ax
+        let dy = by - ay
+        let dz = bz - az
+        let dist = sqrt (dx * dx + dy * dy + dz * dz)
+        let dir_x = 0.0
+        let dir_y = 0.0
+        let dir_z = 0.0
+        if is_finite dist:
+          if dist > 0.000001:
+            let inv_d = 1.0 / dist
+            dir_x := dx * inv_d
+            dir_y := dy * inv_d
+            dir_z := dz * inv_d
         else:
-          let (sdist, sdir) = scaled_delta pa.position pb.position
+          let (sdist, sdir) = scaled_delta ($Vec3 { x: ax, y: ay, z: az }) ($Vec3 { x: bx, y: by, z: bz })
           if not (is_finite sdist and math.finite3 sdir):
             return (false, particles)
           dist := sdist
-          dir := sdir
+          dir_x := sdir.x
+          dir_y := sdir.y
+          dir_z := sdir.z
         if dist > 0.000001:
           let alpha = if link.compliance == 0.0 then 0.0 else link.compliance / dt2
-          let denom = w_sum + alpha
+          let denom = (wa + wb) + alpha
           let stretch = dist - link.rest
           if not (is_finite stretch):
             return (false, particles)
           if is_finite denom and denom > 0.0:
             let corr = stretch / denom
-            if not (is_finite corr and math.finite3 dir):
+            if not (is_finite corr and is_finite dir_x and is_finite dir_y and is_finite dir_z):
               return (false, particles)
             if wa > 0.0:
-              let next_a = pa.position + dir * (corr * wa)
-              if not (math.finite3 next_a):
+              let move_a = corr * wa
+              let nx = ax + dir_x * move_a
+              let ny = ay + dir_y * move_a
+              let nz = az + dir_z * move_a
+              if not (is_finite nx and is_finite ny and is_finite nz):
                 return (false, particles)
-              work[link.a] := $Particle { position: next_a, previous: pa.previous, inv_mass: pa.inv_mass, radius: pa.radius }
+              pos[ao] := nx
+              pos[ao + 1] := ny
+              pos[ao + 2] := nz
             if wb > 0.0:
-              let next_b = pb.position - dir * (corr * wb)
-              if not (math.finite3 next_b):
+              let move_b = corr * wb
+              let nx = bx - dir_x * move_b
+              let ny = by - dir_y * move_b
+              let nz = bz - dir_z * move_b
+              if not (is_finite nx and is_finite ny and is_finite nz):
                 return (false, particles)
-              work[link.b] := $Particle { position: next_b, previous: pb.previous, inv_mass: pb.inv_mass, radius: pb.radius }
+              pos[bo] := nx
+              pos[bo + 1] := ny
+              pos[bo + 2] := nz
           else:
             if is_finite alpha:
-              // Scale (wa, wb, alpha) by their maximum so the dimensionless XPBD
-              // weights remain exact when `w_sum + alpha` overflows F32.
               let w_scale = max (max wa wb) alpha
               if not (is_finite w_scale) or w_scale <= 0.0:
                 return (false, particles)
               let swa = wa / w_scale
               let swb = wb / w_scale
               let sdenom = swa + swb + alpha / w_scale
-              if not (is_finite sdenom) or sdenom <= 0.0 or not (math.finite3 dir):
+              if not (is_finite sdenom) or sdenom <= 0.0 or not (is_finite dir_x and is_finite dir_y and is_finite dir_z):
                 return (false, particles)
               if wa > 0.0:
                 let move_a = stretch * (swa / sdenom)
-                let next_a = pa.position + dir * move_a
-                if not (is_finite move_a and math.finite3 next_a):
+                let nx = ax + dir_x * move_a
+                let ny = ay + dir_y * move_a
+                let nz = az + dir_z * move_a
+                if not (is_finite move_a and is_finite nx and is_finite ny and is_finite nz):
                   return (false, particles)
-                work[link.a] := $Particle { position: next_a, previous: pa.previous, inv_mass: pa.inv_mass, radius: pa.radius }
+                pos[ao] := nx
+                pos[ao + 1] := ny
+                pos[ao + 2] := nz
               if wb > 0.0:
                 let move_b = stretch * (swb / sdenom)
-                let next_b = pb.position - dir * move_b
-                if not (is_finite move_b and math.finite3 next_b):
+                let nx = bx - dir_x * move_b
+                let ny = by - dir_y * move_b
+                let nz = bz - dir_z * move_b
+                if not (is_finite move_b and is_finite nx and is_finite ny and is_finite nz):
                   return (false, particles)
-                work[link.b] := $Particle { position: next_b, previous: pb.previous, inv_mass: pb.inv_mass, radius: pb.radius }
+                pos[bo] := nx
+                pos[bo + 1] := ny
+                pos[bo + 2] := nz
             else:
               if link.compliance == 0.0:
                 return (false, particles)
-    for i in 0 .. count:
-      let pt = work[i]
-      if pt.inv_mass > 0.0:
-        let pos = pt.position
-        for c in colliders:
-          let $Some next_pos = resolve_collider pos pt.radius c else:
-            return (false, particles)
-          pos := next_pos
-        work[i] := $Particle { position: pos, previous: pt.previous, inv_mass: pt.inv_mass, radius: pt.radius }
+    if has_colliders:
+      for i in 0 .. count:
+        let pt = particles[i]
+        if pt.inv_mass > 0.0:
+          let o = i * 3
+          let p = $Vec3 { x: pos[o], y: pos[o + 1], z: pos[o + 2] }
+          for c in pre_colliders:
+            let $Some next_pos = resolve_collider_pre p pt.radius c else:
+              return (false, particles)
+            p := next_pos
+          pos[o] := p.x
+          pos[o + 1] := p.y
+          pos[o + 2] := p.z
   for i in 0 .. count:
-    particles[i] := work[i]
+    let pt = particles[i]
+    let o = i * 3
+    let prev = if pt.inv_mass > 0.0 then pt.position else pt.previous
+    particles[i] := $Particle { position: $Vec3 { x: pos[o], y: pos[o + 1], z: pos[o + 2] }, previous: prev, inv_mass: pt.inv_mass, radius: pt.radius }
   return (true, particles)
 
 // Exact submerged volume fraction of a sphere of radius `r` whose center sits

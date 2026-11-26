@@ -282,6 +282,8 @@ func face_contacts (reference: Poly) -> (incident: Poly) -> (face: U32) -> (marg
   let centroid = reference.centers[face]
   let count = ref_ring.length
   for i in 0..count:
+    if size == 0:
+      break
     let v0 = (reference.verts.at (shapes.ring_vertex reference ref_ring i))
     let v1 = (reference.verts.at (shapes.ring_vertex reference ref_ring ((i + 1) % count)))
     let ex = v1.x - v0.x
@@ -293,9 +295,10 @@ func face_contacts (reference: Poly) -> (incident: Poly) -> (face: U32) -> (marg
     let my = if flip then F32.neg uy else uy
     let mz = if flip then F32.neg uz else uz
     let e = mx * v0.x + my * v0.y + mz * v0.z + 0.00001
-    @storage.truncate clipped 0
-    for 0..(size * 6):
-      @storage.push clipped 0.0
+    let need = size * 6
+    if clipped.length < need:
+      for clipped.length .. need:
+        @storage.push clipped 0.0
     let out = 0
     for k in 0..size:
       let o = k * 3
@@ -321,9 +324,12 @@ func face_contacts (reference: Poly) -> (incident: Poly) -> (face: U32) -> (marg
         clipped[out * 3 + 1] := cy + (qy - cy) * f
         clipped[out * 3 + 2] := cz + (qz - cz) * f
         out := self + 1
-    @storage.truncate polygon 0
-    for value in clipped:
-      @storage.push polygon value
+    let out_floats = out * 3
+    let poly_common = min out_floats polygon.length
+    for j in 0 .. poly_common:
+      polygon[j] := clipped[j]
+    for j in poly_common .. out_floats:
+      @storage.push polygon clipped[j]
     size := out
   let normal = shapes.face_normal plane
   let keep = @array.fill size 0
@@ -389,21 +395,21 @@ func poly_poly (a: Poly) -> (b: Poly) -> (margin: F32) =>
   for i in 0..a.planes.length:
     let p = a.planes[i]
     let s = support_min b.verts p.x p.y p.z - p.w
+    if s > margin:
+      return #[]
     if s > best_a:
       best_a := s
       face_a := i
-  if best_a > margin:
-    return #[]
   let best_b = (-1000000000.0)
   let face_b = 0
   for i in 0..b.planes.length:
     let p = b.planes[i]
     let s = support_min a.verts p.x p.y p.z - p.w
+    if s > margin:
+      return #[]
     if s > best_b:
       best_b := s
       face_b := i
-  if best_b > margin:
-    return #[]
   let best_e = (-1000000000.0)
   let axis_x = 0.0
   let axis_y = 0.0
@@ -418,22 +424,22 @@ func poly_poly (a: Poly) -> (b: Poly) -> (margin: F32) =>
       let cz = da.x * db.y - da.y * db.x
       let length2 = cx * cx + cy * cy + cz * cz
       if length2 > 0.000001:
-        let root = sqrt length2
-        let n0x = cx / root
-        let n0y = cy / root
-        let n0z = cz / root
+        let inv_root = 1.0 / sqrt length2
+        let n0x = cx * inv_root
+        let n0y = cy * inv_root
+        let n0z = cz * inv_root
         let away = n0x * tx + n0y * ty + n0z * tz < 0.0
         let nx = if away then F32.neg n0x else n0x
         let ny = if away then F32.neg n0y else n0y
         let nz = if away then F32.neg n0z else n0z
         let s = support_min b.verts nx ny nz - support_max a.verts nx ny nz
+        if s > margin:
+          return #[]
         if s > best_e:
           best_e := s
           axis_x := nx
           axis_y := ny
           axis_z := nz
-  if best_e > margin:
-    return #[]
   let face_best = max best_a (best_b - 0.0005)
   if best_e > face_best + 0.002:
     let top_a = support_max a.verts axis_x axis_y axis_z
@@ -818,10 +824,10 @@ func triangle_poly (m: mesh.Mesh) -> (t: U32) -> (poly: Poly) -> (margin: F32) :
     let p = poly.planes[i]
     let s = min (p.x * p0.x + p.y * p0.y + p.z * p0.z) (min (p.x * p1.x + p.y * p1.y + p.z * p1.z) (p.x * p2.x + p.y * p2.y + p.z * p2.z)) - p.w
     if s > best_h and feature_valid m t (F32.neg p.x) (F32.neg p.y) (F32.neg p.z):
+      if s > margin:
+        return #[]
       best_h := s
       face_h := i
-  if best_h > margin:
-    return #[]
   // Hull edge directions against the triangle's edges.
   let best_e = (-1000000000.0)
   let axis_x = 0.0
@@ -834,28 +840,30 @@ func triangle_poly (m: mesh.Mesh) -> (t: U32) -> (poly: Poly) -> (margin: F32) :
     let ex = w.x - u.x
     let ey = w.y - u.y
     let ez = w.z - u.z
+    let e_len2 = ex * ex + ey * ey + ez * ez
     for d in poly.dirs:
       let cx = d.y * ez - d.z * ey
       let cy = d.z * ex - d.x * ez
       let cz = d.x * ey - d.y * ex
       let length2 = cx * cx + cy * cy + cz * cz
-      if length2 > 0.000001 * (ex * ex + ey * ey + ez * ez):
-        let root = sqrt length2
+      if length2 > 0.000001 * e_len2:
+        let inv_root = 1.0 / sqrt length2
         let away = (cx * (center.x - mid_x) + cy * (center.y - mid_y) + cz * (center.z - mid_z)) < 0.0
-        let ax = if away then F32.neg cx / root else cx / root
-        let ay = if away then F32.neg cy / root else cy / root
-        let az = if away then F32.neg cz / root else cz / root
+        let sign = if away then F32.neg inv_root else inv_root
+        let ax = cx * sign
+        let ay = cy * sign
+        let az = cz * sign
         let hull_low = support_min poly.verts ax ay az
         let tri_high = max (ax * p0.x + ay * p0.y + az * p0.z) (max (ax * p1.x + ay * p1.y + az * p1.z) (ax * p2.x + ay * p2.y + az * p2.z))
         let s = hull_low - tri_high
         if s > best_e and feature_valid m t ax ay az:
+          if s > margin:
+            return #[]
           best_e := s
           axis_x := ax
           axis_y := ay
           axis_z := az
           edge_e := e
-  if best_e > margin:
-    return #[]
   let face_best = max best_t (best_h - 0.0005)
   if best_e > face_best + 0.002:
     let low_b = support_min poly.verts axis_x axis_y axis_z

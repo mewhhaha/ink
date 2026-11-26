@@ -31,11 +31,7 @@ type Entry [k, v] is data = $Entry { hash: U32, item: Maybe (k, v) }
 type Map [k, v] is data = $Map { rows: #[Entry [k, v]], buckets: #[U32] }
 const tombstone: U32 = 0xFFFFFFFF
 const header_slots: U32 = 2
-func initial_buckets () : #[U32] =>
-  let slots: #[U32] = #[]
-  for 0 .. header_slots + 16:
-    @storage.push slots 0
-  return slots
+func initial_buckets () : #[U32] => @array.fill (header_slots + 16) 0
 func empty () : Map [k, v] =>
   let rows: #[Entry [k, v]] = #[]
   return $Map { rows, buckets: initial_buckets () }
@@ -75,11 +71,9 @@ func rehash (capacity: U32) -> (table: own Map [k, v]) : Map [k, v] =>
     if Maybe.is_some entry.item:
       @storage.push live_rows entry
   let kept = live_rows.length
-  let slots: #[U32] = #[]
-  @storage.push slots kept
-  @storage.push slots kept
-  for 0 .. capacity:
-    @storage.push slots 0
+  let slots = @array.fill (header_slots + capacity) 0
+  slots[0] := kept
+  slots[1] := kept
   let mask = capacity - 1
   for i in 0 .. kept:
     let at = live_rows[i].hash & mask
@@ -220,16 +214,42 @@ func clear (table: own Map [k, v]) : Map [k, v] =>
     table.buckets[i] := 0
   return table
 func copy_into policy -> copy_key -> copy_value -> (destination: own Map [k, v]) -> (source: Map [k, v]) : Map [k, v] =>
-  let values = entries source
-  destination := clear destination
-  if values.length == 0:
-    return destination
-  let (first_key, first_value) = values[0]
-  destination := set policy (copy_key first_key) (copy_value first_value) destination
-  for index in 1 .. values.length:
-    let (key, value) = values[index]
-    destination := set policy (copy_key key) (copy_value value) destination
-  return destination
+  let $Map { rows, buckets } = destination
+  @storage.truncate rows 0
+  let src_rows = source.rows
+  for i in 0 .. src_rows.length:
+    if let $Some (key, value) = src_rows[i].item:
+      let ck = copy_key key
+      let cv = copy_value value
+      @storage.push rows ($Entry { hash: policy.hash ck, item: $Some (ck, cv) })
+  let kept = rows.length
+  let capacity: U32 = 16
+  for 0 .. 28:
+    if kept < capacity / 2:
+      break
+    capacity := self * 2
+  let needed = header_slots + capacity
+  if buckets.length < needed:
+    for i in 0 .. buckets.length:
+      buckets[i] := 0
+    for buckets.length .. needed:
+      @storage.push buckets 0
+  else:
+    if buckets.length > needed:
+      @storage.truncate buckets needed
+    for i in 0 .. needed:
+      buckets[i] := 0
+  buckets[0] := kept
+  buckets[1] := kept
+  let mask = capacity - 1
+  for i in 0 .. kept:
+    let at = rows[i].hash & mask
+    for 0 .. capacity:
+      if buckets[at + header_slots] == 0:
+        buckets[at + header_slots] := i + 1
+        break
+      at := (at + 1) & mask
+  return $Map { rows, buckets }
 func popcount (word: U32) =>
   let bits = word - ((word >> 1) & 0x55555555)
   bits := (self & 0x33333333) + ((self >> 2) & 0x33333333)

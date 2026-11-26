@@ -20,10 +20,7 @@ func hash3 (x: U32) => func (y: U32) => func (z: U32) => func (seed: U32) : U32 
 func unit (h: U32): F32 => U32.to_f32 (h >> 8) / 16777216.0
 
 // Lattice coordinate of a float: floor, as a wrapping U32.
-func cell (v: F32) : U32 =>
-  if not (is_finite v):
-    return 0
-  let f = floor v
+private func cell_floor (f: F32) : U32 =>
   if f >= 0.0:
     if f < 4294967296.0:
       return F32.to_u32 f
@@ -34,6 +31,11 @@ func cell (v: F32) : U32 =>
     return 0 - F32.to_u32 mag
   let w = mag - floor (mag / 4294967296.0) * 4294967296.0
   return if is_finite w and w >= 0.0 and w < 4294967296.0 then 0 - F32.to_u32 w else 0
+
+func cell (v: F32) : U32 =>
+  if not (is_finite v):
+    return 0
+  return cell_floor (floor v)
 
 func fade (t: F32): F32 => t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
@@ -52,12 +54,15 @@ func gradient (h: U32) => func (x: F32) => func (y: F32) => func (z: F32): F32 =
 private func perlin3_at (seed: U32) => func (x: F32) => func (y: F32) => func (z: F32): F32 =>
   if not (is_finite x and is_finite y and is_finite z):
     return 0.0
-  let xi = cell x
-  let yi = cell y
-  let zi = cell z
-  let xf = x - floor x
-  let yf = y - floor y
-  let zf = z - floor z
+  let fx = floor x
+  let fy = floor y
+  let fz = floor z
+  let xi = cell_floor fx
+  let yi = cell_floor fy
+  let zi = cell_floor fz
+  let xf = x - fx
+  let yf = y - fy
+  let zf = z - fz
   let xj = xi + 1
   let yj = yi + 1
   let zj = zi + 1
@@ -99,10 +104,49 @@ private func perlin3_at (seed: U32) => func (x: F32) => func (y: F32) => func (z
   let y0 = x00 + (x10 - x00) * v
   let y1 = x01 + (x11 - x01) * v
   return y0 + (y1 - y0) * w
+private func perlin2_at (seed: U32) => func (x: F32) => func (y: F32): F32 =>
+  if not (is_finite x and is_finite y):
+    return 0.0
+  let fx = floor x
+  let fy = floor y
+  let xi = cell_floor fx
+  let yi = cell_floor fy
+  let xf = x - fx
+  let yf = y - fy
+  let xg = xf - 1.0
+  let yg = yf - 1.0
+  let u = xf * xf * xf * (xf * (xf * 6.0 - 15.0) + 10.0)
+  let v = yf * yf * yf * (yf * (yf * 6.0 - 15.0) + 10.0)
+  let s = seed * 3266489917
+  let xa = xi * 2747636419
+  let xb = (xi + 1) * 2747636419
+  let ya = yi * 2654435769
+  let yb = (yi + 1) * 2654435769
+  let yz = (ya ^ s, yb ^ s, ya ^ 2246822519 ^ s, yb ^ 2246822519 ^ s)
+  let near = simd.u32_xor (simd.u32_splat xa) yz
+  let far = simd.u32_xor (simd.u32_splat xb) yz
+  near := simd.u32_xor self (simd.u32_shr 15 self)
+  far := simd.u32_xor self (simd.u32_shr 15 self)
+  near := simd.u32_mul self (simd.u32_splat 2246822507)
+  far := simd.u32_mul self (simd.u32_splat 2246822507)
+  near := simd.u32_xor self (simd.u32_shr 13 self)
+  far := simd.u32_xor self (simd.u32_shr 13 self)
+  near := simd.u32_mul self (simd.u32_splat 3266489909)
+  far := simd.u32_mul self (simd.u32_splat 3266489909)
+  near := simd.u32_xor self (simd.u32_shr 16 self)
+  far := simd.u32_xor self (simd.u32_shr 16 self)
+  let (h000, h010, h001, h011) = near
+  let (h100, h110, h101, h111) = far
+  let a = (gradient h000 xf yf 0.5, gradient h010 xf yg 0.5, gradient h001 xf yf (-0.5), gradient h011 xf yg (-0.5))
+  let b = (gradient h100 xg yf 0.5, gradient h110 xg yg 0.5, gradient h101 xg yf (-0.5), gradient h111 xg yg (-0.5))
+  let (x00, x10, x01, x11) = simd.f32_add a (simd.f32_mul (simd.f32_sub b a) (simd.f32_splat u))
+  let y0 = x00 + (x10 - x00) * v
+  let y1 = x01 + (x11 - x01) * v
+  return y0 + (y1 - y0) * 0.5
 func perlin3 (seed: U32) => func (p: Vec3) => perlin3_at seed p.x p.y p.z
 
 // Gradient noise in 2D (a slice of the 3D noise).
-func perlin2 (seed: U32) => func (p: Vec2) => perlin3_at seed p.x p.y 0.5
+func perlin2 (seed: U32) => func (p: Vec2) => perlin2_at seed p.x p.y
 
 // Smooth 1D noise over time: wobble, flicker, shake.
 func perlin1 (seed: U32) => func (t: F32) => perlin3_at seed t 0.5 0.5
@@ -124,12 +168,15 @@ func value2 (seed: U32) => func (p: Vec2) =>
 private func value3_at (seed: U32) => func (x: F32) => func (y: F32) => func (z: F32) : F32 =>
   if not (is_finite x and is_finite y and is_finite z):
     return 0.0
-  let xi = cell x
-  let yi = cell y
-  let zi = cell z
-  let xf = x - floor x
-  let yf = y - floor y
-  let zf = z - floor z
+  let fx = floor x
+  let fy = floor y
+  let fz = floor z
+  let xi = cell_floor fx
+  let yi = cell_floor fy
+  let zi = cell_floor fz
+  let xf = x - fx
+  let yf = y - fy
+  let zf = z - fz
   let u = xf * xf * xf * (xf * (xf * 6.0 - 15.0) + 10.0)
   let v = yf * yf * yf * (yf * (yf * 6.0 - 15.0) + 10.0)
   let w = zf * zf * zf * (zf * (zf * 6.0 - 15.0) + 10.0)
@@ -197,7 +244,7 @@ func fbm2 (seed: U32) => func (octaves: U32) => func (p: Vec2) =>
   let amplitude = 1.0
   let frequency = 1.0
   for octave in 0..count:
-    sum := self + amplitude * perlin3_at (seed + octave * 101) (x * frequency) (y * frequency) 0.5
+    sum := self + amplitude * perlin2_at (seed + octave * 101) (x * frequency) (y * frequency)
     total := self + amplitude
     amplitude := self * 0.5
     frequency := self * 2.0

@@ -1,4 +1,5 @@
 import * as random from "../random"
+import * as color from "../color"
 
 // 2D Wave Function Collapse (WFC) Solver: up to 32 tiles represented as U32
 // bitmasks, directional adjacency rules (north/east/south/west), weighted
@@ -20,14 +21,10 @@ type Solution is data = $Solution {
 }
 
 func popcount (mask: U32) : U32 =>
-  let m = mask
-  let c = 0
-  for _ in 0 .. 32:
-    if m == 0:
-      break
-    c := self + (m & 1)
-    m := self >> 1
-  return c
+  let b = mask - ((mask >> 1) & 0x55555555)
+  b := (self & 0x33333333) + ((self >> 2) & 0x33333333)
+  b := (self + (self >> 4)) & 0x0F0F0F0F
+  return (b * 0x01010101) >> 24
 
 func lowest_bit_index (mask: U32) : U32 =>
   for i in 0 .. 32:
@@ -46,22 +43,7 @@ func allowed_for_dir (rules: #[TileRule]) -> (source_mask: U32) -> (dir: U32) : 
   return allowed
 
 private func ln_pos (value: F32) : F32 =>
-  let v = max 1.0e-30 value
-  let k = 0.0
-  for _ in 0 .. 128:
-    if v >= 1.4142135:
-      v := self * 0.5
-      k := self + 1.0
-    else:
-      if v < 0.70710677:
-        v := self * 2.0
-        k := self - 1.0
-      else:
-        break
-  let t = (v - 1.0) / (v + 1.0)
-  let t2 = t * t
-  let series = t * (1.0 + t2 * (0.33333334 + t2 * (0.2 + t2 * (0.14285715 + t2 * 0.11111111))))
-  return 2.0 * series + k * 0.6931472
+  return color.log2 (max 1.0e-30 value) * 0.6931471805599453
 
 private func safe_weight (w: F32) : F32 =>
   if is_finite w and w > 0.0 then max 0.0001 w else 0.0001
@@ -147,6 +129,31 @@ private func attempt (width: U32) -> (height: U32) -> (rules: #[TileRule]) -> (p
   let count = min 32 rules.length
   let full_mask = if count == 32 then 4294967295 else (1 << count) - 1
   let wave = spark #[if i < pinned.length and pinned[i] != 0 then (pinned[i] & full_mask) else full_mask | i <- 0 .. total]
+  // Precompute tile directional bitmasks and safe weights once per attempt.
+  let rn = @array.fill count 0
+  let re = @array.fill count 0
+  let rs = @array.fill count 0
+  let rw = @array.fill count 0
+  let tw = @array.fill count 0.0
+  let tw_ln = @array.fill count 0.0
+  let max_all_w = 0.0
+  for t in 0 .. count:
+    let r = rules[t]
+    rn[t] := r.north
+    re[t] := r.east
+    rs[t] := r.south
+    rw[t] := r.west
+    let w = safe_weight r.weight
+    tw[t] := w
+    max_all_w := max self w
+  let inv_max_w = if max_all_w > 0.0 and is_finite max_all_w then 1.0 / max_all_w else 1.0
+  for t in 0 .. count:
+    let wn = tw[t] * inv_max_w
+    tw[t] := wn
+    tw_ln[t] := wn * ln_pos wn
+  let cell_ent = @array.fill total 0.0
+  let cell_cnt = @array.fill total 0
+  let cell_dirty = @array.fill total true
   let qcap = total + 1
   let queue = @array.fill qcap 0
   let in_queue = @array.fill total false
@@ -154,8 +161,10 @@ private func attempt (width: U32) -> (height: U32) -> (rules: #[TileRule]) -> (p
   let tail = 0
   // Seed ALL cells into initial AC-3 queue so even 1-tile or 0-mask rules propagate.
   for i in 0 .. total:
-    if wave[i] == 0:
+    let m = wave[i]
+    if m == 0:
       return (false, @array.fill total 0)
+    cell_cnt[i] := popcount m
     queue[tail] := i
     tail := (self + 1) % qcap
     in_queue[i] := true
@@ -173,38 +182,106 @@ private func attempt (width: U32) -> (height: U32) -> (rules: #[TileRule]) -> (p
       let cx = cur % width
       let cy = cur / width
       let cmask = wave[cur]
-      // dir 0=north(y-1), 1=east(x+1), 2=south(y+1), 3=west(x-1)
-      for dir in 0 .. 4:
-        let valid = (dir == 0 and cy > 0) or (dir == 1 and cx + 1 < width) or (dir == 2 and cy + 1 < height) or (dir == 3 and cx > 0)
-        if valid:
-          let nidx = if dir == 0 then cur - width else if dir == 1 then cur + 1 else if dir == 2 then cur + width else cur - 1
-          let allowed = allowed_for_dir rules cmask dir
-          let prev = wave[nidx]
-          let next = prev & allowed
-          if next != prev:
-            if next == 0:
-              contradiction := true
-              break
-            wave[nidx] := next
-            if not in_queue[nidx]:
-              queue[tail] := nidx
-              tail := (self + 1) % qcap
-              in_queue[nidx] := true
+      let an: U32 = 0
+      let ae: U32 = 0
+      let as_: U32 = 0
+      let aw: U32 = 0
+      for t in 0 .. count:
+        if ((cmask >> t) & 1) != 0:
+          an := self | rn[t]
+          ae := self | re[t]
+          as_ := self | rs[t]
+          aw := self | rw[t]
+      if cy > 0:
+        let nidx = cur - width
+        let prev = wave[nidx]
+        let next = prev & an
+        if next != prev:
+          if next == 0:
+            contradiction := true
+            break
+          wave[nidx] := next
+          cell_cnt[nidx] := popcount next
+          cell_dirty[nidx] := true
+          if not in_queue[nidx]:
+            queue[tail] := nidx
+            tail := (self + 1) % qcap
+            in_queue[nidx] := true
+      if cx + 1 < width:
+        let nidx = cur + 1
+        let prev = wave[nidx]
+        let next = prev & ae
+        if next != prev:
+          if next == 0:
+            contradiction := true
+            break
+          wave[nidx] := next
+          cell_cnt[nidx] := popcount next
+          cell_dirty[nidx] := true
+          if not in_queue[nidx]:
+            queue[tail] := nidx
+            tail := (self + 1) % qcap
+            in_queue[nidx] := true
+      if cy + 1 < height:
+        let nidx = cur + width
+        let prev = wave[nidx]
+        let next = prev & as_
+        if next != prev:
+          if next == 0:
+            contradiction := true
+            break
+          wave[nidx] := next
+          cell_cnt[nidx] := popcount next
+          cell_dirty[nidx] := true
+          if not in_queue[nidx]:
+            queue[tail] := nidx
+            tail := (self + 1) % qcap
+            in_queue[nidx] := true
+      if cx > 0:
+        let nidx = cur - 1
+        let prev = wave[nidx]
+        let next = prev & aw
+        if next != prev:
+          if next == 0:
+            contradiction := true
+            break
+          wave[nidx] := next
+          cell_cnt[nidx] := popcount next
+          cell_dirty[nidx] := true
+          if not in_queue[nidx]:
+            queue[tail] := nidx
+            tail := (self + 1) % qcap
+            in_queue[nidx] := true
     if contradiction or head != tail:
       contradiction := true
       break
-    // Choose lowest-entropy uncollapsed cell.
+    // Choose lowest-entropy uncollapsed cell (recomputing cached entropy only for dirty cells).
     let best_idx = total
     let best_ent = 0.0
     let has_best = false
     for i in 0 .. total:
-      let cnt = popcount wave[i]
+      let cnt = cell_cnt[i]
       if cnt == 0:
         contradiction := true
         break
       if cnt > 1:
+        if cell_dirty[i]:
+          let m = wave[i]
+          let sw = 0.0
+          let swl = 0.0
+          for t in 0 .. count:
+            if ((m >> t) & 1) != 0:
+              sw := self + tw[t]
+              swl := self + tw_ln[t]
+          let e = 0.0
+          if sw > 0.0 and is_finite sw and is_finite swl:
+            let raw = ln_pos sw - swl / sw
+            if is_finite raw:
+              e := raw
+          cell_ent[i] := e
+          cell_dirty[i] := false
         s := random.next s
-        let ent = cell_entropy rules wave[i] + random.unit s * 0.0001
+        let ent = cell_ent[i] + random.unit s * 0.0001
         if not has_best or ent < best_ent:
           has_best := true
           best_ent := ent
@@ -214,6 +291,8 @@ private func attempt (width: U32) -> (height: U32) -> (rules: #[TileRule]) -> (p
     s := random.next s
     let chosen = pick_weighted_tile rules wave[best_idx] (random.unit s)
     wave[best_idx] := 1 << chosen
+    cell_cnt[best_idx] := 1
+    cell_dirty[best_idx] := false
     queue[tail] := best_idx
     tail := (self + 1) % qcap
     in_queue[best_idx] := true

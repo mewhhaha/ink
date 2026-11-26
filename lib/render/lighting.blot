@@ -268,6 +268,8 @@ private func anisotropic_frame (nx: F32) -> (ny: F32) -> (nz: F32) -> (tx: F32) 
     oy := self / length
     oz := self / length
   let rot = if not (is_finite rotation) then 0.0 else if abs rotation <= 8192.0 then rotation else if abs rotation > 1.0e7 then 0.0 else wrap tau rotation
+  if rot == 0.0:
+    return (ox, oy, oz, (ny * oz - nz * oy) * handedness, (nz * ox - nx * oz) * handedness, (nx * oy - ny * ox) * handedness)
   let (s, c) = sin_cos rot
   let rx = ox * c + (ny * oz - nz * oy) * s
   let ry = oy * c + (nz * ox - nx * oz) * s
@@ -351,16 +353,20 @@ private func back_light (vx: F32) -> (vy: F32) -> (vz: F32) -> (lx: F32) -> (ly:
 // `1 - weight Fc(nvc)` with Fc(nvc) = 0.04 + 0.96 (1 - min(nvc, 1))^5, the coat's
 // Fresnel at the view and the same for every light.
 private func coat_lobe (weight: F32) -> (roughness: F32) -> (cx: F32) -> (cy: F32) -> (cz: F32) -> (hx: F32) -> (hy: F32) -> (hz: F32) -> (lx: F32) -> (ly: F32) -> (lz: F32) -> (vx: F32) -> (vy: F32) -> (vz: F32) -> (vh: F32) -> (schlick: F32) : (F32, F32) =>
-  let nhc = saturate (cx * hx + cy * hy + cz * hz)
   let nlc = saturate (cx * lx + cy * ly + cz * lz)
   let nvc = max 0.00001 (cx * vx + cy * vy + cz * vz)
-  let rc = clamp 0.04 1.0 roughness
-  let ac = rc * rc
-  let fc = 0.04 + 0.96 * schlick
-  let visibility = smith_visibility nlc nvc (ac * ac)
   let t = 1.0 - min nvc 1.0
   let fv = 0.04 + 0.96 * (t * t * t * t * t)
-  return (weight * fc * ggx_distribution nhc (ac * ac) * visibility * nlc, 1.0 - weight * fv)
+  let keep = 1.0 - weight * fv
+  if nlc <= 0.0:
+    return (0.0, keep)
+  let nhc = saturate (cx * hx + cy * hy + cz * hz)
+  let rc = clamp 0.04 1.0 roughness
+  let ac = rc * rc
+  let a2 = ac * ac
+  let fc = 0.04 + 0.96 * schlick
+  let visibility = smith_visibility nlc nvc a2
+  return (weight * fc * ggx_distribution nhc a2 * visibility * nlc, keep)
 
 // The coat's unit normal: the frame's, or its shading normal where it has none.
 private func coat_normal (frame: Frame) -> (nx: F32) -> (ny: F32) -> (nz: F32) : (F32, F32, F32) =>
@@ -410,13 +416,14 @@ private func layered (surface: Surface) -> (frame: Frame) -> (light: Vec3) -> (g
   let rough = clamp 0.04 1.0 material.roughness
   let alpha = rough * rough
   let shape = 0.0
-  if aniso:
-    let (tx, ty, tz, bx, by, bz) = anisotropic_frame nx ny nz frame.tangent.x frame.tangent.y frame.tangent.z frame.handedness surface.anisotropy.rotation
-    let at = F32.lerp alpha 1.0 (bend * bend)
-    shape := anisotropic_distribution at alpha (tx * hx + ty * hy + tz * hz) (bx * hx + by * hy + bz * hz) nh * anisotropic_visibility at alpha (tx * lx + ty * ly + tz * lz) (bx * lx + by * ly + bz * lz) nl (tx * vx + ty * vy + tz * vz) (bx * vx + by * vy + bz * vz) nv
-  else:
-    let a2 = alpha * alpha
-    shape := ggx_distribution nh a2 * smith_visibility nl nv a2
+  if nl > 0.0:
+    if aniso:
+      let (tx, ty, tz, bx, by, bz) = anisotropic_frame nx ny nz frame.tangent.x frame.tangent.y frame.tangent.z frame.handedness surface.anisotropy.rotation
+      let at = F32.lerp alpha 1.0 (bend * bend)
+      shape := anisotropic_distribution at alpha (tx * hx + ty * hy + tz * hz) (bx * hx + by * hy + bz * hz) nh * anisotropic_visibility at alpha (tx * lx + ty * ly + tz * lz) (bx * lx + by * ly + bz * lz) nl (tx * vx + ty * vy + tz * vz) (bx * vx + by * vy + bz * vz) nv
+    else:
+      let a2 = alpha * alpha
+      shape := ggx_distribution nh a2 * smith_visibility nl nv a2
   let metallic = saturate material.metallic
   let ratio = f0_ratio material.ior
   let f90 = F32.lerp material.specular 1.0 metallic
@@ -432,7 +439,8 @@ private func layered (surface: Surface) -> (frame: Frame) -> (light: Vec3) -> (g
   let sheen_keep = 1.0
   if peak > 0.0:
     let rs = clamp 0.07 1.0 surface.sheen.roughness
-    sheen := sheen_lobe nh nl nv rs
+    if nl > 0.0:
+      sheen := sheen_lobe nh nl nv rs
     sheen_keep := max 0.0 (1.0 - peak * sheen_albedo nv rs)
   let gloss = 0.0
   let coat_keep = 1.0
@@ -441,11 +449,11 @@ private func layered (surface: Surface) -> (frame: Frame) -> (light: Vec3) -> (g
     let (g, k) = coat_lobe coat surface.coat.roughness cx cy cz hx hy hz lx ly lz vx vy vz vh schlick
     gloss := g
     coat_keep := k
+  let thin = saturate surface.subsurface.thin
   let back = 0.0
-  if amount > 0.0:
+  if amount > 0.0 and thin < 1.0:
     back := back_light vx vy vz lx ly lz nx ny nz
   let $math.Color { r: sr, g: sg, b: sb } = surface.subsurface.color
-  let thin = saturate surface.subsurface.thin
   let keep = 1.0 - passing
   let diffuse_r = diffuse_channel br fr weight amount sr thin signed back
   let diffuse_g = diffuse_channel bg fg weight amount sg thin signed back

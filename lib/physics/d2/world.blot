@@ -111,19 +111,18 @@ private func cache_precedes (entry: CachedImpulse2D) -> (a: U32) -> (b: U32) -> 
 private func cache_less (a: CachedImpulse2D) -> (b: CachedImpulse2D) : Bool =>
   return cache_precedes a b.body_a b.body_b b.feature
 
-// Sort by full U32 contact identity for binary search (O(N) fast path when already sorted).
-private func sort_cache (entries: #[CachedImpulse2D]) : #[CachedImpulse2D] =>
+// Sort by full U32 contact identity for binary search (O(N) zero-copy fast path when already sorted).
+private func sort_cache_in_place (entries: own #[CachedImpulse2D]) : #[CachedImpulse2D] =>
   let n = entries.length
   if n <= 1:
-    return @storage.copy entries
+    return entries
   let already = true
   for i in 1 .. n:
     if cache_less entries[i] entries[i - 1]:
       already := false
       break
   if already:
-    return @storage.copy entries
-  let src = @storage.copy entries
+    return entries
   let dst = @storage.copy entries
   let from_src = true
   let width = 1
@@ -140,24 +139,27 @@ private func sort_cache (entries: #[CachedImpulse2D]) : #[CachedImpulse2D] =>
       let j = mid
       if from_src:
         for k in left .. right:
-          if i < mid and (j >= right or not (cache_less src[j] src[i])):
-            dst[k] := src[i]
+          if i < mid and (j >= right or not (cache_less entries[j] entries[i])):
+            dst[k] := entries[i]
             i := self + 1
           else:
-            dst[k] := src[j]
+            dst[k] := entries[j]
             j := self + 1
       else:
         for k in left .. right:
           if i < mid and (j >= right or not (cache_less dst[j] dst[i])):
-            src[k] := dst[i]
+            entries[k] := dst[i]
             i := self + 1
           else:
-            src[k] := dst[j]
+            entries[k] := dst[j]
             j := self + 1
       left := right
     from_src := not from_src
     width := self * 2
-  return if from_src then src else dst
+  if not from_src:
+    for i in 0 .. n:
+      entries[i] := dst[i]
+  return entries
 
 private func lookup_cache (cache: #[CachedImpulse2D]) -> (a: U32) -> (b: U32) -> (feature: U32) : (F32, F32) =>
   let n = cache.length
@@ -515,7 +517,12 @@ func step (cfg: WorldConfig2D) -> (dt: F32) -> (bodies_in: #[Body2D]) -> (joint_
   // 2. Deterministic spatial-hash broadphase.
   let pairs = broadphase.broadphase_pairs cfg.cell_size (if cfg.enable_ccd then dt else 0.0) cur
   // 3. Narrowphase -> solid manifolds + trigger Pairs.
-  let sorted_cache = sort_cache cache
+  cache := sort_cache_in_place self
+  let has_suppressed_joints = false
+  for j in joint_list:
+    if not j.collide_connected:
+      has_suppressed_joints := true
+      break
   let warm = shapes.safe_clamp cfg.warm_start_scale 0.0 1.0
   let raw_mans: #[Manifold2D] = #[]
   let solid_pairs: #[broadphase.Pair2D] = #[]
@@ -527,7 +534,7 @@ func step (cfg: WorldConfig2D) -> (dt: F32) -> (bodies_in: #[Body2D]) -> (joint_
     let ib = pr.b
     let ba = cur[ia]
     let bb = cur[ib]
-    if not (pair_suppressed_by_joint ia ib joint_list):
+    if not (has_suppressed_joints and pair_suppressed_by_joint ia ib joint_list):
       case narrowphase.collide_bodies ia ba ib bb of
         $Some m => do:
           if m.is_trigger:
@@ -579,7 +586,7 @@ func step (cfg: WorldConfig2D) -> (dt: F32) -> (bodies_in: #[Body2D]) -> (joint_
     let m = raw_mans[k]
     let ia = m.a
     let ib = m.b
-    let (pm, jn0, jt0, jn1, jt1) = prepare_manifold m cur[ia] cur[ib] inv_m[ia] inv_i[ia] inv_m[ib] inv_i[ib] vx[ia] vy[ia] vw[ia] vx[ib] vy[ib] vw[ib] sorted_cache warm
+    let (pm, jn0, jt0, jn1, jt1) = prepare_manifold m cur[ia] cur[ib] inv_m[ia] inv_i[ia] inv_m[ib] inv_i[ib] vx[ia] vy[ia] vw[ia] vx[ib] vy[ib] vw[ib] cache warm
     @storage.push pmans pm
     sm_jn0[k] := jn0
     sm_jt0[k] := jt0

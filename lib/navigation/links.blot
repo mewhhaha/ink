@@ -58,21 +58,21 @@ func carve_mask (centers: #[Vec3]) -> (radii: #[F32]) -> (obstacles: #[Obstacle]
     let r = if i < radii.length and is_finite radii[i] then max 0.0 radii[i] else 0.0
     let hit = false
     for obs in obstacles:
-      if not hit:
-        let overlap = case obs of
-          $Circle { center, radius } => do:
-            if not (math.finite3 center and is_finite radius):
-              break false
-            let rad = max 0.0 radius
-            break within_dist2_half (c.x * 0.5 - center.x * 0.5) (c.z * 0.5 - center.z * 0.5) (r * 0.5 + rad * 0.5)
-          $Box { low, high } => do:
-            if not (math.finite3 low and math.finite3 high and low.x <= high.x and low.z <= high.z):
-              break false
-            let cx = clamp low.x high.x c.x
-            let cz = clamp low.z high.z c.z
-            break within_dist2_half (c.x * 0.5 - cx * 0.5) (c.z * 0.5 - cz * 0.5) (r * 0.5)
-        if overlap:
-          hit := true
+      let overlap = case obs of
+        $Circle { center, radius } => do:
+          if not (math.finite3 center and is_finite radius):
+            break false
+          let rad = max 0.0 radius
+          break within_dist2_half (c.x * 0.5 - center.x * 0.5) (c.z * 0.5 - center.z * 0.5) (r * 0.5 + rad * 0.5)
+        $Box { low, high } => do:
+          if not (math.finite3 low and math.finite3 high and low.x <= high.x and low.z <= high.z):
+            break false
+          let cx = clamp low.x high.x c.x
+          let cz = clamp low.z high.z c.z
+          break within_dist2_half (c.x * 0.5 - cx * 0.5) (c.z * 0.5 - cz * 0.5) (r * 0.5)
+      if overlap:
+        hit := true
+        break
     blocked[i] := hit
   return blocked
 
@@ -107,6 +107,44 @@ func search (centers: #[Vec3]) -> (offsets: #[U32]) -> (neighbors: #[U32]) -> (b
     return $Some ($Plan { found: false, cost: 0.0, steps: #[] })
   if start_poly == goal_poly:
     return $Some ($Plan { found: true, cost: 0.0, steps: #[$Walk { poly: start_poly }] })
+  // Pre-bucket permitted off-mesh links by source polygon (CSR) preserving link index order.
+  let link_counts = @array.fill n 0
+  let total_edges = 0
+  for li in 0 .. links.length:
+    let lk = links[li]
+    if (lk.flags & capabilities) == lk.flags and is_finite lk.cost and lk.cost >= 0.0:
+      if lk.from_poly < n and lk.to_poly < n:
+        link_counts[lk.from_poly] := self + 1
+        total_edges := self + 1
+        if lk.bidirectional and lk.to_poly != lk.from_poly:
+          link_counts[lk.to_poly] := self + 1
+          total_edges := self + 1
+  let link_starts = @array.fill (n + 1) 0
+  let running = 0
+  for i in 0 .. n:
+    link_starts[i] := running
+    running := self + link_counts[i]
+  link_starts[n] := running
+  let link_cursor = @array.generate n (func (i: U32) => link_starts[i])
+  let link_dst = @array.fill total_edges 0
+  let link_idx = @array.fill total_edges 0
+  let link_cost = @array.fill total_edges 0.0
+  if total_edges > 0:
+    for li in 0 .. links.length:
+      let lk = links[li]
+      if (lk.flags & capabilities) == lk.flags and is_finite lk.cost and lk.cost >= 0.0:
+        if lk.from_poly < n and lk.to_poly < n:
+          let at = link_cursor[lk.from_poly]
+          link_dst[at] := lk.to_poly
+          link_idx[at] := li
+          link_cost[at] := lk.cost
+          link_cursor[lk.from_poly] := at + 1
+          if lk.bidirectional and lk.to_poly != lk.from_poly:
+            let at2 = link_cursor[lk.to_poly]
+            link_dst[at2] := lk.from_poly
+            link_idx[at2] := li
+            link_cost[at2] := lk.cost
+            link_cursor[lk.to_poly] := at2 + 1
   let none = 4294967295
   let g = @array.fill n 0.0
   let f = @array.fill n 0.0
@@ -114,85 +152,138 @@ func search (centers: #[Vec3]) -> (offsets: #[U32]) -> (neighbors: #[U32]) -> (b
   let closed = @array.fill n false
   let parent_poly = @array.fill n none
   let parent_link = @array.fill n none
-  let h0 = dist3 centers[start_poly] centers[goal_poly]
+  let goal_center = centers[goal_poly]
+  let h0 = dist3 centers[start_poly] goal_center
+  let f0 = if is_finite h0 then h0 else 0.0
   seen[start_poly] := true
   g[start_poly] := 0.0
-  f[start_poly] := if is_finite h0 then h0 else 0.0
-  let reached = false
+  f[start_poly] := f0
+  let heap_f: #[F32] = #[f0]
+  let heap_id: #[U32] = #[start_poly]
   for 0 .. n:
-    if not reached:
-      // Pick unclosed node with lowest f-score (ties by lowest index).
-      let u = none
-      let best_f = 0.0
-      for i in 0 .. n:
-        if seen[i] and not closed[i]:
-          if u == none or f[i] < best_f:
-            best_f := f[i]
-            u := i
-      if u == none:
-        reached := true
-      else:
-        if u == goal_poly:
-          reached := true
-        else:
-          closed[u] := true
-          let e0 = offsets[u]
-          let e1 = offsets[u + 1]
-          for ei in e0 .. e1:
-            if ei < neighbors.length:
-              let v = neighbors[ei]
-              if v < n and not closed[v] and not blocked[v]:
-                let step_d = dist3 centers[u] centers[v]
-                if is_finite step_d:
-                  let ng = g[u] + step_d
-                  if is_finite ng and (not seen[v] or ng < g[v]):
-                    let hv = dist3 centers[v] centers[goal_poly]
-                    let nf = if is_finite hv and is_finite (ng + hv) then ng + hv else ng
-                    seen[v] := true
-                    g[v] := ng
-                    f[v] := nf
-                    parent_poly[v] := u
-                    parent_link[v] := none
-          // Relax permitted off-mesh links incident to u.
-          for li in 0 .. links.length:
-            let lk = links[li]
-            let allowed = (lk.flags & capabilities) == lk.flags and is_finite lk.cost and lk.cost >= 0.0
-            if allowed:
-              let dst = none
-              if lk.from_poly == u and lk.to_poly < n:
-                dst := lk.to_poly
-              else:
-                if lk.bidirectional and lk.to_poly == u and lk.from_poly < n:
-                  dst := lk.from_poly
-              if dst != none and not closed[dst] and not blocked[dst]:
-                let ng = g[u] + lk.cost
-                if is_finite ng and (not seen[dst] or ng < g[dst]):
-                  let hd = dist3 centers[dst] centers[goal_poly]
-                  let nf = if is_finite hd and is_finite (ng + hd) then ng + hd else ng
-                  seen[dst] := true
-                  g[dst] := ng
-                  f[dst] := nf
-                  parent_poly[dst] := u
-                  parent_link[dst] := li
+    let u = none
+    for 0 .. 4294967295:
+      let h_len = heap_id.length
+      if h_len == 0:
+        break
+      let top_id = heap_id[0]
+      let top_f = heap_f[0]
+      let last = h_len - 1
+      let mf = heap_f[last]
+      let mi = heap_id[last]
+      @storage.truncate heap_f last
+      @storage.truncate heap_id last
+      if last > 0:
+        let k = 0
+        for 0 .. 32:
+          let left = k * 2 + 1
+          if left >= last:
+            break
+          let child = left
+          let cf = heap_f[left]
+          let ci = heap_id[left]
+          let right = left + 1
+          if right < last:
+            let rf = heap_f[right]
+            let ri = heap_id[right]
+            if rf < cf or (rf == cf and ri < ci):
+              child := right
+              cf := rf
+              ci := ri
+          if not (cf < mf or (cf == mf and ci < mi)):
+            break
+          heap_f[k] := cf
+          heap_id[k] := ci
+          k := child
+        heap_f[k] := mf
+        heap_id[k] := mi
+      if not closed[top_id] and top_f == f[top_id]:
+        u := top_id
+        break
+    if u == none or u == goal_poly:
+      break
+    closed[u] := true
+    let gu = g[u]
+    let cu = centers[u]
+    let e0 = offsets[u]
+    let e1 = offsets[u + 1]
+    for ei in e0 .. e1:
+      if ei < neighbors.length:
+        let v = neighbors[ei]
+        if v < n and not closed[v] and not blocked[v]:
+          let step_d = dist3 cu centers[v]
+          if is_finite step_d:
+            let ng = gu + step_d
+            if is_finite ng and (not seen[v] or ng < g[v]):
+              let hv = dist3 centers[v] goal_center
+              let nf = if is_finite hv and is_finite (ng + hv) then ng + hv else ng
+              seen[v] := true
+              g[v] := ng
+              f[v] := nf
+              parent_poly[v] := u
+              parent_link[v] := none
+              let pk = heap_id.length
+              @storage.push heap_f nf
+              @storage.push heap_id v
+              for 0 .. 32:
+                if pk == 0:
+                  break
+                let par = (pk - 1) / 2
+                let pf = heap_f[par]
+                let pi = heap_id[par]
+                if not (nf < pf or (nf == pf and v < pi)):
+                  break
+                heap_f[pk] := pf
+                heap_id[pk] := pi
+                pk := par
+              heap_f[pk] := nf
+              heap_id[pk] := v
+    let l0 = link_starts[u]
+    let l1 = link_starts[u + 1]
+    for le in l0 .. l1:
+      let dst = link_dst[le]
+      if not closed[dst] and not blocked[dst]:
+        let ng = gu + link_cost[le]
+        if is_finite ng and (not seen[dst] or ng < g[dst]):
+          let hd = dist3 centers[dst] goal_center
+          let nf = if is_finite hd and is_finite (ng + hd) then ng + hd else ng
+          seen[dst] := true
+          g[dst] := ng
+          f[dst] := nf
+          parent_poly[dst] := u
+          parent_link[dst] := link_idx[le]
+          let pk = heap_id.length
+          @storage.push heap_f nf
+          @storage.push heap_id dst
+          for 0 .. 32:
+            if pk == 0:
+              break
+            let par = (pk - 1) / 2
+            let pf = heap_f[par]
+            let pi = heap_id[par]
+            if not (nf < pf or (nf == pf and dst < pi)):
+              break
+            heap_f[pk] := pf
+            heap_id[pk] := pi
+            pk := par
+          heap_f[pk] := nf
+          heap_id[pk] := dst
   if not seen[goal_poly]:
     return $Some ($Plan { found: false, cost: 0.0, steps: #[] })
   // Reconstruct path from goal back to start.
   let rev: #[Step] = #[]
   let cur = goal_poly
-  let stop = false
   for 0 .. (n + 1):
-    if not stop:
-      let p = parent_poly[cur]
-      let lk = parent_link[cur]
-      if p == none:
-        @storage.push rev ($Walk { poly: cur })
-        stop := true
-      else:
-        if lk != none:
-          @storage.push rev ($Traverse { link: lk, from_poly: p, to_poly: cur })
-        else:
-          @storage.push rev ($Walk { poly: cur })
-        cur := p
+    let p = parent_poly[cur]
+    let lk = parent_link[cur]
+    if p == none:
+      @storage.push rev ($Walk { poly: cur })
+      break
+    if lk != none:
+      @storage.push rev ($Traverse { link: lk, from_poly: p, to_poly: cur })
+    else:
+      @storage.push rev ($Walk { poly: cur })
+    cur := p
   let len = rev.length
   let steps = @array.generate len (func (i: U32) => rev[len - 1 - i])
   return $Some ($Plan { found: true, cost: g[goal_poly], steps })

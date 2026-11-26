@@ -480,11 +480,47 @@ func update (sources: #[Source]) -> (previous: own Scene) -> (changed: #[U32]) :
   if changed.is_empty:
     return previous
   let n = sources.length
-  let changed = array.filter (func i => i < n) (changes.unique changed)
+  let changed = if changed.length == 1 then (if changed[0] < n then changed else #[]) else array.filter (func i => i < n) (changes.unique changed)
   if changed.length == 0:
     return previous
   let $Scene {geometry: storage, proxies, index, slots, source_count} = previous
   let count = proxies.length
+  if changed.length == 1:
+    let src_idx = changed[0]
+    let slot = slots[src_idx]
+    let src = sources[src_idx]
+    if slot < count and src.planes.length == 0:
+      if let $Some col = src.collider:
+        if let $Sphere = col.shape:
+          if let $Some row = sphere_proxy_row src_idx src col:
+            if let $shapes.StoredCapsule _ = proxies[slot].shape:
+              proxies[slot] := row
+              if slot < index.leaves.length:
+                let $spatial.Index { base, bounds, order, leaves } = index
+                let node = leaves[slot]
+                let lo = node * 6
+                bounds[lo] := row.low.x
+                bounds[lo + 1] := row.low.y
+                bounds[lo + 2] := row.low.z
+                bounds[lo + 3] := row.high.x
+                bounds[lo + 4] := row.high.y
+                bounds[lo + 5] := row.high.z
+                let parent = node / 2
+                for 0 .. 32:
+                  if parent == 0:
+                    break
+                  let o = parent * 6
+                  let a = parent * 12
+                  let b = a + 6
+                  bounds[o] := min bounds[a] bounds[b]
+                  bounds[o + 1] := min bounds[a + 1] bounds[b + 1]
+                  bounds[o + 2] := min bounds[a + 2] bounds[b + 2]
+                  bounds[o + 3] := max bounds[a + 3] bounds[b + 3]
+                  bounds[o + 4] := max bounds[a + 4] bounds[b + 4]
+                  bounds[o + 5] := max bounds[a + 5] bounds[b + 5]
+                  parent := self / 2
+                return $Scene {geometry: storage, proxies, index: $spatial.Index { base, bounds, order, leaves }, slots, source_count}
+              return $Scene {geometry: storage, proxies, index, slots, source_count}
   // Slot `count` stands for a source without a proxy, which refit skips.
   let dirty = @array.fill changed.length count
   for k in 0 .. changed.length:
@@ -509,11 +545,18 @@ func update (sources: #[Source]) -> (previous: own Scene) -> (changed: #[U32]) :
   for k in 0 .. dirty.length:
     if let $Some row = next[k]:
       let slot = dirty[k]
-      let unpacked = shapes.unpack scratch row.shape
-      let (shape, geometry) = shapes.replace storage proxies[slot].shape unpacked
-      storage := geometry
-      row.shape := shape
-      proxies[slot] := row
+      let both_capsule = false
+      if let $shapes.StoredCapsule _ = row.shape:
+        if let $shapes.StoredCapsule _ = proxies[slot].shape:
+          both_capsule := true
+      if both_capsule:
+        proxies[slot] := row
+      else:
+        let unpacked = shapes.unpack scratch row.shape
+        let (shape, geometry) = shapes.replace storage proxies[slot].shape unpacked
+        storage := geometry
+        row.shape := shape
+        proxies[slot] := row
   let bounds = @array.generate changed.length (func (k: U32) => case next[k] of
     $Some p => $spatial.Bounds { low: p.low, high: p.high }
     $Nothing => $spatial.Bounds { low: math.zero3, high: math.zero3 })
@@ -639,16 +682,16 @@ func cast_shape (shape: Shape) => func (a: Vec3) => func (b: Vec3) => func (radi
   if let $shapes.Heightfield _ = shape:
     heightfield := true
   let steps = 40
+  let delta_len = 0.0
   if heightfield:
     steps := 96
+    delta_len := delta.length
   for 0..steps:
     let gap = shapes.segment_gap shape ($Vec3 { x: a.x + delta.x * t, y: a.y + delta.y * t, z: a.z + delta.z * t }) ($Vec3 { x: b.x + delta.x * t, y: b.y + delta.y * t, z: b.z + delta.z * t })
     let clearance = gap.dist - radius
     if clearance <= hit_eps:
       return $Some (t, gap.on_shape, gap.normal, gap.surface, if t == 0.0 then max 0.0 (F32.neg clearance) else 0.0)
-    let closing = F32.neg (gap.normal.dot delta)
-    if heightfield:
-      closing := delta.length
+    let closing = if heightfield then delta_len else F32.neg (gap.normal.dot delta)
     if closing <= 0.000001:
       return $Nothing
     t := self + clearance / closing
@@ -682,39 +725,128 @@ func accepts (f: Filter) => func (proxy: Proxy) => return
 // Conservative time lower bound for the capsule's moving AABB. Match the
 // original swept candidate box, then allow narrow-phase tolerance and F32
 // coordinate roundoff before pruning against an earlier hit.
+private func accepts_row (f: Filter) -> (row: ProxyRow) : Bool => return
+  (row.layer & f.mask) != 0 and row.id != f.skip and (f.triggers or not row.trigger) and (f.walkers or not row.walker) and (f.dynamics or row.kind != kind_dynamic)
+private func touches_bounds_row (row: ProxyRow) -> (low: Vec3) -> (high: Vec3) : Bool => return
+  low.x <= row.high.x and high.x >= row.low.x and low.y <= row.high.y and high.y >= row.low.y and low.z <= row.high.z and high.z >= row.low.z
+
 func lower_time (low: Vec3) -> (high: Vec3) -> (a: Vec3) -> (b: Vec3) -> (radius: F32) -> (delta: Vec3) -> (bounds: &[F32]) -> (offset: U32) =>
   if not (low.x <= bounds[offset + 3] and high.x >= bounds[offset] and low.y <= bounds[offset + 4] and high.y >= bounds[offset + 1] and low.z <= bounds[offset + 5] and high.z >= bounds[offset + 2]):
     return 1.0 / 0.0
   let lower = 0.0
-  let starts = (min a.x b.x - radius, min a.y b.y - radius, min a.z b.z - radius)
-  let ends = (max a.x b.x + radius, max a.y b.y + radius, max a.z b.z + radius)
-  let (lx, ly, lz) = starts
-  let (hx, hy, hz) = ends
-  for axis in 0 .. 3:
-    let lo = if axis == 0 then lx else if axis == 1 then ly else lz
-    let hi = if axis == 0 then hx else if axis == 1 then hy else hz
-    let speed = if axis == 0 then delta.x else if axis == 1 then delta.y else delta.z
-    let left = bounds[offset + axis]
-    let right = bounds[offset + 3 + axis]
-    let safety = hit_eps + 0.00001 * (abs lo + abs hi + abs left + abs right + abs speed)
-    if speed > 0.0:
-      lower := max self ((left - hi - safety) / speed)
-    if speed < 0.0:
-      lower := max self ((right - lo + safety) / speed)
+  let lx = min a.x b.x - radius
+  let ly = min a.y b.y - radius
+  let lz = min a.z b.z - radius
+  let hx = max a.x b.x + radius
+  let hy = max a.y b.y + radius
+  let hz = max a.z b.z + radius
+  let blx = bounds[offset]
+  let bly = bounds[offset + 1]
+  let blz = bounds[offset + 2]
+  let bhx = bounds[offset + 3]
+  let bhy = bounds[offset + 4]
+  let bhz = bounds[offset + 5]
+  if delta.x > 0.0:
+    let safety = hit_eps + 0.00001 * (abs lx + abs hx + abs blx + abs bhx + delta.x)
+    lower := max self ((blx - hx - safety) / delta.x)
+  else:
+    if delta.x < 0.0:
+      let safety = hit_eps + 0.00001 * (abs lx + abs hx + abs blx + abs bhx - delta.x)
+      lower := max self ((bhx - lx + safety) / delta.x)
+  if delta.y > 0.0:
+    let safety = hit_eps + 0.00001 * (abs ly + abs hy + abs bly + abs bhy + delta.y)
+    lower := max self ((bly - hy - safety) / delta.y)
+  else:
+    if delta.y < 0.0:
+      let safety = hit_eps + 0.00001 * (abs ly + abs hy + abs bly + abs bhy - delta.y)
+      lower := max self ((bhy - ly + safety) / delta.y)
+  if delta.z > 0.0:
+    let safety = hit_eps + 0.00001 * (abs lz + abs hz + abs blz + abs bhz + delta.z)
+    lower := max self ((blz - hz - safety) / delta.z)
+  else:
+    if delta.z < 0.0:
+      let safety = hit_eps + 0.00001 * (abs lz + abs hz + abs blz + abs bhz - delta.z)
+      lower := max self ((bhz - lz + safety) / delta.z)
   return lower
 func cast scene => func (a: Vec3) => func (b: Vec3) => func (radius: F32) => func (delta: Vec3) => func (filter: Filter) =>
   let (low, high) = swept_bounds a b radius delta
-  let found = spatial.closest scene.index (lower_time low high a b radius delta) (func (index: U32) =>
-    let p = proxy scene index
-    if accepts filter p and touches_bounds p low high:
-      return cast_shape p.shape a b radius delta
+  let low_x = low.x
+  let low_y = low.y
+  let low_z = low.z
+  let high_x = high.x
+  let high_y = high.y
+  let high_z = high.z
+  let lx = min a.x b.x - radius
+  let ly = min a.y b.y - radius
+  let lz = min a.z b.z - radius
+  let hx = max a.x b.x + radius
+  let hy = max a.y b.y + radius
+  let hz = max a.z b.z + radius
+  let dx = delta.x
+  let dy = delta.y
+  let dz = delta.z
+  let inv_dx = if dx != 0.0 then 1.0 / dx else 0.0
+  let inv_dy = if dy != 0.0 then 1.0 / dy else 0.0
+  let inv_dz = if dz != 0.0 then 1.0 / dz else 0.0
+  let use_inv_x = is_finite inv_dx
+  let use_inv_y = is_finite inv_dy
+  let use_inv_z = is_finite inv_dz
+  let base_sx = abs lx + abs hx + abs dx
+  let base_sy = abs ly + abs hy + abs dy
+  let base_sz = abs lz + abs hz + abs dz
+  let lower_fast = func (bounds: &[F32]) -> (offset: U32) : F32 =>
+    let blx = bounds[offset]
+    let bhx = bounds[offset + 3]
+    if low_x > bhx or high_x < blx:
+      return 1.0 / 0.0
+    let bly = bounds[offset + 1]
+    let bhy = bounds[offset + 4]
+    if low_y > bhy or high_y < bly:
+      return 1.0 / 0.0
+    let blz = bounds[offset + 2]
+    let bhz = bounds[offset + 5]
+    if low_z > bhz or high_z < blz:
+      return 1.0 / 0.0
+    let lower = 0.0
+    if dx > 0.0:
+      let safety = hit_eps + 0.00001 * (base_sx + abs blx + abs bhx)
+      let num = blx - hx - safety
+      lower := max self (if use_inv_x then num * inv_dx else num / dx)
+    else:
+      if dx < 0.0:
+        let safety = hit_eps + 0.00001 * (base_sx + abs blx + abs bhx)
+        let num = bhx - lx + safety
+        lower := max self (if use_inv_x then num * inv_dx else num / dx)
+    if dy > 0.0:
+      let safety = hit_eps + 0.00001 * (base_sy + abs bly + abs bhy)
+      let num = bly - hy - safety
+      lower := max self (if use_inv_y then num * inv_dy else num / dy)
+    else:
+      if dy < 0.0:
+        let safety = hit_eps + 0.00001 * (base_sy + abs bly + abs bhy)
+        let num = bhy - ly + safety
+        lower := max self (if use_inv_y then num * inv_dy else num / dy)
+    if dz > 0.0:
+      let safety = hit_eps + 0.00001 * (base_sz + abs blz + abs bhz)
+      let num = blz - hz - safety
+      lower := max self (if use_inv_z then num * inv_dz else num / dz)
+    else:
+      if dz < 0.0:
+        let safety = hit_eps + 0.00001 * (base_sz + abs blz + abs bhz)
+        let num = bhz - lz + safety
+        lower := max self (if use_inv_z then num * inv_dz else num / dz)
+    return lower
+  let found = spatial.closest scene.index lower_fast (func (index: U32) =>
+    let row = scene.proxies[index]
+    if accepts_row filter row and touches_bounds_row row low high:
+      return cast_shape (shapes.unpack scene.geometry row.shape) a b radius delta
     return $Nothing) (func (value: (F32, Vec3, Vec3, Vec3, F32)) =>
       let (time, _, _, _, _) = value
       return time) 2.0
   return Maybe.map (func found =>
-    let p = proxy scene found.index
+    let row = scene.proxies[found.index]
     let (t, point, normal, surface, depth) = found.value
-    return $Hit {id: p.id, proxy: found.index, time: t, distance: t * delta.length, point, normal, surface, depth}) found
+    return $Hit {id: row.id, proxy: found.index, time: t, distance: t * delta.length, point, normal, surface, depth}) found
 
 func solid_filter (mask: U32) => $Filter { mask, skip: 0, triggers: false, walkers: true, dynamics: true }
 
@@ -732,9 +864,9 @@ func ray_any scene => func (origin: Vec3) => func (direction: Vec3) => func (rea
   let (low, high) = swept_bounds origin origin 0.0 delta
   let filter = $Filter { mask, skip, triggers: false, walkers: true, dynamics: true }
   return spatial.any scene.index low high (func (index: U32) =>
-    let p = proxy scene index
-    if accepts filter p and touches_bounds p low high:
-      return Maybe.is_some (cast_shape p.shape origin origin 0.0 delta)
+    let row = scene.proxies[index]
+    if accepts_row filter row and touches_bounds_row row low high:
+      return Maybe.is_some (cast_shape (shapes.unpack scene.geometry row.shape) origin origin 0.0 delta)
     return false)
 
 // Every proxy overlapping a sphere, by ascending source index.
@@ -743,11 +875,11 @@ func overlap_sphere scene => func (center: Vec3) => func (radius: F32) => func (
   let high = $Vec3 { x: center.x + radius, y: center.y + radius, z: center.z + radius }
   let found: #[U32] = #[]
   for index in spatial.query scene.index low high:
-    let proxy = unpack_proxy scene.geometry scene.proxies[index]
-    if (proxy.layer & mask) != 0 and touches_bounds proxy low high:
-      let gap = shapes.segment_gap proxy.shape center center
+    let row = scene.proxies[index]
+    if (row.layer & mask) != 0 and touches_bounds_row row low high:
+      let gap = shapes.segment_gap (shapes.unpack scene.geometry row.shape) center center
       if gap.dist <= radius:
-        @storage.push found proxy.id
+        @storage.push found row.id
   return found
 
 // Every proxy overlapping a capsule.
@@ -755,19 +887,19 @@ func overlap_capsule scene => func (a: Vec3) => func (b: Vec3) => func (radius: 
   let (low, high) = swept_bounds a b radius shapes.zero
   let found: #[U32] = #[]
   for index in spatial.query scene.index low high:
-    let proxy = unpack_proxy scene.geometry scene.proxies[index]
-    if (proxy.layer & mask) != 0 and touches_bounds proxy low high:
-      let gap = shapes.segment_gap proxy.shape a b
+    let row = scene.proxies[index]
+    if (row.layer & mask) != 0 and touches_bounds_row row low high:
+      let gap = shapes.segment_gap (shapes.unpack scene.geometry row.shape) a b
       if gap.dist <= radius:
-        @storage.push found proxy.id
+        @storage.push found row.id
   return found
 
 // Is the point inside any solid (non-trigger) proxy?
 func point_solid scene => func (p: Vec3) => func (mask: U32) => return
   spatial.any scene.index p p (func index =>
-    let value = proxy scene index
-    if (value.layer & mask) != 0 and not value.trigger and touches_bounds value p p:
-      return (shapes.segment_gap value.shape p p).dist <= 0.0
+    let row = scene.proxies[index]
+    if (row.layer & mask) != 0 and not row.trigger and touches_bounds_row row p p:
+      return (shapes.segment_gap (shapes.unpack scene.geometry row.shape) p p).dist <= 0.0
     return false)
 
 // Share the caller's invalidation batch with other derived views. Sources remain authoritative.

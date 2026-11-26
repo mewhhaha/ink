@@ -23,15 +23,21 @@ const no_parent: U32 = 4294967295
 // Tails run to the first child's origin; a leaf continues its own direction
 // from the parent (or up) for a quarter metre.
 func default_bones (parents: #[U32]) -> (bind: #[transform.Pose3]) -> (radius: F32) -> (swing: F32) -> (twist_low: F32) -> (twist_high: F32) -> (strength: F32) : #[Bone] =>
-  return @array.generate bind.length (func (i: U32) =>
+  let n = bind.length
+  let first_child = @array.fill n no_parent
+  let p_len = min n parents.length
+  for c in 0 .. p_len:
+    let p = parents[c]
+    if p < n and first_child[p] == no_parent:
+      first_child[p] := c
+  return @array.generate n (func (i: U32) =>
     let tail = $Vec3 { x: 0.0, y: 0.25, z: 0.0 }
-    let found = false
-    for c in 0 .. bind.length:
-      if not found and c < parents.length and parents[c] == i:
-        tail := bind[c].position
-        found := true
-    if not found and bind[i].position.length_squared > 0.000001:
-      tail := bind[i].position.normalized * 0.25
+    let fc = first_child[i]
+    if fc != no_parent:
+      tail := bind[fc].position
+    else:
+      if bind[i].position.length_squared > 0.000001:
+        tail := bind[i].position.normalized * 0.25
     return $Bone { radius, tail, swing, twist_low, twist_high, strength })
 
 func valid_bone (bone: Bone) : Bool =>
@@ -110,19 +116,17 @@ func joint_list (first: U32) -> (parents: #[U32]) -> (bind: #[transform.Pose3]) 
     return #[]
   let rotations = world_rotations parents bind
   let positions = world_positions parents bind rotations
+  let frames = @array.generate bind.length (func (i: U32) => rotations[i] * alignment bones[i])
+  let body_centers = @array.generate bind.length (func (i: U32) => positions[i] + math.Quat.rotate rotations[i] (bones[i].tail * 0.5))
   let found: #[joints.Joint] = #[]
   for i in 0 .. bind.length:
     let p = parents[i]
     if p != no_parent:
-      let frame_p = rotations[p] * alignment bones[p]
-      let frame_i = rotations[i] * alignment bones[i]
-      let body_p = positions[p] + math.Quat.rotate rotations[p] (bones[p].tail * 0.5)
-      let body_i = positions[i] + math.Quat.rotate rotations[i] (bones[i].tail * 0.5)
-      let conj_p = math.Quat.conjugate frame_p
-      let conj_i = math.Quat.conjugate frame_i
-      let anchor_a = math.Quat.rotate conj_p (positions[i] - body_p)
-      let anchor_b = math.Quat.rotate conj_i (positions[i] - body_i)
-      let rest = conj_p * frame_i
+      let conj_p = math.Quat.conjugate frames[p]
+      let conj_i = math.Quat.conjugate frames[i]
+      let anchor_a = math.Quat.rotate conj_p (positions[i] - body_centers[p])
+      let anchor_b = math.Quat.rotate conj_i (positions[i] - body_centers[i])
+      let rest = conj_p * frames[i]
       let axis_a = math.Quat.rotate rest math.up
       let j = joints.cone_twist (first + p) (first + i) anchor_a anchor_b axis_a math.up bones[i].swing bones[i].twist_low bones[i].twist_high
       j.rest := math.Quat.normalized rest
@@ -141,14 +145,14 @@ func powered (parents: #[U32]) -> (bones: #[Bone]) -> (animated: #[transform.Pos
     if not (valid_pose animated[i] and valid_bone bones[i]):
       return links
   let rotations = world_rotations parents animated
+  let frames = @array.generate animated.length (func (i: U32) => rotations[i] * alignment bones[i])
   let k = 0
+  let s_pos = max 0.0 strength
   for i in 0 .. animated.length:
     let p = parents[i]
     if p != no_parent and k < links.length:
-      let frame_p = rotations[p] * alignment bones[p]
-      let frame_i = rotations[i] * alignment bones[i]
-      let target = math.Quat.normalized (math.Quat.conjugate frame_p * frame_i)
-      links[k] := joints.pose_drive links[k] target (bones[i].strength * max 0.0 strength) hertz zeta
+      let target = math.Quat.normalized (math.Quat.conjugate frames[p] * frames[i])
+      links[k] := joints.pose_drive links[k] target (bones[i].strength * s_pos) hertz zeta
       k := self + 1
   return links
 

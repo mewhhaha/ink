@@ -206,8 +206,6 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
     let dx = pb.x + rbx - pa.x - rax
     let dy = pb.y + rby - pa.y - ray
     let dz = pb.z + rbz - pa.z - raz
-    let (aax, aay, aaz) = math.rotate_parts qa.x qa.y qa.z qa.w j.axis_a.x j.axis_a.y j.axis_a.z
-    let (abx, aby, abz) = math.rotate_parts qb.x qb.y qb.z qb.w j.axis_b.x j.axis_b.y j.axis_b.z
     let kind_id = 0
     if let $Spring = j.kind:
       kind_id := 1
@@ -219,7 +217,6 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
       kind_id := 4
     if let $Fixed = j.kind:
       kind_id := 5
-    let hinge_kind = kind_id == 2
     let spring_kind = kind_id == 1
     let rows = 1
     if kind_id == 2:
@@ -230,26 +227,55 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
       rows := 8
     if kind_id == 5:
       rows := 6
-    let (px, py, pz) = shapes.perpendicular_xyz aax aay aaz
-    let ex = aay * abz - aaz * aby
-    let ey = aaz * abx - aax * abz
-    let ez = aax * aby - aay * abx
-    // Antiparallel axes have zero cross product but are not aligned. Choose a
-    // deterministic correction axis instead of leaving the hinge inverted.
-    if aax * abx + aay * aby + aaz * abz < 0.0 and ex * ex + ey * ey + ez * ez < 0.00000001:
-      ex := px
-      ey := py
-      ez := pz
-    let squared = dx * dx + dy * dy + dz * dz
-    let separation = sqrt squared
-    let stretch = separation - j.length
+    let aax = 0.0
+    let aay = 1.0
+    let aaz = 0.0
+    let abx = 0.0
+    let aby = 1.0
+    let abz = 0.0
+    let px = 0.0
+    let py = 0.0
+    let pz = 0.0
+    let ex = 0.0
+    let ey = 0.0
+    let ez = 0.0
+    if kind_id == 2 or kind_id == 3 or kind_id == 4:
+      let (txa, tya, tza) = math.rotate_parts qa.x qa.y qa.z qa.w j.axis_a.x j.axis_a.y j.axis_a.z
+      aax := txa
+      aay := tya
+      aaz := tza
+      if kind_id == 2 or kind_id == 4:
+        let (tpx, tpy, tpz) = shapes.perpendicular_xyz aax aay aaz
+        px := tpx
+        py := tpy
+        pz := tpz
+      if kind_id == 2:
+        let (txb, tyb, tzb) = math.rotate_parts qb.x qb.y qb.z qb.w j.axis_b.x j.axis_b.y j.axis_b.z
+        abx := txb
+        aby := tyb
+        abz := tzb
+        ex := aay * abz - aaz * aby
+        ey := aaz * abx - aax * abz
+        ez := aax * aby - aay * abx
+        // Antiparallel axes have zero cross product but are not aligned. Choose a
+        // deterministic correction axis instead of leaving the hinge inverted.
+        if aax * abx + aay * aby + aaz * abz < 0.0 and ex * ex + ey * ey + ez * ez < 0.00000001:
+          ex := px
+          ey := py
+          ez := pz
+    let stretch = 0.0
     let ux = 0.0
     let uy = 1.0
     let uz = 0.0
-    if squared > 0.00000001:
-      ux := dx / separation
-      uy := dy / separation
-      uz := dz / separation
+    if kind_id <= 1:
+      let squared = dx * dx + dy * dy + dz * dz
+      let separation = sqrt squared
+      stretch := separation - j.length
+      if squared > 0.00000001:
+        let inv_sep = 1.0 / separation
+        ux := dx * inv_sep
+        uy := dy * inv_sep
+        uz := dz * inv_sep
     // The rotation of b away from a's rest orientation, in world axes, as a
     // quaternion (w >= 0): its vector part gives the lock error, and its
     // swing/twist split gives the angles.
@@ -266,61 +292,73 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
     let drx = 0.0
     let dry = 0.0
     let drz = 0.0
-    if kind_id >= 2:
+    let need_dq = kind_id == 4 or kind_id == 5 or (kind_id == 2 and (j.limited or (j.motor_position and j.motor_torque > 0.0))) or (kind_id == 3 and j.limited)
+    if need_dq:
       let dq = qb * math.Quat.conjugate (qa * j.rest)
       let sign = if dq.w < 0.0 then (-1.0) else 1.0
       dqx := dq.x * sign
       dqy := dq.y * sign
       dqz := dq.z * sign
       dqw := dq.w * sign
-      let along = dqx * aax + dqy * aay + dqz * aaz
-      twist := 2.0 * math.atan2 along dqw
-      if kind_id == 3:
-        let tl = sqrt (along * along + dqw * dqw)
-        if tl > 0.000001:
-          let tq = $Quat { x: aax * along / tl, y: aay * along / tl, z: aaz * along / tl, w: dqw / tl }
-          let sq = $Quat { x: dqx, y: dqy, z: dqz, w: dqw } * math.Quat.conjugate tq
-          let sv = sqrt (sq.x * sq.x + sq.y * sq.y + sq.z * sq.z)
-          let ssign = if sq.w < 0.0 then (-1.0) else 1.0
-          swing_angle := 2.0 * math.atan2 sv (sq.w * ssign)
-          if sv > 0.000001:
-            swx := sq.x * ssign / sv
-            swy := sq.y * ssign / sv
-            swz := sq.z * ssign / sv
-        else:
-          let sv = sqrt (dqx * dqx + dqy * dqy + dqz * dqz)
-          if sv > 0.000001:
-            swing_angle := pi
-            swx := dqx / sv
-            swy := dqy / sv
-            swz := dqz / sv
-        if j.motor_position:
-          let dt = qb * math.Quat.conjugate (qa * j.target)
-          let ds = if dt.w < 0.0 then (-1.0) else 1.0
-          drx := 2.0 * dt.x * ds
-          dry := 2.0 * dt.y * ds
-          drz := 2.0 * dt.z * ds
+      if kind_id == 2 or kind_id == 3:
+        let along = dqx * aax + dqy * aay + dqz * aaz
+        twist := 2.0 * math.atan2 along dqw
+        if kind_id == 3:
+          let tl = sqrt (along * along + dqw * dqw)
+          if tl > 0.000001:
+            let inv_tl = 1.0 / tl
+            let tq = $Quat { x: aax * along * inv_tl, y: aay * along * inv_tl, z: aaz * along * inv_tl, w: dqw * inv_tl }
+            let sq = $Quat { x: dqx, y: dqy, z: dqz, w: dqw } * math.Quat.conjugate tq
+            let sv = sqrt (sq.x * sq.x + sq.y * sq.y + sq.z * sq.z)
+            let ssign = if sq.w < 0.0 then (-1.0) else 1.0
+            swing_angle := 2.0 * math.atan2 sv (sq.w * ssign)
+            if sv > 0.000001:
+              let inv_sv = ssign / sv
+              swx := sq.x * inv_sv
+              swy := sq.y * inv_sv
+              swz := sq.z * inv_sv
+          else:
+            let sv = sqrt (dqx * dqx + dqy * dqy + dqz * dqz)
+            if sv > 0.000001:
+              swing_angle := pi
+              let inv_sv = 1.0 / sv
+              swx := dqx * inv_sv
+              swy := dqy * inv_sv
+              swz := dqz * inv_sv
+    if kind_id == 3 and j.motor_position and j.motor_torque > 0.0:
+      let dt = qb * math.Quat.conjugate (qa * j.target)
+      let ds = if dt.w < 0.0 then (-1.0) else 1.0
+      drx := 2.0 * dt.x * ds
+      dry := 2.0 * dt.y * ds
+      drz := 2.0 * dt.z * ds
+    let has_pos_motor = j.motor_position and j.motor_torque > 0.0 and (kind_id == 2 or kind_id == 3 or kind_id == 4)
+    let (motor_rate, motor_scale) = if has_pos_motor then soft_rate h j.motor_hertz j.motor_zeta else (0.0, 0.0)
     // Slider: translation along the axis and the two perpendicular rows.
-    let slide = dx * aax + dy * aay + dz * aaz
-    let (s1x, s1y, s1z) = shapes.perpendicular_xyz aax aay aaz
-    let s2x = aay * s1z - aaz * s1y
-    let s2y = aaz * s1x - aax * s1z
-    let s2z = aax * s1y - aay * s1x
+    let slide = if kind_id == 4 then dx * aax + dy * aay + dz * aaz else 0.0
+    let s1x = px
+    let s1y = py
+    let s1z = pz
+    let s2x = if kind_id == 4 then aay * s1z - aaz * s1y else 0.0
+    let s2y = if kind_id == 4 then aaz * s1x - aax * s1z else 0.0
+    let s2z = if kind_id == 4 then aax * s1y - aay * s1x else 0.0
+    let vel_a = ia * 6
+    let vel_b = ib * 6
+    let vax = if has_a then vel[vel_a] else link.velocity_a.x
+    let vay = if has_a then vel[vel_a + 1] else link.velocity_a.y
+    let vaz = if has_a then vel[vel_a + 2] else link.velocity_a.z
+    let wax = if has_a then vel[vel_a + 3] else link.angular_a.x
+    let way = if has_a then vel[vel_a + 4] else link.angular_a.y
+    let waz = if has_a then vel[vel_a + 5] else link.angular_a.z
+    let vbx = if has_b then vel[vel_b] else link.velocity_b.x
+    let vby = if has_b then vel[vel_b + 1] else link.velocity_b.y
+    let vbz = if has_b then vel[vel_b + 2] else link.velocity_b.z
+    let wbx = if has_b then vel[vel_b + 3] else link.angular_b.x
+    let wby = if has_b then vel[vel_b + 4] else link.angular_b.y
+    let wbz = if has_b then vel[vel_b + 5] else link.angular_b.z
+    let ka = ia * 6
+    let kb = ib * 6
+    let inv_h = 1.0 / h
     for row in 0..rows:
-      let vel_a = ia * 6
-      let vel_b = ib * 6
-      let vax = if has_a then vel[vel_a] else link.velocity_a.x
-      let vay = if has_a then vel[vel_a + 1] else link.velocity_a.y
-      let vaz = if has_a then vel[vel_a + 2] else link.velocity_a.z
-      let wax = if has_a then vel[vel_a + 3] else link.angular_a.x
-      let way = if has_a then vel[vel_a + 4] else link.angular_a.y
-      let waz = if has_a then vel[vel_a + 5] else link.angular_a.z
-      let vbx = if has_b then vel[vel_b] else link.velocity_b.x
-      let vby = if has_b then vel[vel_b + 1] else link.velocity_b.y
-      let vbz = if has_b then vel[vel_b + 2] else link.velocity_b.z
-      let wbx = if has_b then vel[vel_b + 3] else link.angular_b.x
-      let wby = if has_b then vel[vel_b + 4] else link.angular_b.y
-      let wbz = if has_b then vel[vel_b + 5] else link.angular_b.z
       let angular = false
       let nx = ux
       let ny = uy
@@ -332,9 +370,6 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
       let sgn = 1.0
       let live = true
       let cap = 0.0
-      let motor_axis_x = aax
-      let motor_axis_y = aay
-      let motor_axis_z = aaz
       if spring_kind:
         mode := 1
       if kind_id == 2 or kind_id == 3 or kind_id == 5:
@@ -458,6 +493,8 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
         ny := if row == 4 then 1.0 else 0.0
         nz := if row == 5 then 1.0 else 0.0
         error := 2.0 * (dqx * nx + dqy * ny + dqz * nz)
+      if not live:
+        continue
       let jax = if angular then nx else ray * nz - raz * ny
       let jay = if angular then ny else raz * nx - rax * nz
       let jaz = if angular then nz else rax * ny - ray * nx
@@ -468,18 +505,16 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
       let iay = 0.0
       let iaz = 0.0
       if ma > 0.0:
-        let k = ia * 6
-        iax := iw[k] * jax + iw[k + 3] * jay + iw[k + 4] * jaz
-        iay := iw[k + 3] * jax + iw[k + 1] * jay + iw[k + 5] * jaz
-        iaz := iw[k + 4] * jax + iw[k + 5] * jay + iw[k + 2] * jaz
+        iax := iw[ka] * jax + iw[ka + 3] * jay + iw[ka + 4] * jaz
+        iay := iw[ka + 3] * jax + iw[ka + 1] * jay + iw[ka + 5] * jaz
+        iaz := iw[ka + 4] * jax + iw[ka + 5] * jay + iw[ka + 2] * jaz
       let ibx = 0.0
       let iby = 0.0
       let ibz = 0.0
       if mb > 0.0:
-        let k = ib * 6
-        ibx := iw[k] * jbx + iw[k + 3] * jby + iw[k + 4] * jbz
-        iby := iw[k + 3] * jbx + iw[k + 1] * jby + iw[k + 5] * jbz
-        ibz := iw[k + 4] * jbx + iw[k + 5] * jby + iw[k + 2] * jbz
+        ibx := iw[kb] * jbx + iw[kb + 3] * jby + iw[kb + 4] * jbz
+        iby := iw[kb + 3] * jbx + iw[kb + 1] * jby + iw[kb + 5] * jbz
+        ibz := iw[kb + 4] * jbx + iw[kb + 5] * jby + iw[kb + 2] * jbz
       let k = jax * iax + jay * iay + jaz * iaz + (jbx * ibx + jby * iby + jbz * ibz)
       let speed = wbx * jbx + wby * jby + wbz * jbz - (wax * jax + way * jay + waz * jaz)
       if not angular:
@@ -487,48 +522,57 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
         // Relative anchor velocity: translation plus the anchors' spin.
         speed := self + ((vbx - vax) * nx + (vby - vay) * ny + (vbz - vaz) * nz)
       let gamma = 0.0
-      let active = live
-      let bias = clamp (-3.0) 3.0 (0.2 * error / h)
+      let active = true
+      let bias = clamp (-3.0) 3.0 (0.2 * error * inv_h)
       if mode == 1:
         let denominator = h * (j.damping + h * j.stiffness)
-        active := active and denominator > 0.0
+        active := denominator > 0.0
         if denominator > 0.0:
           gamma := 1.0 / denominator
           bias := error * h * j.stiffness * gamma
       if active and k > 0.0:
-        let impulse = F32.neg (speed + bias) / (k + gamma)
-        if mode == 2:
-          impulse := clamp (F32.neg cap) cap (F32.neg (speed - j.motor_speed) / k)
-        if mode == 3:
-          let (motor_rate, motor_scale) = soft_rate h j.motor_hertz j.motor_zeta
-          impulse := clamp (F32.neg cap) cap (F32.neg motor_scale * (speed + motor_rate * error) / k)
-        if mode == 4:
-          // Violated when error > 0; otherwise approach is allowed up to the limit.
-          let y = sgn * speed
-          let target = if error > 0.0 then F32.neg limit_rate * error else F32.neg error / h
-          let scale = if error > 0.0 then limit_scale else 1.0
-          impulse := sgn * (min 0.0 (F32.neg scale * (y - target) / k))
-        if not (is_finite impulse):
-          impulse := 0.0
-        let qx = nx * impulse
-        let qy = ny * impulse
-        let qz = nz * impulse
-        if ma > 0.0:
-          if not angular:
-            vel[vel_a] := vel[vel_a] - qx * ma
-            vel[vel_a + 1] := vel[vel_a + 1] - qy * ma
-            vel[vel_a + 2] := vel[vel_a + 2] - qz * ma
-          vel[vel_a + 3] := vel[vel_a + 3] - iax * impulse
-          vel[vel_a + 4] := vel[vel_a + 4] - iay * impulse
-          vel[vel_a + 5] := vel[vel_a + 5] - iaz * impulse
-        if mb > 0.0:
-          if not angular:
-            vel[vel_b] := vel[vel_b] + qx * mb
-            vel[vel_b + 1] := vel[vel_b + 1] + qy * mb
-            vel[vel_b + 2] := vel[vel_b + 2] + qz * mb
-          vel[vel_b + 3] := vel[vel_b + 3] + ibx * impulse
-          vel[vel_b + 4] := vel[vel_b + 4] + iby * impulse
-          vel[vel_b + 5] := vel[vel_b + 5] + ibz * impulse
+        let impulse = if mode == 2 then clamp (F32.neg cap) cap (F32.neg (speed - j.motor_speed) / k)
+          else if mode == 3 then clamp (F32.neg cap) cap (F32.neg motor_scale * (speed + motor_rate * error) / k)
+          else if mode == 4 then (do:
+            let y = sgn * speed
+            let target = if error > 0.0 then F32.neg limit_rate * error else F32.neg error * inv_h
+            let scale = if error > 0.0 then limit_scale else 1.0
+            break sgn * (min 0.0 (F32.neg scale * (y - target) / k)))
+          else F32.neg (speed + bias) / (k + gamma)
+        if is_finite impulse and impulse != 0.0:
+          let qx = nx * impulse
+          let qy = ny * impulse
+          let qz = nz * impulse
+          if ma > 0.0:
+            if not angular:
+              vax := self - qx * ma
+              vay := self - qy * ma
+              vaz := self - qz * ma
+            wax := self - iax * impulse
+            way := self - iay * impulse
+            waz := self - iaz * impulse
+          if mb > 0.0:
+            if not angular:
+              vbx := self + qx * mb
+              vby := self + qy * mb
+              vbz := self + qz * mb
+            wbx := self + ibx * impulse
+            wby := self + iby * impulse
+            wbz := self + ibz * impulse
+    if ma > 0.0:
+      vel[vel_a] := vax
+      vel[vel_a + 1] := vay
+      vel[vel_a + 2] := vaz
+      vel[vel_a + 3] := wax
+      vel[vel_a + 4] := way
+      vel[vel_a + 5] := waz
+    if mb > 0.0:
+      vel[vel_b] := vbx
+      vel[vel_b + 1] := vby
+      vel[vel_b + 2] := vbz
+      vel[vel_b + 3] := wbx
+      vel[vel_b + 4] := wby
+      vel[vel_b + 5] := wbz
   return vel
 
 func solve_into (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => func (rot: #[F32]) => func (inv_mass: #[F32]) => func (iw: #[F32]) => func (links: #[Link]) => func (vel_in: #[F32]) -> (vel: own #[F32]) : #[F32] =>

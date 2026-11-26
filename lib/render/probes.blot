@@ -96,13 +96,25 @@ func sample (grid: Grid) -> (values: #[F32]) -> (position: Vec3) -> (normal: Vec
   let fx = cx - U32.to_f32 ix
   let fy = cy - U32.to_f32 iy
   let fz = cz - U32.to_f32 iz
-  let terms = environment.basis n
+  let t0 = 0.2820947918
+  let t1 = 0.4886025119 * n.y
+  let t2 = 0.4886025119 * n.z
+  let t3 = 0.4886025119 * n.x
+  let t4 = 1.0925484306 * n.x * n.y
+  let t5 = 1.0925484306 * n.y * n.z
+  let t6 = 0.3153915653 * (3.0 * n.z * n.z - 1.0)
+  let t7 = 1.0925484306 * n.x * n.z
+  let t8 = 0.5462742153 * (n.x * n.x - n.y * n.y)
   let r = 0.0
   let g = 0.0
   let b = 0.0
   let weight = 0.0
   let share = 0.0
   let total = 0.0
+  let sp = grid.spacing
+  let ox = grid.origin.x
+  let oy = grid.origin.y
+  let oz = grid.origin.z
   for corner in 0 .. 8:
     let dx = corner & 1
     let dy = (corner >> 1) & 1
@@ -121,20 +133,15 @@ func sample (grid: Grid) -> (values: #[F32]) -> (position: Vec3) -> (normal: Vec
       total := self + tri
       share := self + tri * valid
       if valid > 0.0:
-        let probe = lattice_position grid index
-        let tx = probe.x - position.x
-        let ty = probe.y - position.y
-        let tz = probe.z - position.z
+        let tx = ox + U32.to_f32 x * sp - position.x
+        let ty = oy + U32.to_f32 y * sp - position.y
+        let tz = oz + U32.to_f32 z * sp - position.z
         let length = sqrt (tx * tx + ty * ty + tz * tz)
         let facing = if length < 0.0001 then 1.0 else 0.5 + 0.5 * (tx * n.x + ty * n.y + tz * n.z) / length
         let w = tri * valid * max 0.02 (facing * facing)
-        let cr = 0.0
-        let cg = 0.0
-        let cb = 0.0
-        for i in 0 .. 9:
-          cr := self + values[base + i * 3] * terms[i]
-          cg := self + values[base + i * 3 + 1] * terms[i]
-          cb := self + values[base + i * 3 + 2] * terms[i]
+        let cr = values[base] * t0 + values[base + 3] * t1 + values[base + 6] * t2 + values[base + 9] * t3 + values[base + 12] * t4 + values[base + 15] * t5 + values[base + 18] * t6 + values[base + 21] * t7 + values[base + 24] * t8
+        let cg = values[base + 1] * t0 + values[base + 4] * t1 + values[base + 7] * t2 + values[base + 10] * t3 + values[base + 13] * t4 + values[base + 16] * t5 + values[base + 19] * t6 + values[base + 22] * t7 + values[base + 25] * t8
+        let cb = values[base + 2] * t0 + values[base + 5] * t1 + values[base + 8] * t2 + values[base + 11] * t3 + values[base + 14] * t4 + values[base + 17] * t5 + values[base + 20] * t6 + values[base + 23] * t7 + values[base + 26] * t8
         r := self + w * max 0.0 cr
         g := self + w * max 0.0 cg
         b := self + w * max 0.0 cb
@@ -189,40 +196,82 @@ func bake_probe (sc: scene.Scene) -> (light: Light) -> (grid: Grid) -> (albedo: 
     return values
   let rays = max 1 light.rays
   let weight = 12.5663706144 / U32.to_f32 rays
-  let inside = 0
-  let samples: #[environment.Sample] = #[]
-  if scene.point_solid sc origin light.mask:
-    inside := rays
-  for i in 0 .. rays:
-    if inside < rays:
-      let y = 1.0 - 2.0 * (U32.to_f32 i + 0.5) / U32.to_f32 rays
-      let ring = sqrt (max 0.0 (1.0 - y * y))
-      let raw_phase = U32.to_f32 i * 2.3999632297
-      let phase = if abs raw_phase > 8192.0 then (if abs raw_phase > 1.0e7 then 0.0 else wrap tau raw_phase) else raw_phase
-      let (s, c) = sin_cos phase
-      let direction = $Vec3 { x: ring * c, y, z: ring * s }
-      let radiance = math.rgb 0.0 0.0 0.0
-      if let $Some hit = scene.ray sc origin direction light.reach light.mask 0:
-        if hit.distance < 0.001:
-          inside := self + 1
-        else:
-          radiance := reflected sc light grid previous (albedo hit.id) hit.point hit.normal
-      else:
-        let heaven = environment.sky light.sky direction
-        radiance := math.rgb (heaven.r * light.tint.r) (heaven.g * light.tint.g) (heaven.b * light.tint.b)
-      @storage.push samples ($environment.Sample { direction, radiance, solid_angle: weight })
   let base = index * stride
-  let valid = inside * 4 <= rays
-  if inside >= rays or not valid:
+  if scene.point_solid sc origin light.mask:
     for k in 0 .. stride:
       values[base + k] := 0.0
     return values
-  let irradiance = environment.integrate (samples)
-  for i in 0 .. 9:
-    let c = irradiance.coefficients[i]
-    values[base + i * 3] := c.r / 3.1415926536
-    values[base + i * 3 + 1] := c.g / 3.1415926536
-    values[base + i * 3 + 2] := c.b / 3.1415926536
+  let inside = 0
+  let sums = @array.fill 27 0.0
+  let w0 = 0.2820947918 * weight * 3.1415926536
+  let k1 = 0.4886025119 * weight * 2.0943951024
+  let k2 = 1.0925484306 * weight * 0.7853981634
+  let k6 = 0.3153915653 * weight * 0.7853981634
+  let k8 = 0.5462742153 * weight * 0.7853981634
+  let inv_rays = 1.0 / U32.to_f32 rays
+  for i in 0 .. rays:
+    let y = 1.0 - 2.0 * (U32.to_f32 i + 0.5) * inv_rays
+    let ring = sqrt (max 0.0 (1.0 - y * y))
+    let raw_phase = U32.to_f32 i * 2.3999632297
+    let phase = if abs raw_phase > 8192.0 then (if abs raw_phase > 1.0e7 then 0.0 else wrap tau raw_phase) else raw_phase
+    let (s, c) = sin_cos phase
+    let dx = ring * c
+    let dz = ring * s
+    let direction = $Vec3 { x: dx, y, z: dz }
+    let radiance = math.rgb 0.0 0.0 0.0
+    if let $Some hit = scene.ray sc origin direction light.reach light.mask 0:
+      if hit.distance < 0.001:
+        inside := self + 1
+      else:
+        radiance := reflected sc light grid previous (albedo hit.id) hit.point hit.normal
+    else:
+      let heaven = environment.sky light.sky direction
+      radiance := math.rgb (heaven.r * light.tint.r) (heaven.g * light.tint.g) (heaven.b * light.tint.b)
+    let rr = radiance.r
+    let rg = radiance.g
+    let rb = radiance.b
+    let w1 = k1 * y
+    let w2 = k1 * dz
+    let w3 = k1 * dx
+    let w4 = k2 * dx * y
+    let w5 = k2 * y * dz
+    let w6 = k6 * (3.0 * dz * dz - 1.0)
+    let w7 = k2 * dx * dz
+    let w8 = k8 * (dx * dx - y * y)
+    sums[0] := self + rr * w0
+    sums[1] := self + rg * w0
+    sums[2] := self + rb * w0
+    sums[3] := self + rr * w1
+    sums[4] := self + rg * w1
+    sums[5] := self + rb * w1
+    sums[6] := self + rr * w2
+    sums[7] := self + rg * w2
+    sums[8] := self + rb * w2
+    sums[9] := self + rr * w3
+    sums[10] := self + rg * w3
+    sums[11] := self + rb * w3
+    sums[12] := self + rr * w4
+    sums[13] := self + rg * w4
+    sums[14] := self + rb * w4
+    sums[15] := self + rr * w5
+    sums[16] := self + rg * w5
+    sums[17] := self + rb * w5
+    sums[18] := self + rr * w6
+    sums[19] := self + rg * w6
+    sums[20] := self + rb * w6
+    sums[21] := self + rr * w7
+    sums[22] := self + rg * w7
+    sums[23] := self + rb * w7
+    sums[24] := self + rr * w8
+    sums[25] := self + rg * w8
+    sums[26] := self + rb * w8
+  if inside * 4 > rays:
+    for k in 0 .. stride:
+      values[base + k] := 0.0
+    return values
+  let inv_pi = 1.0 / 3.1415926536
+  for i in 0 .. 27:
+    values[base + i] := sums[i] * inv_pi
   values[base + 27] := 1.0
   return values
 
@@ -249,13 +298,56 @@ func resume (grid: Grid) -> (first: U32) -> (budget: U32) : U32 =>
 // `light.reach` is every probe that could see them).
 func region (grid: Grid) -> (low: Vec3) -> (high: Vec3) -> (margin: F32) : #[U32] =>
   let found: #[U32] = #[]
-  let $Some total = grid_count grid else:
+  let $Some _ = grid_count grid else:
     return found
-  for index in 0 .. total:
-    let p = lattice_position grid index
-    if p.x >= low.x - margin and p.x <= high.x + margin and p.y >= low.y - margin and p.y <= high.y + margin and p.z >= low.z - margin and p.z <= high.z + margin:
-      @storage.push found index
-  return (found)
+  if not (math.finite3 grid.origin and is_finite grid.spacing and grid.spacing > 0.0 and math.finite3 low and math.finite3 high and is_finite margin):
+    return found
+  let min_x = low.x - margin
+  let max_x = high.x + margin
+  let min_y = low.y - margin
+  let max_y = high.y + margin
+  let min_z = low.z - margin
+  let max_z = high.z + margin
+  if min_x > max_x or min_y > max_y or min_z > max_z:
+    return found
+  let sp = grid.spacing
+  let f_x0 = ceil ((min_x - grid.origin.x) / sp)
+  let f_x1 = floor ((max_x - grid.origin.x) / sp)
+  let f_y0 = ceil ((min_y - grid.origin.y) / sp)
+  let f_y1 = floor ((max_y - grid.origin.y) / sp)
+  let f_z0 = ceil ((min_z - grid.origin.z) / sp)
+  let f_z1 = floor ((max_z - grid.origin.z) / sp)
+  let fx_max = U32.to_f32 (grid.nx - 1)
+  let fy_max = U32.to_f32 (grid.ny - 1)
+  let fz_max = U32.to_f32 (grid.nz - 1)
+  if f_x1 < 0.0 or f_x0 > fx_max or f_y1 < 0.0 or f_y0 > fy_max or f_z1 < 0.0 or f_z0 > fz_max:
+    return found
+  let ix0 = if f_x0 <= 0.0 then 0 else min (grid.nx - 1) (F32.to_u32 f_x0)
+  let ix1 = if f_x1 >= fx_max then grid.nx - 1 else F32.to_u32 f_x1
+  let iy0 = if f_y0 <= 0.0 then 0 else min (grid.ny - 1) (F32.to_u32 f_y0)
+  let iy1 = if f_y1 >= fy_max then grid.ny - 1 else F32.to_u32 f_y1
+  let iz0 = if f_z0 <= 0.0 then 0 else min (grid.nz - 1) (F32.to_u32 f_z0)
+  let iz1 = if f_z1 >= fz_max then grid.nz - 1 else F32.to_u32 f_z1
+  // Include boundary-adjacent indices in case of F32 rounding of `origin + i * spacing`.
+  let sx0 = if ix0 > 0 then ix0 - 1 else 0
+  let sx1 = min (grid.nx - 1) (ix1 + 1)
+  let sy0 = if iy0 > 0 then iy0 - 1 else 0
+  let sy1 = min (grid.ny - 1) (iy1 + 1)
+  let sz0 = if iz0 > 0 then iz0 - 1 else 0
+  let sz1 = min (grid.nz - 1) (iz1 + 1)
+  for z in sz0 .. (sz1 + 1):
+    let pz = grid.origin.z + U32.to_f32 z * sp
+    if pz >= min_z and pz <= max_z:
+      let z_base = z * grid.ny
+      for y in sy0 .. (sy1 + 1):
+        let py = grid.origin.y + U32.to_f32 y * sp
+        if py >= min_y and py <= max_y:
+          let y_base = (z_base + y) * grid.nx
+          for x in sx0 .. (sx1 + 1):
+            let px = grid.origin.x + U32.to_f32 x * sp
+            if px >= min_x and px <= max_x:
+              @storage.push found (y_base + x)
+  return found
 
 // Bakes the listed probes from position `first`, `budget` of them; the next
 // position in the list is `min listed.length (first + budget)`.

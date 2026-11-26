@@ -25,7 +25,7 @@ import { Vec3 } from "std/vector"
 
 // Input events occupy a separately named owner; this local result is scalar.
 type FrameInput is data = $FrameInput {elapsed: F32, width: F32, height: F32}
-func decode_frame (packet: #[F32]) -> (packet_events: own #[protocol.Event]) -> (received: own #[window.Event]) : (FrameInput, #[protocol.Event], #[window.Event]) =>
+func decode_frame packet -> (packet_events: own #[protocol.Event]) -> (received: own #[window.Event]) : (FrameInput, #[protocol.Event], #[window.Event]) =>
   let input = protocol.decode_input_into packet packet_events
   lanes.require (input.state.length == 0)
   @storage.truncate received 0
@@ -288,6 +288,27 @@ func wire_node context -> index =>
     text,
   }
 
+// Flat pre-packed UI text avoids allocating a per-node #[F32] on every frame.
+func wire_node_packed context -> index =>
+  let node: tree.StoredNode = context.nodes.at index
+  let parent = if node.parent != 0 and (context.parents.at index) < index then (context.parents.at index) + 1 else 0
+  let span_base = index * 4
+  let start = context.ui_text_spans.at span_base
+  let name_length = context.ui_text_spans.at (span_base + 1)
+  let description_length = context.ui_text_spans.at (span_base + 2)
+  let total_text = context.ui_text_spans.at (span_base + 3)
+  let ui_text: &[F32] = context.ui_text
+  let text = &ui_text[start..start + total_text]
+  return {
+    id: min node.id protocol.max_ui_id, parent, role: node.role,
+    x: node.x, y: node.y, width: node.width, height: node.height,
+    focusable: node.focusable, focused: node.focused, disabled: node.disabled, hidden: node.hidden, modal: node.modal,
+    checked: node.checked, expanded: node.expanded, selected: node.selected, live: node.live,
+    value: node.value, minimum: node.minimum, maximum: node.maximum, step: node.step,
+    actions: node.actions, text_length: total_text, name_length, description_length,
+    text,
+  }
+
 // Exposure and the grade as the host's present pass reads them.
 func wire_exposure (e: render.Exposure) => $wire.Exposure {
   auto: e.auto, compensation: e.compensation, min: e.min, max: e.max, brighten: e.brighten, darken: e.darken,
@@ -401,7 +422,7 @@ const projections = {
   sound: func context -> value => wire_sound context.view value,
   inset: func context -> value => wire_inset context value,
   field: func context -> value => field_patch context value,
-  ui: wire_node,
+  ui: wire_node_packed,
   service: wire_outgoing_service,
   buse: func context -> value => wire_bus context.volumes value.index value.bus,
   voice: func context -> value => wire_voice context.view value,
@@ -534,6 +555,25 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
   let visible_nodes = &nodes[0..ui_count]
   let parents = tree.parents_of visible_nodes
   let ui_indices = array.generate ui_count identity
+  let ui_text: #[F32] = #[]
+  let ui_text_spans = @array.fill (ui_count * 4) 0
+  for idx in 0 .. ui_count:
+    let node = visible_nodes[idx]
+    let name = clipped (tree.text ui_labels node.name) protocol.max_ui_text
+    let description = clipped (tree.text ui_labels node.description) (protocol.max_ui_text - name.length)
+    let value_text = clipped (tree.text ui_labels node.value_text) (protocol.max_ui_text - name.length - description.length)
+    let start = ui_text.length
+    for i in 0 .. name.length:
+      @storage.push ui_text (U32.to_f32 name[i])
+    for i in 0 .. description.length:
+      @storage.push ui_text (U32.to_f32 description[i])
+    for i in 0 .. value_text.length:
+      @storage.push ui_text (U32.to_f32 value_text[i])
+    let sb = idx * 4
+    ui_text_spans[sb] := start
+    ui_text_spans[sb + 1] := name.length
+    ui_text_spans[sb + 2] := description.length
+    ui_text_spans[sb + 3] := name.length + description.length + value_text.length
   let buses = array.generate sound.buses.length (func index => {index, bus: (sound.buses.at index)})
   let state: #[F32] = #[]
   let empty_instances: #[render.Instance] = #[]
@@ -568,7 +608,8 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
     kernel_payload, probe_values,
     vectors: frame.vectors, faces: frame.faces, inset_draws: frame.inset_draws, field_values: frame.field_values,
-    nodes: visible_nodes, parents: &parents[0..parents.length], ui_labels}
+    nodes: visible_nodes, parents: &parents[0..parents.length],
+    ui_text: &ui_text[0..ui_text.length], ui_text_spans: &ui_text_spans[0..ui_text_spans.length]}
   lanes.require (frame.extensions.length <= protocol.max_extensions)
   for extension in frame.extensions:
     lanes.require (extension.tag <= protocol.max_extension_tag and extension.values.count <= protocol.max_extension_lanes and extension.values.start <= frame.extension_values.length and extension.values.count <= frame.extension_values.length - extension.values.start)
@@ -732,9 +773,6 @@ func frame application -> (own access) -> payload -> (outgoing: own #[F32]) =>
   access.preferences[0].changed := false
   return (access, outgoing)
 func execute application -> (own access) -> operation -> (payload: &[F32]) -> (outgoing: own #[F32]) =>
-  // The session buffer is reused after dispatch; decoders receive one owned
-  // numeric snapshot, scoped to this request and never carried around the loop.
-  let packet: #[F32] = array.generate payload.length (func index => payload.at index)
   case operation of
     1 => do:
       access := application.initialize (own access)
@@ -743,13 +781,14 @@ func execute application -> (own access) -> operation -> (payload: &[F32]) -> (o
       access.response := application.encode_state access self
       outgoing := program.append access.response self
     2 => do:
-      let (next_access, next_outgoing) = frame application access packet outgoing
+      let (next_access, next_outgoing) = frame application access payload outgoing
       access := next_access
       outgoing := next_outgoing
     3 => do:
       access.response := application.encode_state access self
       outgoing := program.append access.response self
     4 => do:
+      let packet: #[F32] = array.generate payload.length (func index => payload.at index)
       let (report, restored) = application.decode_state (own access) packet
       access := restored
       access.control := app.invalidate self
@@ -758,6 +797,7 @@ func execute application -> (own access) -> operation -> (payload: &[F32]) -> (o
       access.response := application.encode_scene access self
       outgoing := program.append access.response self
     6 => do:
+      let packet: #[F32] = array.generate payload.length (func index => payload.at index)
       let (report, restored) = application.decode_scene (own access) packet
       access := restored
       access.control := app.invalidate self

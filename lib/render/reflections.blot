@@ -60,42 +60,62 @@ func box_distance (probe: render.ReflectionProbe) -> (eye: Vec3) : F32 =>
 // `1 - the product of (1 - weight)` of what the higher priorities left, so
 // the share of probe i of a priority is `left * covered * w_i / sum w`. The
 // shares add up to `coverage`, and the sky has the rest (1 - coverage).
-private func probe_counted (probes: &[render.ReflectionProbe]) -> (weights: &[F32]) -> (i: U32) : F32 =>
-  if weights[i] <= 0.0:
-    return 0.0
-  let n = probes.length
-  let ahead = 0
-  for j in 0 .. n:
-    let first = probes[j].priority > probes[i].priority or (probes[j].priority == probes[i].priority and (probes[j].id < probes[i].id or (probes[j].id == probes[i].id and j < i)))
-    if weights[j] > 0.0 and first:
-      ahead := self + 1
-  return if ahead < max_blended then weights[i] else 0.0
-
-private func probe_share (probes: &[render.ReflectionProbe]) -> (counted: &[F32]) -> (i: U32) : F32 =>
-  if counted[i] <= 0.0:
-    return 0.0
-  let n = probes.length
-  let missed = 1.0
-  let total = 0.0
-  let left = 1.0
-  for k in 0 .. n:
-    if counted[k] > 0.0:
-      if probes[k].priority == probes[i].priority:
-        missed := self * (1.0 - counted[k])
-        total := self + counted[k]
-      if probes[k].priority > probes[i].priority:
-        left := self * (1.0 - counted[k])
-  if not (total > 0.0):
-    return 0.0
-  return left * (1.0 - missed) * counted[i] / total
+private func probe_before (pa: U32) -> (ia: U32) -> (idx_a: U32) -> (pb: U32) -> (ib: U32) -> (idx_b: U32) : Bool =>
+  return pa > pb or (pa == pb and (ia < ib or (ia == ib and idx_a < idx_b)))
 
 func shares (probes: &[render.ReflectionProbe]) -> (point: Vec3) : #[F32] =>
   let n = probes.length
-  let weights = spark #[influence probes[i] point | i <- 0 .. n]
-  let wv = &weights[0..n]
-  let counted = spark #[probe_counted probes wv i | i <- 0 .. n]
-  let cv = &counted[0..n]
-  return spark #[probe_share probes cv i | i <- 0 .. n]
+  let out = @array.fill n 0.0
+  let top_idx = @array.fill 4 0
+  let top_pri = @array.fill 4 0
+  let top_id = @array.fill 4 0
+  let top_w = @array.fill 4 0.0
+  let top_count: U32 = 0
+  for i in 0 .. n:
+    let p = probes[i]
+    let w = influence p point
+    if w > 0.0:
+      let pri = p.priority
+      let id = p.id
+      let pos = top_count
+      for k in 0 .. top_count:
+        if probe_before pri id i top_pri[k] top_id[k] top_idx[k]:
+          pos := k
+          break
+      if pos < max_blended:
+        let limit = min top_count (max_blended - 1)
+        let j = limit
+        for 0 .. 4:
+          if j <= pos:
+            break
+          top_idx[j] := top_idx[j - 1]
+          top_pri[j] := top_pri[j - 1]
+          top_id[j] := top_id[j - 1]
+          top_w[j] := top_w[j - 1]
+          j := self - 1
+        top_idx[pos] := i
+        top_pri[pos] := pri
+        top_id[pos] := id
+        top_w[pos] := w
+        if top_count < max_blended:
+          top_count := self + 1
+  for a in 0 .. top_count:
+    let pa = top_pri[a]
+    let missed = 1.0
+    let total = 0.0
+    let left = 1.0
+    for k in 0 .. top_count:
+      let pk = top_pri[k]
+      let wk = top_w[k]
+      if pk == pa:
+        missed := self * (1.0 - wk)
+        total := self + wk
+      else:
+        if pk > pa:
+          left := self * (1.0 - wk)
+    if total > 0.0:
+      out[top_idx[a]] := left * (1.0 - missed) * top_w[a] / total
+  return out
 
 // How much of the reflection the probes cover at `point`; the sky shows through the rest.
 func coverage (probes: &[render.ReflectionProbe]) -> (point: Vec3) : F32 =>
@@ -134,19 +154,33 @@ func box_projected (probe: render.ReflectionProbe) -> (point: Vec3) -> (directio
 // that already holds a slot as 20% nearer, so as to keep it; that history is not here.
 func choose (probes: &[render.ReflectionProbe]) -> (eye: Vec3) -> (slots: U32) : #[U32] =>
   let n = probes.length
-  let ranks = array.generate n (func (i: U32) =>
-    let ahead = 0
-    for j in 0 .. n:
-      let dj = box_distance probes[j] eye
-      let di = box_distance probes[i] eye
-      let first = probes[j].priority > probes[i].priority or (probes[j].priority == probes[i].priority and (dj < di or (dj == di and (probes[j].id < probes[i].id or (probes[j].id == probes[i].id and j < i)))))
-      if first:
-        ahead := self + 1
-    return ahead)
   let kept = min slots n
-  return array.generate kept (func (k: U32) =>
-    let found = 0
+  if kept == 0:
+    return #[]
+  let dists = @array.fill n 0.0
+  for i in 0 .. n:
+    dists[i] := box_distance probes[i] eye
+  let chosen = @array.fill kept 0
+  let used = @array.fill n false
+  for k in 0 .. kept:
+    let best: U32 = 0
+    let has_best = false
+    let best_pri: U32 = 0
+    let best_d = 0.0
+    let best_id: U32 = 0
     for i in 0 .. n:
-      if ranks[i] == k:
-        found := i
-    return found)
+      if not used[i]:
+        let p = probes[i]
+        let pri = p.priority
+        let d = dists[i]
+        let id = p.id
+        let better = not has_best or pri > best_pri or (pri == best_pri and (d < best_d or (d == best_d and (id < best_id or (id == best_id and i < best)))))
+        if better:
+          has_best := true
+          best := i
+          best_pri := pri
+          best_d := d
+          best_id := id
+    used[best] := true
+    chosen[k] := best
+  return chosen

@@ -111,7 +111,13 @@ as the body; bind long conditions in a `let cond = (...)` local first. A
 `private func` with unannotated generic parameters called directly from a public
 unannotated function can trigger `PRIVATE_IDENTITY_ESCAPE` if its inferred type
 constraint leaks into the public signature; annotate the helper's parameter
-concretely or make the generic helper public.
+concretely or make the generic helper public. Replacing an `own #[T]` binding
+with a freshly created array inside an `if` branch can trigger `RESULT_NOT_OWNED`
+when returned; route conditional replacement through a small `own` helper
+(`func adopt (dst: own #[T]) -> (src: own #[T]) : #[T]`). In hot polymorphic
+loops, prefer `for item in rows:` over `rows[i].field`, and call view methods
+directly (`values.at i`) rather than binding `let read: U32 -> U32 = values.at`,
+which prevents specialization and forces indirect calls (~3x slower).
 
 ## Math, transforms and time
 

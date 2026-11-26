@@ -28,14 +28,17 @@ func apply (state: U32) -> (eff_mask: U32) -> (eff_value: U32) : U32 =>
   return (state & (4294967295 ^ eff_mask)) | (eff_value & eff_mask)
 
 private func popcount32 (x: U32) : U32 =>
-  let v = x
-  let count = 0
-  for 0 .. 32:
-    if v == 0:
-      break
-    count := self + (v & 1)
-    v := self >> 1
-  return count
+  let b = x - ((x >> 1) & 0x55555555)
+  b := (self & 0x33333333) + ((self >> 2) & 0x33333333)
+  b := (self + (self >> 4)) & 0x0F0F0F0F
+  return (b * 0x01010101) >> 24
+
+private func hash_u32 (x: U32) : U32 =>
+  let h = x ^ (x >> 16)
+  h := self * 0x7FEB352D
+  h := self ^ (self >> 15)
+  h := self * 0x846CA68B
+  return h ^ (h >> 16)
 
 private func unsatisfied_bits (state: U32) -> (goal: Condition) : U32 =>
   return popcount32 ((state ^ goal.value) & goal.mask)
@@ -58,16 +61,16 @@ func plan (initial: U32) -> (goal: Condition) -> (actions: #[Action]) -> (max_no
     return $Some ($Plan { found: false, cost: 0.0, actions: #[] })
   let none = 4294967295
   let init_h = U32.to_f32 (unsatisfied_bits initial goal) * min_action_cost
+  let init_f = if is_finite init_h then init_h else 0.0
   let states: #[U32] = #[initial]
   let g_costs: #[F32] = #[0.0]
-  let f_costs: #[F32] = #[if is_finite init_h then init_h else 0.0]
+  let f_costs: #[F32] = #[init_f]
   let parents: #[U32] = #[none]
   let via_action: #[U32] = #[none]
   let closed: #[Bool] = #[false]
   let goal_node = none
-  let stop = false
-  for 0 .. max_nodes:
-    if not stop:
+  if max_nodes <= 64:
+    for 0 .. max_nodes:
       let u = none
       let best_f = 0.0
       for i in 0 .. states.length:
@@ -76,54 +79,166 @@ func plan (initial: U32) -> (goal: Condition) -> (actions: #[Action]) -> (max_no
             best_f := f_costs[i]
             u := i
       if u == none:
-        stop := true
-      else:
-        let st = states[u]
-        if satisfies st goal.mask goal.value:
-          goal_node := u
-          stop := true
-        else:
-          closed[u] := true
-          for ai in 0 .. actions.length:
-            let act = actions[ai]
-            if satisfies st act.pre_mask act.pre_value:
-              let nxt = apply st act.eff_mask act.eff_value
-              let ng = g_costs[u] + act.cost
-              if is_finite ng:
-                let nh = U32.to_f32 (unsatisfied_bits nxt goal) * min_action_cost
-                let nf = if is_finite nh and is_finite (ng + nh) then ng + nh else ng
-                // Find existing node for `nxt` if any.
-                let existing = none
-                for k in 0 .. states.length:
-                  if existing == none and states[k] == nxt:
-                    existing := k
-                if existing != none:
-                  if not closed[existing] and ng < g_costs[existing]:
-                    g_costs[existing] := ng
-                    f_costs[existing] := nf
-                    parents[existing] := u
-                    via_action[existing] := act.id
-                else:
-                  if states.length < max_nodes:
-                    @storage.push states nxt
-                    @storage.push g_costs ng
-                    @storage.push f_costs nf
-                    @storage.push parents u
-                    @storage.push via_action act.id
-                    @storage.push closed false
+        break
+      let st = states[u]
+      if satisfies st goal.mask goal.value:
+        goal_node := u
+        break
+      closed[u] := true
+      let gu = g_costs[u]
+      for ai in 0 .. actions.length:
+        let act = actions[ai]
+        if satisfies st act.pre_mask act.pre_value:
+          let nxt = apply st act.eff_mask act.eff_value
+          let ng = gu + act.cost
+          if is_finite ng:
+            let nh = U32.to_f32 (unsatisfied_bits nxt goal) * min_action_cost
+            let nf = if is_finite nh and is_finite (ng + nh) then ng + nh else ng
+            let existing = none
+            for k in 0 .. states.length:
+              if states[k] == nxt:
+                existing := k
+                break
+            if existing != none:
+              if not closed[existing] and ng < g_costs[existing]:
+                g_costs[existing] := ng
+                f_costs[existing] := nf
+                parents[existing] := u
+                via_action[existing] := act.id
+            else:
+              if states.length < max_nodes:
+                @storage.push states nxt
+                @storage.push g_costs ng
+                @storage.push f_costs nf
+                @storage.push parents u
+                @storage.push via_action act.id
+                @storage.push closed false
+  else:
+    // Open-addressing hash table mapping `state -> node_id` (none = empty).
+    let table_cap: U32 = 16
+    let target_cap = if max_nodes >= 1073741824 then 2147483648 else max_nodes * 2
+    for 0 .. 31:
+      if table_cap >= target_cap:
+        break
+      table_cap := self * 2
+    let table_mask = table_cap - 1
+    let table = @array.fill table_cap none
+    table[hash_u32 initial & table_mask] := 0
+    // Lazy binary min-heap of `(f, node_id)` with lowest-node-id tie-breaking.
+    let heap_f: #[F32] = #[init_f]
+    let heap_id: #[U32] = #[0]
+    for 0 .. max_nodes:
+      let u = none
+      for 0 .. 4294967295:
+        let h_len = heap_id.length
+        if h_len == 0:
+          break
+        let top_id = heap_id[0]
+        let top_f = heap_f[0]
+        let last = h_len - 1
+        let mf = heap_f[last]
+        let mi = heap_id[last]
+        @storage.truncate heap_f last
+        @storage.truncate heap_id last
+        if last > 0:
+          let k = 0
+          for 0 .. 32:
+            let left = k * 2 + 1
+            if left >= last:
+              break
+            let child = left
+            let cf = heap_f[left]
+            let ci = heap_id[left]
+            let right = left + 1
+            if right < last:
+              let rf = heap_f[right]
+              let ri = heap_id[right]
+              if rf < cf or (rf == cf and ri < ci):
+                child := right
+                cf := rf
+                ci := ri
+            if not (cf < mf or (cf == mf and ci < mi)):
+              break
+            heap_f[k] := cf
+            heap_id[k] := ci
+            k := child
+          heap_f[k] := mf
+          heap_id[k] := mi
+        if not closed[top_id] and is_finite f_costs[top_id] and top_f == f_costs[top_id]:
+          u := top_id
+          break
+      if u == none:
+        break
+      let st = states[u]
+      if satisfies st goal.mask goal.value:
+        goal_node := u
+        break
+      closed[u] := true
+      let gu = g_costs[u]
+      for ai in 0 .. actions.length:
+        let act = actions[ai]
+        if satisfies st act.pre_mask act.pre_value:
+          let nxt = apply st act.eff_mask act.eff_value
+          let ng = gu + act.cost
+          if is_finite ng:
+            let nh = U32.to_f32 (unsatisfied_bits nxt goal) * min_action_cost
+            let nf = if is_finite nh and is_finite (ng + nh) then ng + nh else ng
+            let slot = hash_u32 nxt & table_mask
+            let existing = none
+            for 0 .. table_cap:
+              let cand = table[slot]
+              if cand == none:
+                break
+              if states[cand] == nxt:
+                existing := cand
+                break
+              slot := (self + 1) & table_mask
+            let push_id = none
+            if existing != none:
+              if not closed[existing] and ng < g_costs[existing]:
+                g_costs[existing] := ng
+                f_costs[existing] := nf
+                parents[existing] := u
+                via_action[existing] := act.id
+                push_id := existing
+            else:
+              if states.length < max_nodes:
+                let nid = states.length
+                table[slot] := nid
+                @storage.push states nxt
+                @storage.push g_costs ng
+                @storage.push f_costs nf
+                @storage.push parents u
+                @storage.push via_action act.id
+                @storage.push closed false
+                push_id := nid
+            if push_id != none and is_finite nf:
+              let pk = heap_id.length
+              @storage.push heap_f nf
+              @storage.push heap_id push_id
+              for 0 .. 32:
+                if pk == 0:
+                  break
+                let par = (pk - 1) / 2
+                let pf = heap_f[par]
+                let pi = heap_id[par]
+                if not (nf < pf or (nf == pf and push_id < pi)):
+                  break
+                heap_f[pk] := pf
+                heap_id[pk] := pi
+                pk := par
+              heap_f[pk] := nf
+              heap_id[pk] := push_id
   if goal_node == none:
     return $Some ($Plan { found: false, cost: 0.0, actions: #[] })
   let rev: #[U32] = #[]
   let cur = goal_node
-  let done = false
   for 0 .. max_nodes:
-    if not done:
-      let p = parents[cur]
-      if p == none:
-        done := true
-      else:
-        @storage.push rev via_action[cur]
-        cur := p
+    let p = parents[cur]
+    if p == none:
+      break
+    @storage.push rev via_action[cur]
+    cur := p
   let len = rev.length
   let out = @array.generate len (func (i: U32) => rev[len - 1 - i])
   return $Some ($Plan { found: true, cost: g_costs[goal_node], actions: out })
