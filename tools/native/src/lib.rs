@@ -323,6 +323,8 @@ mod generation_tests;
 
 pub mod benchmark;
 pub mod cli;
+pub mod doom_assets;
+pub mod minecraft_assets;
 pub mod package;
 pub mod site;
 

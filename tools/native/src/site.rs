@@ -41,6 +41,8 @@ const OPTIONAL_PEN_NOTICE_FILES: &[&str] = &["LICENSE", "THIRD_PARTY_NOTICES.md"
 enum DemoAssets {
     Empty,
     ProceduralPbr3d,
+    MiniMinecraft,
+    MiniDoom,
 }
 
 struct PenDemoSpec {
@@ -49,7 +51,9 @@ struct PenDemoSpec {
     summary: &'static str,
     controls: &'static str,
     file: &'static str,
+    companions: &'static [&'static str],
     assets: DemoAssets,
+    fps_mode: Option<&'static str>,
 }
 
 struct WasmExampleSpec {
@@ -65,19 +69,23 @@ struct WasmExampleSpec {
 const PEN_DEMOS: &[PenDemoSpec] = &[
     PenDemoSpec {
         slug: "mini_doom",
-        title: "Mini Doom — Corridor Blaster",
-        summary: "Playable 3D retro corridor shooter with plasma bolts, dynamic lights, cyber-demons, and minimap.",
-        controls: "WASD / Arrows or on-screen controls to move & turn, drag viewport to look, Space or click to fire.",
+        title: "Mini Doom — Freedoom E1M1",
+        summary: "Playable Freedoom E1M1 with BSP doors and lifts, four weapons, four enemy types, exploding barrels, Tab automap, and WAD sound effects.",
+        controls: "Click viewport for mouse look (Esc pauses/releases), WASD walk, Shift run, E/Space use doors & switches, Click/Ctrl fire, 1–4 weapons, Tab map, H help.",
         file: "examples/mini_doom.blot",
-        assets: DemoAssets::ProceduralPbr3d,
+        companions: &["examples/mini_doom_e1m1.blot"],
+        assets: DemoAssets::MiniDoom,
+        fps_mode: Some("doom"),
     },
     PenDemoSpec {
         slug: "mini_minecraft",
-        title: "Mini Minecraft — Voxel Island",
-        summary: "Interactive 3D voxel island with raycast mining & building, trees, glowing lanterns, and day/night.",
-        controls: "Click or tap blocks to mine/build; pick blocks & Day/Night on the left; drag or Q/E to orbit.",
+        title: "Mini Minecraft — Voxel Sandbox",
+        summary: "80×40×80 deterministic voxel world with caves, trees, lake, day/night cycle, glowing lamps, 8-slot hotbar, crafting, and F5/F9 snapshots.",
+        controls: "Click viewport for mouse look (Esc/C releases), WASD walk, Space jump/swim, Shift run, Ctrl ledge-sneak, Left mine, Right/E place, 1–8/wheel slot, C craft, F5/F9 save/load, H help.",
         file: "examples/mini_minecraft.blot",
-        assets: DemoAssets::ProceduralPbr3d,
+        companions: &[],
+        assets: DemoAssets::MiniMinecraft,
+        fps_mode: Some("minecraft"),
     },
     PenDemoSpec {
         slug: "gi_lighting",
@@ -85,7 +93,9 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "Live 3D sanctuary switching between Sunlit DDGI, Cornell bounce, 48-Light Night, Volumetric Dusk, and Neon LTC.",
         controls: "Switch lighting scenarios (1–5), toggle DDGI / RT tiers, adjust Sun Angle & Fog, or drag to orbit.",
         file: "examples/gi_lighting.blot",
+        companions: &[],
         assets: DemoAssets::ProceduralPbr3d,
+        fps_mode: None,
     },
     PenDemoSpec {
         slug: "sketch_ui",
@@ -93,7 +103,9 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "Hand-drawn immediate-mode widgets, 5 fps line boil, themes, and a doodle pad.",
         controls: "Click or press Tab / Shift+Tab, Arrows, and Enter to use widgets; draw inside the chalkboard pad.",
         file: "examples/sketch_ui.blot",
+        companions: &[],
         assets: DemoAssets::Empty,
+        fps_mode: None,
     },
     PenDemoSpec {
         slug: "d2_lighting",
@@ -101,7 +113,9 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "2D rigid body casting real-time global illumination shadows around a wall.",
         controls: "Click anywhere in the room to launch the glowing orb across the wall.",
         file: "examples/d2_lighting.blot",
+        companions: &[],
         assets: DemoAssets::Empty,
+        fps_mode: None,
     },
     PenDemoSpec {
         slug: "physics_sandbox",
@@ -109,7 +123,9 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "Wireframe rigid-body crate tower hit by a swinging distance-joint pendulum.",
         controls: "Press KICK! or RESET, toggle AUTO ORBIT, and adjust GRAVITY or CAM YAW.",
         file: "examples/physics_sandbox.blot",
+        companions: &[],
         assets: DemoAssets::Empty,
+        fps_mode: None,
     },
     PenDemoSpec {
         slug: "nav_playground",
@@ -117,7 +133,9 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "Convex polygon navmesh, A* corridor, funnel path, and six ORCA crowd agents.",
         controls: "Click anywhere in the arena to move the goal; tweak CLEARANCE or click SWAP.",
         file: "examples/nav_playground.blot",
+        companions: &[],
         assets: DemoAssets::Empty,
+        fps_mode: None,
     },
     PenDemoSpec {
         slug: "ik_rig",
@@ -125,7 +143,9 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         summary: "Two-bone analytic IK and a 6-bone FABRIK chain tracking a spring target.",
         controls: "Move the pointer across the stage, click for trauma shake, or adjust sliders.",
         file: "examples/ik_rig.blot",
+        companions: &[],
         assets: DemoAssets::Empty,
+        fps_mode: None,
     },
 ];
 
@@ -668,9 +688,13 @@ fn render_pen_demo_html(
     let actions = format!(
         r#"<button class="tool-btn" id="fullscreen-btn" type="button" data-state="enter" aria-label="Enter fullscreen">{ICON_EXPAND}{ICON_COLLAPSE}<span class="tool-label">Fullscreen</span></button>"#
     );
+    let fps_attr = spec
+        .fps_mode
+        .map(|mode| format!(" data-fps=\"{mode}\""))
+        .unwrap_or_default();
     let main = format!(
         r#"      <div class="stage" id="stage">
-        <canvas id="game" tabindex="0" aria-label="{title}"></canvas>
+        <canvas id="game" tabindex="0"{fps_attr} aria-label="{title}"></canvas>
         <p class="stage-loading" id="loading" role="status">Loading WebGPU runtime…</p>
         <p class="stage-error" id="status" role="alert"></p>
       </div>
@@ -1006,6 +1030,13 @@ fn build_pen_demo(
     let assets_dir = proj.join("src/assets");
     std::fs::create_dir_all(&assets_dir)?;
     copy_file_checked(&root.join(spec.file), &proj.join("src/main.blot"))?;
+    for companion in spec.companions {
+        let src = root.join(companion);
+        let name = src
+            .file_name()
+            .with_context(|| format!("invalid companion path {companion}"))?;
+        copy_file_checked(&src, &proj.join("src").join(name))?;
+    }
     match spec.assets {
         DemoAssets::Empty => {
             std::fs::write(
@@ -1015,6 +1046,12 @@ fn build_pen_demo(
         }
         DemoAssets::ProceduralPbr3d => {
             write_procedural_pbr_assets(root, &assets_dir)?;
+        }
+        DemoAssets::MiniMinecraft => {
+            crate::minecraft_assets::write_mini_minecraft_assets(&assets_dir)?;
+        }
+        DemoAssets::MiniDoom => {
+            crate::doom_assets::write_mini_doom_assets(root, &assets_dir)?;
         }
     }
     let pen_json = serde_json::json!({
@@ -1305,6 +1342,9 @@ mod tests {
         for demo in PEN_DEMOS {
             assert!(slugs.insert(demo.slug), "duplicate slug {}", demo.slug);
             assert!(root.join(demo.file).is_file(), "missing {}", demo.file);
+            for companion in demo.companions {
+                assert!(root.join(companion).is_file(), "missing {}", companion);
+            }
         }
         for ex in WASM_EXAMPLES {
             assert!(slugs.insert(ex.slug), "duplicate slug {}", ex.slug);

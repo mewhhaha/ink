@@ -251,9 +251,42 @@ if (fullscreenBtn) {
   }
 }
 
-canvasEl.addEventListener('pointerdown', () => {
+const fpsMode = canvasEl.dataset.fps || '';
+let craftingOpen = false;
+
+canvasEl.addEventListener('pointerdown', (ev) => {
   canvasEl.focus({ preventScroll: true });
+  if (
+    fpsMode &&
+    !craftingOpen &&
+    ev.pointerType === 'mouse' &&
+    ev.button === 0 &&
+    document.pointerLockElement !== canvasEl &&
+    typeof canvasEl.requestPointerLock === 'function'
+  ) {
+    try {
+      const maybePromise = canvasEl.requestPointerLock();
+      if (maybePromise && typeof maybePromise.catch === 'function') {
+        maybePromise.catch(() => {});
+      }
+    } catch {
+      // Fall back to drag / arrow turning when pointer lock is unavailable.
+    }
+  }
 });
+
+if (fpsMode === 'minecraft') {
+  window.addEventListener('keydown', (ev) => {
+    if (ev.code === 'KeyC' && !ev.repeat) {
+      craftingOpen = !craftingOpen;
+      if (craftingOpen && document.pointerLockElement === canvasEl) {
+        document.exitPointerLock?.();
+      }
+    } else if (ev.code === 'Escape') {
+      craftingOpen = false;
+    }
+  });
+}
 
 async function bootDemo() {
   statusEl.textContent = '';
