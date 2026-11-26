@@ -24,7 +24,7 @@ function recordDiagnostic(text) {
   if (!clean || clean.includes('Failed to load resource: the server responded with a status of 404')) {
     return;
   }
-  const clipped = clean.length > 360 ? `${clean.slice(0, 357)}…` : clean;
+  const clipped = clean.length > 600 ? `${clean.slice(0, 597)}…` : clean;
   if (diagLines.length < 6 && !diagLines.includes(clipped)) {
     diagLines.push(clipped);
     if (fatalReason !== null) {
@@ -41,6 +41,54 @@ console.error = (...args) => {
     .join(' ');
   recordDiagnostic(text);
 };
+
+// Capture WebGPU GPUInternalError messages before wgpu-30.0.1 panics in Error::from_js.
+let lastPipeline = '';
+if (typeof GPUDevice !== 'undefined') {
+  for (const method of ['createRenderPipeline', 'createComputePipeline']) {
+    const orig = GPUDevice.prototype[method];
+    if (typeof orig === 'function') {
+      GPUDevice.prototype[method] = function (desc, ...rest) {
+        if (desc?.label) lastPipeline = `${method}(${desc.label})`;
+        return orig.call(this, desc, ...rest);
+      };
+    }
+  }
+  const origPop = GPUDevice.prototype.popErrorScope;
+  if (typeof origPop === 'function') {
+    GPUDevice.prototype.popErrorScope = function () {
+      return origPop.call(this).then((err) => {
+        if (err) {
+          const kind = err.constructor?.name || 'GPUError';
+          const ctx = lastPipeline ? ` [last=${lastPipeline}]` : '';
+          recordDiagnostic(`${kind} (scope)${ctx}: ${err.message || err}`);
+        }
+        return err;
+      });
+    };
+  }
+}
+if (typeof GPUAdapter !== 'undefined' && typeof GPUAdapter.prototype.requestDevice === 'function') {
+  const origRequestDevice = GPUAdapter.prototype.requestDevice;
+  GPUAdapter.prototype.requestDevice = function (...args) {
+    return origRequestDevice.apply(this, args).then((device) => {
+      if (device && typeof device.addEventListener === 'function') {
+        device.addEventListener('uncapturederror', (ev) => {
+          const err = ev?.error;
+          const kind = err?.constructor?.name || 'GPUError';
+          const ctx = lastPipeline ? ` [last=${lastPipeline}]` : '';
+          recordDiagnostic(`${kind} (uncaptured)${ctx}: ${err?.message || err}`);
+        });
+      }
+      if (device?.lost && typeof device.lost.then === 'function') {
+        device.lost.then((info) => {
+          recordDiagnostic(`GPUDevice lost (${info?.reason || 'unknown'}): ${info?.message || ''}`);
+        });
+      }
+      return device;
+    });
+  };
+}
 
 function clearStartupTimer() {
   if (startupTimer !== null) {
