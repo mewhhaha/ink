@@ -1202,8 +1202,12 @@ private func proxy_extents (stored: #[ProxyRow]) : #[F32] =>
     extents[o + 5] := row.high.z
   return extents
 
-private func build_sphere_rows_direct (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32]) =>
-  for i in 0 .. sources.length:
+private func build_sphere_rows_direct (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32], #[F32]) =>
+  let n = sources.length
+  @storage.reserve rows n
+  @storage.reserve slots n
+  let extents: #[F32] = @storage.with_capacity (n * 6)
+  for i in 0 .. n:
     let src = sources[i]
     let slot = 0xFFFFFFFF
     if let $Some collider = src.collider:
@@ -1221,16 +1225,31 @@ private func build_sphere_rows_direct (rows: own #[ProxyRow]) -> (slots: own #[U
         if material_ok and bounds_ok and is_finite inertia:
           slot := rows.length
           @storage.push rows (sphere_row i src.id kind_static false collider cx cy cz radius inertia)
+          @storage.push extents (cx - radius)
+          @storage.push extents (cy - radius)
+          @storage.push extents (cz - radius)
+          @storage.push extents (cx + radius)
+          @storage.push extents (cy + radius)
+          @storage.push extents (cz + radius)
       else:
         if let $Some row = sphere_proxy_row i src collider:
           slot := rows.length
           @storage.push rows row
+          @storage.push extents row.low.x
+          @storage.push extents row.low.y
+          @storage.push extents row.low.z
+          @storage.push extents row.high.x
+          @storage.push extents row.high.y
+          @storage.push extents row.high.z
     @storage.push slots slot
   slots := finish_slots self rows.length
-  return (rows, slots)
+  return (rows, slots, extents)
 
 private func build_primitive_rows_direct (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32], #[shapes.Point3], #[shapes.Plane4]) =>
-  for i in 0 .. sources.length:
+  let n = sources.length
+  @storage.reserve rows n
+  @storage.reserve slots n
+  for i in 0 .. n:
     let src = sources[i]
     let row = $Nothing
     if let $Some col = src.collider:
@@ -1266,12 +1285,14 @@ private func build_rows_direct (geometry: own shapes.Geometry) -> (rows: own #[P
         primitives := false
         break
   if all_spheres:
-    let (rows, slots) = build_sphere_rows_direct rows slots sources
+    let (rows, slots, _) = build_sphere_rows_direct rows slots sources
     return (rows, slots, geometry)
   if primitives:
     let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
     let (rows, slots, points, planes) = build_primitive_rows_direct points planes rows slots sources
     return (rows, slots, $shapes.Geometry { points, planes, rings, indices, heights, source_planes })
+  @storage.reserve rows n
+  @storage.reserve slots n
   for i in 0 .. n:
     let (maybe_row, next_geom) = proxy_of geometry i sources[i]
     geometry := next_geom
@@ -1288,17 +1309,56 @@ func build_rows_into (geometry: own shapes.Geometry) -> (rows: own #[ProxyRow]) 
 
 func build_into (destination: own Scene) -> (sources: #[Source]) : Scene =>
   let $Scene { geometry, proxies, index, slots, source_count: _ } = destination
-  let (stored, slots, geometry) = build_rows_direct geometry proxies slots sources
-  let extents = proxy_extents stored
+  let n = sources.length
+  @storage.truncate proxies 0
+  @storage.truncate slots 0
+  let all_spheres = true
+  let primitives = true
+  let box_count: U32 = 0
+  for i in 0 .. n:
+    let kind = source_class sources[i]
+    if kind != 0:
+      all_spheres := false
+      if kind == 2:
+        primitives := false
+        break
+      if let $Some col = sources[i].collider:
+        if let $Box = col.shape:
+          box_count := self + 1
+  if all_spheres:
+    let (stored, slots, extents) = build_sphere_rows_direct proxies slots sources
+    let index = spatial.build_flat index extents
+    return $Scene { geometry, proxies: stored, index, slots, source_count: n }
+  if primitives:
+    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    if box_count > 0:
+      @storage.reserve points (box_count * 17)
+      @storage.reserve planes (box_count * 6)
+    let (stored, slots, points, planes) = build_primitive_rows_direct points planes proxies slots sources
+    let extents = proxy_extents stored
+    let index = spatial.build_flat index extents
+    return $Scene { geometry: $shapes.Geometry { points, planes, rings, indices, heights, source_planes }, proxies: stored, index, slots, source_count: n }
+  @storage.reserve proxies n
+  @storage.reserve slots n
+  for i in 0 .. n:
+    let (maybe_row, next_geom) = proxy_of geometry i sources[i]
+    geometry := next_geom
+    let slot = 0xFFFFFFFF
+    if let $Some row = maybe_row:
+      slot := proxies.length
+      @storage.push proxies row
+    @storage.push slots slot
+  slots := finish_slots self proxies.length
+  let extents = proxy_extents proxies
   let index = spatial.build_flat index extents
-  return $Scene { geometry, proxies: stored, index, slots, source_count: sources.length }
+  return $Scene { geometry, proxies, index, slots, source_count: n }
 
 // The complete consumer ends before any temporary geometry/tree owner closes.
 func with_built (sources: #[Source]) -> consume => return
   consume (own (build_into (empty ()) sources))
 
 func copied_rows (geometry: own shapes.Geometry) -> (source: Scene) : (#[ProxyRow], shapes.Geometry) =>
-  let rows: #[ProxyRow] = #[]
+  let rows: #[ProxyRow] = @storage.with_capacity (count source)
   for i in 0 .. count source:
     let value = proxy source i
     let (packed, next_geom) = pack_proxy geometry value
@@ -1427,6 +1487,7 @@ func unpack_source geometry -> (value: SourceRow) => $Source {
 // outside their packing loop so its temporary records can be reclaimed.
 func pack_sources_into (geometry: own shapes.Geometry) -> (rows: own #[SourceRow]) -> (values: #[Source]) : (#[SourceRow], shapes.Geometry) =>
   @storage.truncate rows 0
+  @storage.reserve rows values.length
   let ordinary = true
   for value in values:
     if value.planes.length != 0 or (Maybe.is_some value.collider and source_class value == 2):
@@ -1502,6 +1563,8 @@ private func unpack_primitive_source (value: SourceRow) : Source =>
   }
 
 private func build_sphere_source_rows (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: &[SourceRow]) : (#[ProxyRow], #[U32]) =>
+  @storage.reserve rows sources.length
+  @storage.reserve slots sources.length
   for i in 0 .. sources.length:
     let src = sources[i]
     let slot = 0xFFFFFFFF
@@ -1514,6 +1577,8 @@ private func build_sphere_source_rows (rows: own #[ProxyRow]) -> (slots: own #[U
   return (rows, slots)
 
 private func build_primitive_source_rows (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: &[SourceRow]) : (#[ProxyRow], #[U32], #[shapes.Point3], #[shapes.Plane4]) =>
+  @storage.reserve rows sources.length
+  @storage.reserve slots sources.length
   for i in 0 .. sources.length:
     let src = sources[i]
     let row = $Nothing
@@ -1542,6 +1607,7 @@ private func build_rows_from_stored (geometry: own shapes.Geometry) -> (rows: ow
   let n = sources.length
   let all_spheres = true
   let primitives = true
+  let box_count: U32 = 0
   for i in 0 .. n:
     let kind = stored_source_class sources[i]
     if kind != 0:
@@ -1549,13 +1615,21 @@ private func build_rows_from_stored (geometry: own shapes.Geometry) -> (rows: ow
       if kind == 2:
         primitives := false
         break
+      if let $Some col = sources[i].collider:
+        if let $StoredBox = col.shape:
+          box_count := self + 1
   if all_spheres:
     let (rows, slots) = build_sphere_source_rows rows slots sources
     return (rows, slots, geometry)
   if primitives:
     let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    if box_count > 0:
+      @storage.reserve points (box_count * 17)
+      @storage.reserve planes (box_count * 6)
     let (rows, slots, points, planes) = build_primitive_source_rows points planes rows slots sources
     return (rows, slots, $shapes.Geometry { points, planes, rings, indices, heights, source_planes })
+  @storage.reserve rows n
+  @storage.reserve slots n
   for i in 0 .. n:
     let (maybe_row, next_geom) = proxy_of geometry i (unpack_source src_geom sources[i])
     geometry := next_geom

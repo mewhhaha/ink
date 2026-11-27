@@ -44,6 +44,7 @@ func submit_many tick -> earliest -> (requests: #[request]) -> (locals: #[local]
   if meta[3] == 0 or meta[1] == 0 or queue.length >= meta[2] or count > meta[2] - queue.length or tick < meta[4] or earliest < tick or count - 1 > 0xFFFFFFFF - meta[1]:
     return ($Nothing, queue, meta, history)
   let tickets: #[Ticket] = array.generate count (func i => $Ticket {epoch: meta[0], sequence: meta[1] + i})
+  @storage.reserve queue count
   for i in 0 .. count:
     let job: Job [request, value, local] = $Job {ticket: tickets[i], submitted: tick, earliest, request: requests[i], continuation: locals[i], state: $Pending}
     @storage.push queue job
@@ -106,10 +107,11 @@ func publish tick -> (queue: own Queue [request, value, local]) -> (own meta) ->
     if tick < ready or tick < job.earliest:
       break
     count := self + 1
-  let delivered: #[Delivery [value, local]] = #[]
   if count == 0:
+    let delivered: #[Delivery [value, local]] = #[]
     meta[4] := tick
     return (delivered, queue, meta, history)
+  let delivered: #[Delivery [value, local]] = @storage.with_capacity count
   for i in 0 .. count:
     let $Ready {outcome} = queue[i].state else:
       return panic "ready prefix invariant"
@@ -165,11 +167,11 @@ func pending (queue: Queue [request, value, local]) : #[Job [request, value, loc
 // Exact U32 framing. Callers validate the request/result/continuation domain
 // in their decoders. Trace history is transient; accepted results are saved.
 func append_words (words: #[U32]) -> (destination: own #[U32]) : #[U32] =>
-  for word in words:
-    @storage.push destination word
+  @storage.extend destination words
   return destination
 func encode encode_request -> encode_value -> encode_local -> (q: Queue [request, value, local]) -> (meta: Metadata) =>
   let out: #[U32] = #[]
+  @storage.reserve out (7 + q.length * 11)
   @storage.push out 1
   @storage.push out meta[0]
   @storage.push out meta[1]
@@ -292,6 +294,7 @@ func decode (maximum: U32) -> (trace: Bool) -> (decode_request: #[U32] -> Maybe 
     return (false, queue, meta, history)
   @storage.truncate queue 0
   @storage.truncate history 0
+  @storage.reserve queue out.length
   for item in out:
     let $Some job = item else:
       return panic "decoder count invariant"

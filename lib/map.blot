@@ -111,15 +111,18 @@ private func grow_index (capacity: U32) -> (table: own Map [k, v]) : Map [k, v] 
 // A fresh bulk builder can allocate its bucket index once. Bound speculative
 // reservation for duplicate-heavy inputs; later growth follows the usual rule.
 func reserve_batch (count: U32) -> (table: own Map [k, v]) : Map [k, v] =>
-  if table.rows.length > 0 or count <= (table.buckets.length - header_slots) / 2:
-    return table
+  let $Map { rows, buckets } = table
   let wanted = min count 65536
-  let capacity = table.buckets.length - header_slots
+  if rows.length == 0 and wanted > 0:
+    @storage.reserve rows wanted
+  if rows.length > 0 or count <= (buckets.length - header_slots) / 2:
+    return $Map { rows, buckets }
+  let capacity = buckets.length - header_slots
   for 0 .. 32:
     if capacity / 2 >= wanted:
       break
     capacity := self * 2
-  return grow_index capacity table
+  return grow_index capacity ($Map { rows, buckets })
 
 func probe_set_raw policy -> key -> (hashed: U32) -> (table: Map [k, v]) : (U32, U32, U32) =>
   let buckets = table.buckets
@@ -235,20 +238,20 @@ func remove_many policy -> keys -> (table: own Map [k, v]) : Map [k, v] =>
 func from policy -> (entries: #[(k, v)]) -> (table: own Map [k, v]) : Map [k, v] => set_many policy entries table
 func entries table =>
   let rows: #[Entry [k, v]] = table.rows
-  let out: #[(k, v)] = #[]
+  let out: #[(k, v)] = @storage.with_capacity (count table)
   for row in rows:
     if let $Some item = row.item:
       @storage.push out item
   return out
 func keys (table: Map [k, v]) =>
-  let out: #[k] = #[]
+  let out: #[k] = @storage.with_capacity (count table)
   for row in table.rows:
     if let $Some (key, _) = row.item:
       @storage.push out key
   return out
 func values table =>
   let rows: #[Entry [k, v]] = table.rows
-  let out: #[v] = #[]
+  let out: #[v] = @storage.with_capacity (count table)
   for row in rows:
     if let $Some (_, value) = row.item:
       @storage.push out value
@@ -296,6 +299,7 @@ func copy_into policy -> copy_key -> copy_value -> (destination: own Map [k, v])
     let slots = index_rows (copy_capacity n) fresh
     return $Map {rows: fresh, buckets: slots}
   @storage.truncate rows 0
+  @storage.reserve rows source.buckets[0]
   for row in src_rows:
     if let $Some (key, value) = row.item:
       let ck = copy_key key
