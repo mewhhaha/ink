@@ -1774,7 +1774,7 @@ struct Out {
   let c = corners[v];
   let mode = s.parameters.x;
   var px: vec2f;
-  if (mode == 2.0) {
+  if (mode >= 1.5) {
     let a = s.rect.xy;
     let b = s.rect.zw;
     let d = b - a;
@@ -1794,16 +1794,12 @@ fn srgb_encode(light: vec3f) -> vec3f {
 }
 
 @fragment fn fragment(in: Out) -> @location(0) vec4f {
-  if (in.mode == 0.0 || in.mode == 2.0) {
+  if (in.mode < 0.5 || in.mode >= 1.5) {
     return in.color;
   }
   let texel = in.rect.xy + clamp(floor(in.uv * in.rect.zw), vec2f(0.0), in.rect.zw - vec2f(1.0));
   let sample_color = textureLoad(atlas, vec2i(texel), 0);
-  var rgb = srgb_encode(sample_color.rgb);
-  if (in.mode == 3.0) {
-    rgb = vec3f(min(1.0, max(rgb.r, max(rgb.g, rgb.b)) * 1.3));
-  }
-  return vec4f(rgb * in.color.rgb, sample_color.a * in.color.a);
+  return vec4f(srgb_encode(sample_color.rgb) * in.color.rgb, sample_color.a * in.color.a);
 }
 "#;
 

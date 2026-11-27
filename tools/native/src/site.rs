@@ -71,7 +71,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         slug: "mini_doom",
         title: "Mini Doom — Freedoom E1M1",
         summary: "Playable Freedoom E1M1 with BSP doors and lifts, four weapons, four enemy types, exploding barrels, Tab automap, and WAD sound effects.",
-        controls: "Click for mouse look. WASD move, Shift run, E/Space use, Click/Ctrl fire, 1–4 select weapon, Tab map, Esc pause, H help.",
+        controls: "Click viewport for mouse look (Esc pauses/releases), WASD walk, Shift run, E/Space use doors & switches, Click/Ctrl fire, 1–4 weapons, Tab map, H help.",
         file: "examples/mini_doom.blot",
         companions: &["examples/mini_doom_e1m1.blot"],
         assets: DemoAssets::MiniDoom,
@@ -81,7 +81,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         slug: "mini_minecraft",
         title: "Mini Minecraft — Voxel Sandbox",
         summary: "80×40×80 deterministic voxel world with caves, trees, lake, day/night cycle, glowing lamps, 8-slot hotbar, crafting, and F5/F9 snapshots.",
-        controls: "Click for mouse look. WASD move, Space jump/swim, Shift run, Ctrl sneak, Left/F mine, Right/E place, 1–8/wheel select, C craft, F5/F9 save/load, H help.",
+        controls: "Click viewport for mouse look (Esc/C releases), WASD walk, Space jump/swim, Shift run, Ctrl ledge-sneak, Left mine, Right/E place, 1–8/wheel slot, C craft, F5/F9 save/load, H help.",
         file: "examples/mini_minecraft.blot",
         companions: &[],
         assets: DemoAssets::MiniMinecraft,
@@ -692,19 +692,6 @@ fn render_pen_demo_html(
         .fps_mode
         .map(|mode| format!(" data-fps=\"{mode}\""))
         .unwrap_or_default();
-    let controls = match spec.fps_mode {
-        Some(mode) => {
-            let touch_note = if mode == "minecraft" {
-                "Drag the scene to look. Hold Mine to gather blocks, then tap Craft for recipes."
-            } else {
-                "Drag the scene to turn. Use the arrows to move, Fire to shoot, and Use on doors and switches."
-            };
-            format!(
-                r#"<span class="desktop-note">{controls}</span><span class="touch-note">{touch_note}</span>"#
-            )
-        }
-        None => controls,
-    };
     let main = format!(
         r#"      <div class="stage" id="stage">
         <canvas id="game" tabindex="0"{fps_attr} aria-label="{title}"></canvas>

@@ -664,67 +664,9 @@ fn srgb_encode(light: vec3f) -> vec3f {
   return select(1.055 * pow(l, vec3f(1.0 / 2.4)) - 0.055, l * 12.92, l <= vec3f(0.0031308));
 }
 
-fn on_face(uv: vec2f) -> bool {
-  return all(uv >= vec2f(0.0)) && all(uv <= vec2f(1.0));
-}
-
-// Three projected faces of the carried block, sampled from the world's atlas.
-fn held_block(p: vec2f, tile: i32) -> vec4f {
-  let x = (p.x - 0.5) / 0.41;
-  let y = (p.y - 0.07) / 0.19;
-  var uv = vec2f((y + x) * 0.5, (y - x) * 0.5);
-  var shade = 1.03;
-  if (!on_face(uv)) {
-    if (p.x < 0.5) {
-      let u = (p.x - 0.09) / 0.41;
-      uv = vec2f(u, (p.y - 0.26 - u * 0.19) / 0.4);
-      shade = 0.79;
-    } else {
-      let u = (p.x - 0.5) / 0.41;
-      uv = vec2f(u, (p.y - 0.45 + u * 0.19) / 0.4);
-      shade = 0.58;
-    }
-  }
-  if (!on_face(uv)) {
-    return vec4f(0.0);
-  }
-  let texel = clamp(vec2i(uv * 16.0), vec2i(0), vec2i(15)) + vec2i(tile * 16, 0);
-  return vec4f(srgb_encode(textureLoad(atlas, texel, 0).rgb) * shade, 1.0);
-}
-
-fn held_tool(p: vec2f, tool: f32) -> vec4f {
-  let pixel = floor(p * 40.0) / 40.0;
-  let cross = pixel.x - pixel.y * 0.64;
-  if (tool > 0.0) {
-    // A straight wrapped grip and a short angled head.
-    let handle = pixel.y > 0.22 && abs(cross - 0.23) < 0.04;
-    let head = pixel.x > 0.19 && pixel.x < 0.58 && abs(pixel.y + pixel.x * 0.55 - 0.43) < 0.075;
-    if (head) {
-      return vec4f(select(vec3f(0.62, 0.43, 0.23), vec3f(0.58, 0.65, 0.66), tool > 1.0), 1.0);
-    }
-    if (handle) {
-      return vec4f(0.43, 0.28, 0.15, 1.0);
-    }
-  }
-  if (pixel.y > 0.49 && cross > 0.15 && cross < 0.48) {
-    let cuff = pixel.y - pixel.x * 0.2;
-    let sleeve = vec3f(0.20, 0.40, 0.34);
-    let glove = vec3f(0.59, 0.40, 0.23);
-    let fill = select(glove, sleeve, cuff > 0.60);
-    return vec4f(fill * select(1.0, 0.71, cross > 0.38), 1.0);
-  }
-  return vec4f(0.0);
-}
-
 @fragment fn fragment(in: Out) -> @location(0) vec4f {
   if (in.params.x < 0.5) {
     return in.color;
-  }
-  if (in.params.x >= 2.5) {
-    return held_tool(in.uv, in.params.z);
-  }
-  if (in.params.x >= 1.5) {
-    return held_block(in.uv, i32(in.params.y));
   }
   let dims = vec2i(textureDimensions(atlas, 0));
   let coord = clamp(vec2i(floor(in.uv * vec2f(dims))), vec2i(0, 0), dims - vec2i(1, 1));
