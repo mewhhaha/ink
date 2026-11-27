@@ -142,7 +142,21 @@ bounded invocation stack (`rt.stack_live_bytes`): replacing large long-lived
 caller-owned `own` arrays with fresh `@array.fill` buffers (or calling
 record-returning closures inside large `0 .. n` loops) can pin tens of MiB on
 the stack across nested owners and trap in `runtime.stack_slow`; populate large
-caller-owned buffers in place instead.
+caller-owned buffers in place instead. `@storage.with_capacity n` at top level
+(outside loops and inlined helpers) likewise allocates on the bump stack: if
+pushes exceed `n`, growth moves to the heap while pinning the stack slab until
+return, so use `@storage.with_capacity` only for exact or guaranteed upper
+bounds and `let out = #[]; @storage.reserve out estimate` when the capacity is
+only an estimate. Use `@storage.extend` for bulk copies of non-trivial slices,
+not tiny 1–3 element appends inside hot loops where direct `@storage.push`
+avoids extend overhead. Guarding a hot indexed write loop with a conditional
+`if out.length < n: @storage.reserve out ...` invalidates cached array bounds at
+the branch merge, so avoid redundant reserve branches when callers already pass
+exact-sized buffers. `@array.fill n 0` defaults `0` to `U32`; bind a typed
+local (`let zero64: U64 = 0`) when filling `#[U64]`. On polymorphic text views,
+indexed `for i in 0 .. len: text.at i` avoids iterator overhead compared to
+`for code in text:`. Over-inlining medium helpers into hot loops can bloat Wasm
+locals and spill registers in the host compiler.
 
 ## Math, transforms and time
 
