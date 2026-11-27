@@ -268,18 +268,22 @@ the moved slot; serialization preserves U32 identities. Mutations take
 
 ## ECS, queries and commits
 
-`ecs.Entities` is a named live-bit pool; every component has a separate
-`ecs.Pool a = ResizeArray (Maybe a)`. Entity/component metadata and application
-resources have independent owners. There is no registration builder, ambient
-world lookup or implicit component store.
+`ecs.Entities` packs entity live bits 64 per `U64` word (`ecs.entities ()`); every
+component has a separate `ecs.Pool a` (`ecs.pool ()`) that stays direct-indexed
+with zero side-allocation when dense and hole-free, adds a `U32` presence bitset
+on removals, and promotes to a compact sparse set on gaps. Borrowed read-only
+views use `ecs.rows pool : ecs.PoolRead a`.
+Entity/component metadata and application resources have independent owners.
+There is no registration builder, ambient world lookup or implicit component
+store.
 
 ```blot
 import * as ecs from "ink/ecs"
 
 io component () : U32 => return do:
-  let alive: ecs.Entities = #[]
+  let alive: ecs.Entities = ecs.entities ()
   let entity_meta = ecs.metadata 1
-  let values: ecs.Pool U32 = #[]
+  let values: ecs.Pool U32 = ecs.pool ()
   let value_meta = ecs.metadata 1
   let (id, alive, entity_meta) = ecs.spawn alive entity_meta
   let (values, value_meta) = ecs.insert alive values value_meta id 17

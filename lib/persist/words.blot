@@ -94,11 +94,11 @@ func restore_alive sections -> words -> (alive: own ecs.Entities) -> (meta: own 
   let $Some section = find 0 sections else:
     return panic "missing word-native entities"
   require (section.version == 1)
-  @storage.truncate alive 0
+  alive := ecs.clear_entities self
   for i in 0 .. section.count:
     let flag = words.at (section.start + i)
     require (flag <= 1)
-    @storage.push alive (flag == 1)
+    alive := ecs.push_entity self (flag == 1)
   meta[1] := 0
   meta[2] := 0
   return (alive, meta, $persist.Outcome {key: 0, fate: $persist.Kept, saved: 1, version: 1})
@@ -172,7 +172,7 @@ func decode_column_range (require_live: Bool) -> codec -> (saved_version: U32) -
   require (length >= 2 and words.at start <= alive_count and words.at (start + 1) <= words.at start)
   let row_count = words.at start
   let present_count = words.at (start + 1)
-  let decoded: ecs.Pool a = @array.fill row_count $Nothing
+  let decoded: ecs.Pool a = ecs.pool ()
   let at: U32 = 2
   let previous: U32 = 0
   for record in 0 .. present_count:
@@ -191,42 +191,32 @@ func decode_column_range (require_live: Bool) -> codec -> (saved_version: U32) -
       return (false, empty)
     let $Some row = codec.decode value else:
       return panic "invalid word-native value"
-    decoded[id] := $Some row
+    decoded := ecs.put_raw_row self id row
     previous := id
     at := at + count
   require (at == length)
-  return (true, decoded)
+  return (true, ecs.set_extent decoded row_count)
 func decode_column (require_live: Bool) -> codec -> (saved_version: U32) -> alive -> words =>
   return decode_column_range require_live codec saved_version alive words 0 words.length
-func commit_column (filled: Bool) -> (decoded: &[Maybe a]) -> (pool: own ecs.Pool a) : ecs.Pool a =>
+func commit_column (filled: Bool) -> (decoded: ecs.Pool a) -> (pool: own ecs.Pool a) : ecs.Pool a =>
   if not filled:
-    @storage.truncate pool 0
-    return pool
-  let n = decoded.length
-  let old_n = pool.length
-  let common = min n old_n
-  for i in 0 .. common:
-    pool[i] := decoded[i]
-  for i in common .. n:
-    @storage.push pool decoded[i]
-  if old_n > n:
-    @storage.truncate pool n
-  return pool
+    return ecs.clear_pool pool
+  return ecs.copy_into identity pool decoded
 func read_column (require_live: Bool) -> codec -> (saved_version: U32) -> alive -> words -> (pool: own ecs.Pool a) =>
   let (filled, decoded) = decode_column require_live codec saved_version alive words
-  let pool = commit_column filled (&decoded[0..decoded.length]) pool
+  let pool = commit_column filled decoded pool
   return (filled, pool)
 func restore_column (require_live: Bool) -> codec -> alive -> (pool: own ecs.Pool a) -> (meta: own ecs.Metadata) -> sections -> words : (ecs.Pool a, ecs.Metadata, persist.Outcome) =>
   let key: U32 = codec.key
   let version: U32 = codec.version
   let $Some section = find key sections else:
-    @storage.truncate pool 0
+    pool := ecs.clear_pool self
     meta[1] := 0
     meta[2] := 0
     return (pool, meta, $persist.Outcome {key, fate: $persist.Missing, saved: 0, version})
   let fate = if section.version == version then $persist.Kept else $persist.Migrated
   let (filled, decoded) = decode_column_range require_live codec section.version alive words section.start section.count
-  let pool = commit_column filled (&decoded[0..decoded.length]) pool
+  let pool = commit_column filled decoded pool
   if not filled:
     fate := $persist.Reset
   meta[1] := 0
@@ -309,10 +299,10 @@ func restore_snapshotted_component codec -> alive -> (own current) -> (own curre
   previous_meta[1] := 0
   previous_meta[2] := 0
   if not curr_filled or not prev_filled:
-    @storage.truncate current 0
-    @storage.truncate previous 0
+    current := ecs.clear_pool self
+    previous := ecs.clear_pool self
     return (current, current_meta, previous, previous_meta, $persist.Outcome {key: codec.key, fate: $persist.Reset, saved: section.version, version: codec.version})
-  current := commit_column true (&curr_decoded[0..curr_decoded.length]) self
-  previous := commit_column true (&prev_decoded[0..prev_decoded.length]) self
+  current := commit_column true curr_decoded self
+  previous := commit_column true prev_decoded self
   let fate = if section.version == codec.version then $persist.Kept else $persist.Migrated
   return (current, current_meta, previous, previous_meta, $persist.Outcome {key: codec.key, fate, saved: section.version, version: codec.version})

@@ -37,17 +37,75 @@ type SourceMeta is data = $SourceMeta { key: U32, epoch: U32, structure: U32 }
 func source_meta (key: U32) -> (meta: ecs.Metadata): SourceMeta => return
   $SourceMeta { key, epoch: ecs.epoch meta, structure: ecs.membership_revision meta }
 func source (key: U32) -> (pool: ecs.Pool a) -> (meta: ecs.Metadata) -> (membership: own #[Bool]) : Source =>
-  let n = pool.length
+  let n = pool.extent
   let epoch = ecs.epoch meta
   let structure = ecs.membership_revision meta
+  if n == 0:
+    @storage.truncate membership 0
+    return $Source {key, epoch, structure, present: membership}
+  let flags = pool.flags
+  if flags == 0:
+    if membership.length < n:
+      return $Source {key, epoch, structure, present: @array.fill n true}
+    for id in 0 .. n:
+      membership[id] := true
+    if membership.length > n:
+      @storage.truncate membership n
+    return $Source {key, epoch, structure, present: membership}
+  let p_meta = pool.meta
   if membership.length < n:
     let fresh = @array.fill n false
-    for id in 0 .. n:
-      if let $Some _ = pool[id]:
-        fresh[id] := true
+    if flags == 2:
+      let full = n >> 5
+      for wi in 0 .. full:
+        let w = p_meta[1 + wi]
+        let base = wi << 5
+        for 0 .. 32:
+          if w == 0:
+            break
+          fresh[base + ecs.ctz32 w] := true
+          w := self & (self - 1)
+      let rem = n & 31
+      if rem > 0:
+        let w = p_meta[1 + full] & ((1 << rem) - 1)
+        let base = full << 5
+        for 0 .. 32:
+          if w == 0:
+            break
+          fresh[base + ecs.ctz32 w] := true
+          w := self & (self - 1)
+    else:
+      let id_base = 3 + p_meta[1]
+      let live_n = p_meta[0]
+      for k in 0 .. live_n:
+        fresh[p_meta[id_base + k]] := true
     return $Source {key, epoch, structure, present: fresh}
   for id in 0 .. n:
-    membership[id] := Maybe.is_some pool[id]
+    membership[id] := false
+  if flags == 2:
+    let full = n >> 5
+    for wi in 0 .. full:
+      let w = p_meta[1 + wi]
+      let base = wi << 5
+      for 0 .. 32:
+        if w == 0:
+          break
+        membership[base + ecs.ctz32 w] := true
+        w := self & (self - 1)
+    let rem = n & 31
+    if rem > 0:
+      let w = p_meta[1 + full] & ((1 << rem) - 1)
+      let base = full << 5
+      for 0 .. 32:
+        if w == 0:
+          break
+        membership[base + ecs.ctz32 w] := true
+        w := self & (self - 1)
+  else:
+    let id_base = 3 + p_meta[1]
+    let live_n = p_meta[0]
+    for k in 0 .. live_n:
+      membership[p_meta[id_base + k]] := true
   if membership.length > n:
     @storage.truncate membership n
   return $Source {key, epoch, structure, present: membership}
@@ -245,10 +303,42 @@ func prepare (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: Fi
       let builds = ecs.bumped_revision meta[0]
       @storage.truncate indices 0
       let present = s.present
-      let limit = min alive.length present.length
-      for id in 0 .. limit:
-        if present[id] and alive[id]:
-          @storage.push indices id
+      let a_words = alive.words
+      let limit = min alive.count present.length
+      let zero64: U64 = 0u64
+      let one64: U64 = 1u64
+      let all64: U64 = 0xFFFFFFFFFFFFFFFFu64
+      let full = limit >> 6
+      for wi in 0 .. full:
+        let w = a_words[wi]
+        if U64.eq w zero64:
+          continue
+        let base = wi << 6
+        if U64.eq w all64:
+          for b in 0 .. 64:
+            let id = base + b
+            if present[id]:
+              @storage.push indices id
+        else:
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            let id = base + ecs.ctz64 w
+            if present[id]:
+              @storage.push indices id
+            w := U64.bit_and self (U64.sub self one64)
+      let rem = limit & 63
+      if rem > 0:
+        let mask = U64.sub (U64.shl one64 (U32.to_u64 rem)) one64
+        let w = U64.bit_and a_words[full] mask
+        let base = full << 6
+        for 0 .. 64:
+          if U64.eq w zero64:
+            break
+          let id = base + ecs.ctz64 w
+          if present[id]:
+            @storage.push indices id
+          w := U64.bit_and self (U64.sub self one64)
       @storage.truncate key 0
       @storage.reserve key 7
       @storage.push key ep
@@ -302,40 +392,108 @@ func prepare (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: Fi
     return (key, indices, meta)
   let builds = ecs.bumped_revision meta[0]
   @storage.truncate indices 0
-  let n_alive = alive.length
+  let a_words = alive.words
+  let n_alive = alive.count
+  let zero64: U64 = 0u64
+  let one64: U64 = 1u64
+  let full_alive = n_alive >> 6
+  let rem_alive = n_alive & 63
   if flen == 1:
     case filter[0] of
       $With _ => ()
       $Without _ => do:
         let present = sources[resolved[0]].present
         let p_len = present.length
-        for id in 0 .. n_alive:
-          if alive[id] and not (id < p_len and present[id]):
-            @storage.push indices id
+        for wi in 0 .. full_alive:
+          let w = a_words[wi]
+          let base = wi << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            let id = base + ecs.ctz64 w
+            if not (id < p_len and present[id]):
+              @storage.push indices id
+            w := U64.bit_and self (U64.sub self one64)
+        if rem_alive > 0:
+          let mask = U64.sub (U64.shl one64 (U32.to_u64 rem_alive)) one64
+          let w = U64.bit_and a_words[full_alive] mask
+          let base = full_alive << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            let id = base + ecs.ctz64 w
+            if not (id < p_len and present[id]):
+              @storage.push indices id
+            w := U64.bit_and self (U64.sub self one64)
       $Optional _ => do:
-        for id in 0 .. n_alive:
-          if alive[id]:
-            @storage.push indices id
+        for wi in 0 .. full_alive:
+          let w = a_words[wi]
+          let base = wi << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            @storage.push indices (base + ecs.ctz64 w)
+            w := U64.bit_and self (U64.sub self one64)
+        if rem_alive > 0:
+          let mask = U64.sub (U64.shl one64 (U32.to_u64 rem_alive)) one64
+          let w = U64.bit_and a_words[full_alive] mask
+          let base = full_alive << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            @storage.push indices (base + ecs.ctz64 w)
+            w := U64.bit_and self (U64.sub self one64)
       $All take => do:
         if take != 0:
           return panic "query filter stack underflow"
-        for id in 0 .. n_alive:
-          if alive[id]:
-            @storage.push indices id
+        for wi in 0 .. full_alive:
+          let w = a_words[wi]
+          let base = wi << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            @storage.push indices (base + ecs.ctz64 w)
+            w := U64.bit_and self (U64.sub self one64)
+        if rem_alive > 0:
+          let mask = U64.sub (U64.shl one64 (U32.to_u64 rem_alive)) one64
+          let w = U64.bit_and a_words[full_alive] mask
+          let base = full_alive << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            @storage.push indices (base + ecs.ctz64 w)
+            w := U64.bit_and self (U64.sub self one64)
       $Any take => do:
         if take != 0:
           return panic "query filter stack underflow"
   else:
     if flen <= 32:
-      for id in 0 .. n_alive:
-        if alive[id]:
+      for wi in 0 .. full_alive:
+        let w = a_words[wi]
+        let base = wi << 6
+        for 0 .. 64:
+          if U64.eq w zero64:
+            break
+          let id = base + ecs.ctz64 w
           if matches_bitmask filter resolved sources id:
             @storage.push indices id
+          w := U64.bit_and self (U64.sub self one64)
+      if rem_alive > 0:
+        let mask = U64.sub (U64.shl one64 (U32.to_u64 rem_alive)) one64
+        let w = U64.bit_and a_words[full_alive] mask
+        let base = full_alive << 6
+        for 0 .. 64:
+          if U64.eq w zero64:
+            break
+          let id = base + ecs.ctz64 w
+          if matches_bitmask filter resolved sources id:
+            @storage.push indices id
+          w := U64.bit_and self (U64.sub self one64)
     else:
       let stack = array.fill flen false
       let loop_state = (stack, indices)
       for id in 0 .. n_alive:
-        if alive[id]:
+        if ecs.live alive id:
           loop_state := step_match filter resolved sources id self
       let (_, next_indices) = loop_state
       indices := next_indices

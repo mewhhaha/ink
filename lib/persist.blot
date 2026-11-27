@@ -123,9 +123,9 @@ func restore_alive sections -> values -> (alive: own ecs.Entities) -> (meta: own
   let $Some section = find 0 sections else:
     return panic "missing saved entities"
   lanes.require (section.version == 1 and section.width == 0)
-  @storage.truncate alive 0
+  alive := ecs.clear_entities self
   for i in 0 .. section.count:
-    @storage.push alive (lanes.flag (values.at (section.start + i)))
+    alive := ecs.push_entity self (lanes.flag (values.at (section.start + i)))
   meta[1] := 0
   meta[2] := 0
   return (alive, meta, $Outcome {key: 0, fate: $Kept, saved: 1, version: 1})
@@ -221,7 +221,7 @@ func write_snapshotted_component codec -> (width: U32) -> alive -> current -> pr
   w.payload := append_pool codec width alive_count previous self
   @storage.push w.sections ($Section {key: codec.key, version: codec.version, width, start, count})
   return w
-func step_restore_row (decode: #[F32] -> own s -> (a, s)) -> (migrate: U32 -> #[F32] -> Maybe (#[F32])) -> (alive_at: U32 -> Bool) -> (value_at: U32 -> F32) -> (section: Section) -> (version: U32) -> (width: U32) -> (stride: U32) -> (id: U32) -> (acc: own (s, ecs.Pool a, #[Fate])) : (s, ecs.Pool a, #[Fate]) =>
+func step_restore_row (decode: #[F32] -> own s -> (a, s)) -> (migrate: U32 -> #[F32] -> Maybe (#[F32])) -> (alive_at: U32 -> Bool) -> (value_at: U32 -> F32) -> (section: Section) -> (version: U32) -> (width: U32) -> (stride: U32) -> (id: U32) -> (acc: own (s, #[Maybe a], #[Fate])) : (s, #[Maybe a], #[Fate]) =>
   let (cur_state, cur_decoded, cur_fate) = acc
   if let $Reset = cur_fate[0]:
     return (cur_state, cur_decoded, cur_fate)
@@ -249,7 +249,7 @@ func restore_component_with codec -> (width: U32) -> (decode: #[F32] -> own s ->
   let migrate: U32 -> #[F32] -> Maybe (#[F32]) = codec.migrate
   let found: Maybe Section = find key sections
   let $Some section = found else:
-    @storage.truncate pool 0
+    pool := ecs.clear_pool self
     meta[1] := 0
     meta[2] := 0
     return (pool, meta, state, $Outcome {key: key, fate: $Missing, saved: 0, version: version})
@@ -260,18 +260,16 @@ func restore_component_with codec -> (width: U32) -> (decode: #[F32] -> own s ->
   lanes.require (section.count % stride == 0 and section.count / stride <= alive_count)
   if section.version == version:
     lanes.require (section.width == width)
-  let decoded: ecs.Pool a = ecs.pool ()
+  let decoded: #[Maybe a] = #[]
   let loop_acc = (state, decoded, init_fate)
   for id in 0 .. section.count / stride:
     loop_acc := step_restore_row decode migrate (func i => alive.at i) (func i => values.at i) section version width stride id self
   let (final_state, final_decoded, final_fate_arr) = loop_acc
   let fate: Fate = final_fate_arr[0]
-  @storage.truncate pool 0
   if let $Reset = fate:
-    ()
+    pool := ecs.clear_pool self
   else:
-    for value in final_decoded:
-      @storage.push pool value
+    pool := ecs.load_maybe_rows (&final_decoded[0..final_decoded.length]) self
   meta[1] := 0
   meta[2] := 0
   return (pool, meta, final_state, $Outcome {key: key, fate, saved, version: version})
@@ -287,7 +285,7 @@ func decode_component_rows_using read_current -> codec -> (width: U32) -> alive 
   let decode: #[F32] -> a = codec.decode
   let migrate: U32 -> #[F32] -> Maybe (#[F32]) = codec.migrate
   let found: Maybe Section = find key sections
-  let decoded: ecs.Pool a = ecs.pool ()
+  let decoded: #[Maybe a] = #[]
   let fate: Fate = $Missing
   let saved: U32 = 0
   if let $Some section = found:
@@ -320,12 +318,10 @@ func decode_component_rows_using read_current -> codec -> (width: U32) -> alive 
         @storage.push decoded $Nothing
   return (decoded, $Outcome {key: key, fate, saved, version: version})
 func commit_component_rows (decoded: &[Maybe a]) -> (fate: Fate) -> (pool: own ecs.Pool a) -> (meta: own ecs.Metadata) : (ecs.Pool a, ecs.Metadata) =>
-  @storage.truncate pool 0
   if let $Reset = fate:
-    ()
+    pool := ecs.clear_pool self
   else:
-    for value in decoded:
-      @storage.push pool value
+    pool := ecs.load_maybe_rows decoded self
   meta[1] := 0
   meta[2] := 0
   return (pool, meta)
@@ -410,8 +406,8 @@ func restore_snapshot_using read_current -> codec -> (width: U32) -> copy_value 
   let (curr_rows, outcome) = decode_component_rows_using read_current codec width alive #[first] values
   let (prev_rows, prev_outcome) = decode_component_rows_using read_current codec width alive #[second] values
   if is_reset outcome.fate or is_reset prev_outcome.fate:
-    @storage.truncate current 0
-    @storage.truncate previous 0
+    current := ecs.clear_pool self
+    previous := ecs.clear_pool self
     current_meta[1] := 0
     current_meta[2] := 0
     previous_meta[1] := 0
