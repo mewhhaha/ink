@@ -19,15 +19,16 @@ type Key = { lineage: U32, revision: U32 }
 type State = { ready: Bool, revision: Key }
 const initial: State = {ready: false, revision: {lineage: 0, revision: 0}}
 type Access is data = $Access {
-  state: State, sources: #[scene.SourceRow],
+  state: State, sources: #[scene.SourceRow], bodies: scene.Bodies,
   scene: scene.Scene, ids: #[U32], by_id: #[U32],
 }
-type Static is data = $Static { revision: Key, sources: &[scene.SourceRow], scene: scene.Read, ids: &[U32], by_id: &[U32] }
+type Static is data = $Static { revision: Key, sources: &[scene.SourceRow], bodies: scene.BodiesRead, scene: scene.Read, ids: &[U32], by_id: &[U32] }
 func read (destination: Access): Static =>
   if not destination.state.ready:
     return panic "prepared geometry has not been built"
   return $Static {revision: destination.state.revision,
     sources: destination.sources.view 0 destination.sources.length,
+    bodies: scene.read_bodies destination.bodies,
     scene: scene.read destination.scene,
     ids: destination.ids.view 0 destination.ids.length,
     by_id: destination.by_id.view 0 destination.by_id.length}
@@ -51,18 +52,27 @@ func prepare_into (revision: Key) -> (sources: #[scene.Source]) -> (destination:
   if not (admissible sources):
     return panic "prepared geometry requires static sources"
   destination.scene.geometry := shapes.clear self
+  destination.bodies := scene.clear_bodies self
   destination.scene := scene.build_into self sources
-  let (rows, geometry) = scene.pack_sources_into destination.scene.geometry destination.sources sources
+  let (rows, geometry, bodies) = scene.pack_sources_into destination.scene.geometry destination.bodies destination.sources sources
   destination.scene.geometry := geometry
+  destination.bodies := bodies
   destination.sources := rows
-  let keys: #[U32] = array.fill (scene.count destination.scene) 0
-  for i in 0 .. keys.length:
-    keys[i] := destination.scene.proxies[i].id
-  let order: #[U32] = physics.order_proxy_ids keys
-  destination.ids := spatial.replace_u32 self keys
-  destination.by_id := spatial.replace_u32 self order
-  destination.state := {ready: true, revision}
-  return destination
+  let n = scene.count destination.scene
+  let $Access { state: _, sources: s_rows, bodies: s_bodies, scene: sc, ids, by_id } = destination
+  let id_len = ids.length
+  let common = min id_len n
+  for i in 0 .. common:
+    ids[i] := sc.proxies[i].id
+  if n > common:
+    @storage.reserve ids (n - common)
+    for i in common .. n:
+      @storage.push ids sc.proxies[i].id
+  if id_len > n:
+    @storage.truncate ids n
+  let order: #[U32] = physics.order_proxy_ids ids
+  let by_id = spatial.replace_u32 by_id order
+  return $Access { state: {ready: true, revision}, sources: s_rows, bodies: s_bodies, scene: sc, ids, by_id }
 func refresh_into (revision: Key) -> (sources: #[scene.Source]) -> (destination: own Access) : Access =>
   let state = destination.state
   if state.ready and state.revision.lineage == revision.lineage and state.revision.revision == revision.revision:
@@ -145,11 +155,11 @@ func pack_proxy_step (p: scene.Proxy) -> (acc: own (shapes.Geometry, #[scene.Pro
 func select_for_cache (fixed: Static) -> (walk: physics.Walkers) -> (seconds: F32) -> (cache: physics.CacheAccess) -> (moving_count: U32) -> (links: #[joints.Joint]) : #[U32] =>
   let c = physics.read_cache cache
   return select fixed walk.proxies walk.velocities seconds c moving_count links
-func run_prepared_step (fixed: Static) -> (links: #[joints.Joint]) -> (config: physics.Config) -> (seconds: F32) -> (source_rows: &[scene.SourceRow]) -> (step_geom: shapes.Geometry) -> (cache: own physics.CacheAccess) -> (results: own #[physics.Result]) : (Bool, physics.CacheAccess, #[physics.Result]) =>
+func run_prepared_step (fixed: Static) -> (links: #[joints.Joint]) -> (config: physics.Config) -> (seconds: F32) -> (source_rows: &[scene.SourceRow]) -> (step_bodies: scene.BodiesRead) -> (step_geom: shapes.Geometry) -> (cache: own physics.CacheAccess) -> (results: own #[physics.Result]) : (Bool, physics.CacheAccess, #[physics.Result]) =>
   let moving_count = source_rows.length
-  let built = scene.build_source_rows (scene.empty ()) step_geom source_rows
+  let built = scene.build_source_rows (scene.empty ()) step_geom step_bodies source_rows
   let queries = scene.together (scene.queries built) (scene.single fixed.scene)
-  let (walk_geom, walk) = physics.run_walkers_with queries source_rows built seconds true
+  let (walk_geom, walk) = physics.run_walkers_with queries source_rows (func (i: U32) : scene.Rigid => physics.rigid_of_row step_bodies source_rows[i]) (func (i: U32) : Maybe scene.Walker => scene.row_walker step_bodies source_rows[i]) built seconds true
   let selected = select_for_cache fixed walk seconds cache moving_count links
   // The solver reads only pose, body, and controller fields from these rows.
   // Authored collider spans stay in their separate moving and fixed pools.
@@ -184,13 +194,15 @@ func run_prepared_step (fixed: Static) -> (links: #[joints.Joint]) -> (config: p
     link.b := remap moving_count selected self
     @storage.push mapped link
   let expanded = physics.extend_walkers_with walk sources work true
-  return physics.simulate_prepared_rows queries mapped config seconds sources work cache results walk_geom expanded moving_proxies fixed.scene.geometry
+  let rigid_at = func (i: U32) : scene.Rigid =>
+    if i < moving_count then physics.rigid_of_row step_bodies sources[i] else physics.rigid_of_row fixed.bodies sources[i]
+  return physics.simulate_prepared_rows queries mapped config seconds sources rigid_at work cache results walk_geom expanded moving_proxies fixed.scene.geometry
 func simulate_joints_into (fixed: Static) -> (links: #[joints.Joint]) -> (config: physics.Config) -> (seconds: F32) -> (step: own physics.StepAccess) : physics.StepAccess =>
   if not (seconds > 0.0 and is_finite seconds):
     @storage.truncate step.results 0
     return step
-  let $physics.StepAccess { sources: source_rows, geometry: step_geom, cache, results } = step
-  let (solved, cache, results) = run_prepared_step fixed links config seconds (&source_rows[0..source_rows.length]) step_geom cache results
-  return physics.swap_cache solved ($physics.StepAccess { sources: source_rows, geometry: step_geom, cache, results })
+  let $physics.StepAccess { sources: source_rows, bodies: step_bodies, geometry: step_geom, cache, results } = step
+  let (solved, cache, results) = run_prepared_step fixed links config seconds (&source_rows[0..source_rows.length]) (scene.read_bodies step_bodies) step_geom cache results
+  return physics.swap_cache solved ($physics.StepAccess { sources: source_rows, bodies: step_bodies, geometry: step_geom, cache, results })
 func simulate_into (fixed: Static) -> (config: physics.Config) -> (seconds: F32) -> (step: own physics.StepAccess) : physics.StepAccess => return
   simulate_joints_into fixed #[] config seconds step

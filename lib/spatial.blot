@@ -134,9 +134,46 @@ private func write_morton_order (order: own #[U32]) -> (keys: #[U32]) : #[U32] =
         right := self + 1
   return order
 
+// Largest power of two <= n (for n >= 1).
+private func largest_pow2 (n: U32) : U32 =>
+  let p: U32 = 1
+  for 0 .. 31:
+    if p <= n / 2:
+      p := self * 2
+    else:
+      break
+  return p
+
+private func reverse_u32 (values: own #[U32]) -> (first: U32) -> (last: U32) : #[U32] =>
+  let i = first
+  let j = last
+  for 0 .. (last - first) / 2:
+    let tmp = values[i]
+    values[i] := values[j - 1]
+    values[j - 1] := tmp
+    i := self + 1
+    j := self - 1
+  return values
+
+// Rotate `values[0..n]` left by `shift` in place so Morton rank `i` lands at
+// leaf slot `node - n` of the 2*n - 1 complete tree, keeping left-to-right DFS
+// in exact Morton order without power-of-two padding or sentinel leaves.
+private func rotate_left_u32 (values: own #[U32]) -> (shift: U32) : #[U32] =>
+  let n = values.length
+  if shift == 0 or shift >= n:
+    return values
+  values := reverse_u32 self 0 shift
+  values := reverse_u32 self shift n
+  return reverse_u32 values 0 n
+
 func build_into (destination: own Index) -> (items: #[Bounds]) : Index =>
   let $Index { base: _, bounds, order, leaves } = destination
   let n = items.length
+  if n == 0:
+    @storage.truncate bounds 0
+    @storage.truncate order 0
+    @storage.truncate leaves 0
+    return $Index { base: 0, bounds, order, leaves }
   let low_x = 3.402823466e38
   let low_y = 3.402823466e38
   let low_z = 3.402823466e38
@@ -160,31 +197,22 @@ func build_into (destination: own Index) -> (items: #[Bounds]) : Index =>
   let span_x = high_x - low_x
   let span_y = high_y - low_y
   let span_z = high_z - low_z
-  let keys = @array.generate n (func (i: U32) =>
+  let keys = @array.fill n 0
+  for i in 0 .. n:
     let b = items[i]
     let x = b.low.x * 0.5 + b.high.x * 0.5
     let y = b.low.y * 0.5 + b.high.y * 0.5
     let z = b.low.z * 0.5 + b.high.z * 0.5
-    return spread (quantize_center x low_x high_x span_x) | (spread (quantize_center y low_y high_y span_y) << 1) | (spread (quantize_center z low_z high_z span_z) << 2))
+    keys[i] := spread (quantize_center x low_x high_x span_x) | (spread (quantize_center y low_y high_y span_y) << 1) | (spread (quantize_center z low_z high_z span_z) << 2)
   let sorted_order = sort.order_u32 keys
   order := replace_u32 self sorted_order
-  let base = 1
-  for 0..31:
-    if base >= n:
-      break
-    base := self * 2
+  let deep = (n - largest_pow2 n) * 2
+  order := rotate_left_u32 self deep
+  let base = n
   let target_bounds = base * 12
   bounds := resize_zeroed self target_bounds 0.0
   for i in 0..6:
     bounds[i] := 0.0
-  for i in n..base:
-    let o = (base + i) * 6
-    bounds[o] := 1000000000.0
-    bounds[o + 1] := 1000000000.0
-    bounds[o + 2] := 1000000000.0
-    bounds[o + 3] := (-1000000000.0)
-    bounds[o + 4] := (-1000000000.0)
-    bounds[o + 5] := (-1000000000.0)
   leaves := resize_zeroed self n 0
   for i in 0..n:
     let node = base + i
@@ -216,6 +244,11 @@ func build_into (destination: own Index) -> (items: #[Bounds]) : Index =>
 func build_flat (destination: own Index) -> (extents: #[F32]) : Index =>
   let $Index { base: _, bounds, order, leaves } = destination
   let n = extents.length / 6
+  if n == 0:
+    @storage.truncate bounds 0
+    @storage.truncate order 0
+    @storage.truncate leaves 0
+    return $Index { base: 0, bounds, order, leaves }
   let low_x = 3.402823466e38
   let low_y = 3.402823466e38
   let low_z = 3.402823466e38
@@ -251,10 +284,14 @@ func build_flat (destination: own Index) -> (extents: #[F32]) : Index =>
         ordered_x := false
         break
       previous := x
+  let deep = (n - largest_pow2 n) * 2
   if ordered_x:
     order := resize_zeroed self n 0
-    for i in 0 .. n:
-      order[i] := i
+    let split = n - deep
+    for i in 0 .. split:
+      order[i] := i + deep
+    for i in split .. n:
+      order[i] := i - split
   else:
     let keys = @array.fill n 0
     for i in 0 .. n:
@@ -264,23 +301,12 @@ func build_flat (destination: own Index) -> (extents: #[F32]) : Index =>
       let z = extents[o + 2] * 0.5 + extents[o + 5] * 0.5
       keys[i] := spread (quantize_center x low_x high_x span_x) | (spread (quantize_center y low_y high_y span_y) << 1) | (spread (quantize_center z low_z high_z span_z) << 2)
     order := write_morton_order self keys
-  let base = 1
-  for 0..31:
-    if base >= n:
-      break
-    base := self * 2
+    order := rotate_left_u32 self deep
+  let base = n
   let target_bounds = base * 12
   bounds := resize_zeroed self target_bounds 0.0
   for i in 0..6:
     bounds[i] := 0.0
-  for i in n..base:
-    let o = (base + i) * 6
-    bounds[o] := 1000000000.0
-    bounds[o + 1] := 1000000000.0
-    bounds[o + 2] := 1000000000.0
-    bounds[o + 3] := (-1000000000.0)
-    bounds[o + 4] := (-1000000000.0)
-    bounds[o + 5] := (-1000000000.0)
   leaves := resize_zeroed self n 0
   for i in 0..n:
     let node = base + i
@@ -314,6 +340,11 @@ func build_from (destination: own Index) -> (n: U32) -> (bounds_at: U32 -> Bound
 // Readers may return a Bounds or a stored row with the same bounds fields.
 func build_rows (destination: own Index) -> (n: U32) -> bounds_at : Index =>
   let $Index { base: _, bounds, order, leaves } = destination
+  if n == 0:
+    @storage.truncate bounds 0
+    @storage.truncate order 0
+    @storage.truncate leaves 0
+    return $Index { base: 0, bounds, order, leaves }
   let low_x = 3.402823466e38
   let low_y = 3.402823466e38
   let low_z = 3.402823466e38
@@ -337,32 +368,23 @@ func build_rows (destination: own Index) -> (n: U32) -> bounds_at : Index =>
   let span_x = high_x - low_x
   let span_y = high_y - low_y
   let span_z = high_z - low_z
-  let keys = @array.generate n (func (i: U32) =>
+  let keys = @array.fill n 0
+  for i in 0 .. n:
     let b = bounds_at i
     let x = b.low.x * 0.5 + b.high.x * 0.5
     let y = b.low.y * 0.5 + b.high.y * 0.5
     let z = b.low.z * 0.5 + b.high.z * 0.5
-    return spread (quantize_center x low_x high_x span_x) | (spread (quantize_center y low_y high_y span_y) << 1) | (spread (quantize_center z low_z high_z span_z) << 2))
+    keys[i] := spread (quantize_center x low_x high_x span_x) | (spread (quantize_center y low_y high_y span_y) << 1) | (spread (quantize_center z low_z high_z span_z) << 2)
   let sorted_order = sort.order_u32 keys
   order := replace_u32 self sorted_order
-  let base = 1
-  for 0..31:
-    if base >= n:
-      break
-    base := self * 2
+  let deep = (n - largest_pow2 n) * 2
+  order := rotate_left_u32 self deep
+  let base = n
   let target_bounds = base * 12
   // The rebuild writes every bounds lane and every item-to-leaf entry.
   bounds := resize_zeroed self target_bounds 0.0
   for i in 0..6:
     bounds[i] := 0.0
-  for i in n..base:
-    let o = (base + i) * 6
-    bounds[o] := 1000000000.0
-    bounds[o + 1] := 1000000000.0
-    bounds[o + 2] := 1000000000.0
-    bounds[o + 3] := (-1000000000.0)
-    bounds[o + 4] := (-1000000000.0)
-    bounds[o + 5] := (-1000000000.0)
   leaves := resize_zeroed self n 0
   for i in 0..n:
     let node = base + i
@@ -424,6 +446,8 @@ private func quantize_center (value: F32) -> (low: F32) -> (high: F32) -> (span:
 
 func build_columns (items: #[Bounds]) : (U32, #[F32], #[U32], #[U32]) =>
   let n = items.length
+  if n == 0:
+    return (0, #[], #[], #[])
   // Scalar centres: a Vec3 temporary costs a heap allocation per item.
   let low_x = 3.402823466e38
   let low_y = 3.402823466e38
@@ -444,33 +468,26 @@ func build_columns (items: #[Bounds]) : (U32, #[F32], #[U32], #[U32]) =>
     if is_finite z:
       low_z := min self z
       high_z := max self z
-  let keys = @array.generate n (func (i: U32) =>
+  let span_x = high_x - low_x
+  let span_y = high_y - low_y
+  let span_z = high_z - low_z
+  let keys = @array.fill n 0
+  for i in 0 .. n:
     let b = items[i]
     let x = b.low.x * 0.5 + b.high.x * 0.5
     let y = b.low.y * 0.5 + b.high.y * 0.5
     let z = b.low.z * 0.5 + b.high.z * 0.5
-    return spread (quantize x low_x high_x) | (spread (quantize y low_y high_y) << 1) | (spread (quantize z low_z high_z) << 2))
-  let order = sort.order_u32 keys
-  let base = 1
-  for 0..31:
-    if base >= n:
-      break
-    base := self * 2
+    keys[i] := spread (quantize_center x low_x high_x span_x) | (spread (quantize_center y low_y high_y span_y) << 1) | (spread (quantize_center z low_z high_z span_z) << 2)
+  let order = rotate_left_u32 (sort.order_u32 keys) ((n - largest_pow2 n) * 2)
+  let base = n
   let bounds = @array.fill (base * 12) 0.0
-  for i in n..base:
-    let o = (base + i) * 6
-    bounds[o] := 1000000000.0
-    bounds[o + 1] := 1000000000.0
-    bounds[o + 2] := 1000000000.0
-    bounds[o + 3] := (-1000000000.0)
-    bounds[o + 4] := (-1000000000.0)
-    bounds[o + 5] := (-1000000000.0)
   let leaves = @array.fill n 0
   for i in 0..n:
     let node = base + i
     let o = node * 6
-    let b = items[order[i]]
-    leaves[order[i]] := node
+    let idx = order[i]
+    let b = items[idx]
+    leaves[idx] := node
     bounds[o] := b.low.x
     bounds[o + 1] := b.low.y
     bounds[o + 2] := b.low.z
@@ -482,9 +499,12 @@ func build_columns (items: #[Bounds]) : (U32, #[F32], #[U32], #[U32]) =>
     let o = node * 6
     let a = node * 12
     let b = a + 6
-    for axis in 0..3:
-      bounds[o + axis] := min bounds[a + axis] bounds[b + axis]
-      bounds[o + 3 + axis] := max bounds[a + 3 + axis] bounds[b + 3 + axis]
+    bounds[o] := min bounds[a] bounds[b]
+    bounds[o + 1] := min bounds[a + 1] bounds[b + 1]
+    bounds[o + 2] := min bounds[a + 2] bounds[b + 2]
+    bounds[o + 3] := max bounds[a + 3] bounds[b + 3]
+    bounds[o + 4] := max bounds[a + 4] bounds[b + 4]
+    bounds[o + 5] := max bounds[a + 5] bounds[b + 5]
   // Construction and read-only queries keep contiguous storage. Convert once
   // on the first sparse update, so static and dense workloads pay no paging.
   return (base, bounds, order, leaves)

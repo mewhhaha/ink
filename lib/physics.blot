@@ -48,7 +48,7 @@ type CachedContact is data = $CachedContact {
 // Cache is a read for one operation; no owning aggregate crosses a tick.
 type Cache is data = $Cache { contacts: &[CachedContact] }
 type CacheAccess is data = $CacheAccess {first_active: Bool, first: #[CachedContact], second: #[CachedContact]}
-type StepAccess is data = $StepAccess {sources: #[scene.SourceRow], geometry: shapes.Geometry, cache: CacheAccess, results: #[Result]}
+type StepAccess is data = $StepAccess {sources: #[scene.SourceRow], bodies: scene.Bodies, geometry: shapes.Geometry, cache: CacheAccess, results: #[Result]}
 func read_cache (cache: CacheAccess) => return
   $Cache {contacts: if cache.first_active then cache.first.view 0 cache.first.length else cache.second.view 0 cache.second.length}
 // Explicit snapshots/seed inputs require an independent destination owner.
@@ -64,32 +64,64 @@ func seed_cache_into (contacts: &[CachedContact]) -> (cache: own CacheAccess) : 
   return cache
 func load_sources_into (values: #[Source]) -> (step: own StepAccess) : StepAccess =>
   step.geometry := shapes.clear self
-  let (rows, geometry) = scene.pack_sources_into step.geometry step.sources values
+  step.bodies := scene.clear_bodies self
+  let (rows, geometry, bodies) = scene.pack_sources_into step.geometry step.bodies step.sources values
   step.geometry := geometry
+  step.bodies := bodies
   step.sources := rows
   @storage.truncate step.cache.first 0
   @storage.truncate step.cache.second 0
   step.cache.first_active := true
   @storage.truncate step.results 0
   return step
-func source (step: StepAccess) -> (index: U32) => scene.unpack_source step.geometry step.sources[index]
+func source (step: StepAccess) -> (index: U32) => scene.unpack_source step.geometry step.bodies step.sources[index]
+func source_rigid (step: StepAccess) -> (index: U32) : Maybe scene.Rigid => scene.row_rigid step.bodies step.sources[index]
+func source_walker (step: StepAccess) -> (index: U32) : Maybe Walker => scene.row_walker step.bodies step.sources[index]
+func set_rigid (index: U32) -> (body: scene.Rigid) -> (step: own StepAccess) : StepAccess =>
+  let row = step.sources[index]
+  if row.rigid != scene.no_body:
+    step.bodies.rigids[row.rigid] := body
+  else:
+    row.rigid := step.bodies.rigids.length
+    @storage.push step.bodies.rigids body
+    step.sources[index] := row
+  return step
+func set_walker (index: U32) -> (walker: Walker) -> (step: own StepAccess) : StepAccess =>
+  let row = step.sources[index]
+  if row.walker != scene.no_body:
+    step.bodies.walkers[row.walker] := walker
+  else:
+    row.walker := step.bodies.walkers.length
+    @storage.push step.bodies.walkers walker
+    step.sources[index] := row
+  return step
 // The materialized Source array is invocation scratch. All nested views borrow
 // the older named geometry owners; the known consumer finishes before it dies.
 func with_sources (step: StepAccess) -> consume =>
-  let values = scene.source_values step.geometry (step.sources.view 0 step.sources.length)
+  let values = scene.source_values step.geometry step.bodies (step.sources.view 0 step.sources.length)
   return consume values
 func apply_into (step: own StepAccess) : StepAccess =>
-  for i in 0 .. step.results.length:
-    let result = step.results[i]
-    let row = step.sources[result.source]
+  let $StepAccess { sources, bodies, geometry, cache, results } = step
+  let $scene.Bodies { rigids, walkers } = bodies
+  for i in 0 .. results.length:
+    let result = results[i]
+    let row = sources[result.source]
     row.position := result.position
     row.rotation := result.rotation
     if let $Some body = result.rigid:
-      row.rigid := $Some body
+      if row.rigid != scene.no_body:
+        rigids[row.rigid] := body
+      else:
+        row.rigid := rigids.length
+        @storage.push rigids body
     if let $Some walker = result.walker:
-      row.walker := $Some walker
-    step.sources[result.source] := row
-  return step
+      if row.walker != scene.no_body:
+        walkers[row.walker] := walker
+      else:
+        row.walker := walkers.length
+        @storage.push walkers walker
+    sources[result.source] := row
+  return $StepAccess { sources, bodies: $scene.Bodies { rigids, walkers }, geometry, cache, results }
 const default_config = $Config {
   gravity: math.vec3 0.0 (-9.81) 0.0,
   substeps: 4,
@@ -100,21 +132,26 @@ const default_config = $Config {
 
 const no_slot = 0.0 - 1.0
 
+const default_static_rigid: scene.Rigid = $scene.Rigid {
+  kind: $scene.Static,
+  mass: 1.0,
+  gravity_scale: 1.0,
+  linear_damping: 0.0,
+  angular_damping: 0.0,
+  can_sleep: true,
+  continuous: false,
+  linear_velocity: math.zero3,
+  angular_velocity: math.zero3,
+  sleeping: false,
+  sleep_time: 0.0,
+}
+
 func rigid_of source => case source.rigid of
   $Some r => r
-  $Nothing => $scene.Rigid {
-    kind: $scene.Static,
-    mass: 1.0,
-    gravity_scale: 1.0,
-    linear_damping: 0.0,
-    angular_damping: 0.0,
-    can_sleep: true,
-    continuous: false,
-    linear_velocity: math.zero3,
-    angular_velocity: math.zero3,
-    sleeping: false,
-    sleep_time: 0.0,
-  }
+  $Nothing => default_static_rigid
+
+func rigid_of_row (bodies: scene.BodiesRead) -> (row: scene.SourceRow) : scene.Rigid =>
+  if row.rigid != scene.no_body then bodies.rigids[row.rigid] else default_static_rigid
 
 // The velocity a proxy moves with this step.
 func velocity_of (sources: #[Source]) => func (proxy: Proxy) =>
@@ -813,10 +850,10 @@ private func contact_substeps_width (substeps: U32) => func (row_array: #[F32]) 
   return base
 
 func prepare_joints (joint_list: #[joints.Joint]) => func (sources: #[Source]) => func (sc: Scene) => func (slot_of: #[F32]) =>
-  return prepare_joints_with joint_list sources sc (func (proxy: U32) : F32 =>
+  return prepare_joints_with joint_list sources (func (i: U32) : scene.Rigid => rigid_of sources[i]) sc (func (proxy: U32) : F32 =>
     if proxy < slot_of.length then slot_of[proxy] else no_slot)
 
-private func prepare_joints_with (joint_list: #[joints.Joint]) -> sources -> (sc: Scene) -> (slot_at: U32 -> F32) =>
+private func prepare_joints_with (joint_list: #[joints.Joint]) -> sources -> (rigid_at: U32 -> scene.Rigid) -> (sc: Scene) -> (slot_at: U32 -> F32) =>
   let prepared: #[joints.Link] = #[]
   for joint in joint_list:
     if joint.a < sources.length and joint.b < sources.length and joints.valid joint:
@@ -824,15 +861,15 @@ private func prepare_joints_with (joint_list: #[joints.Joint]) -> sources -> (sc
       let b = (sources.at joint.b)
       let slot_a = slot_at sc.slots[joint.a]
       let slot_b = slot_at sc.slots[joint.b]
-      let body_a = rigid_of a
-      let body_b = rigid_of b
+      let body_a = rigid_at joint.a
+      let body_b = rigid_at joint.b
       @storage.push prepared ($joints.Link { joint, a: slot_a, b: slot_b, position_a: a.position, position_b: b.position, rotation_a: a.rotation, rotation_b: b.rotation, velocity_a: body_a.linear_velocity, velocity_b: body_b.linear_velocity, angular_a: body_a.angular_velocity, angular_b: body_b.angular_velocity })
   return prepared
 
 func with_sleep_islands (config: Config) => func (dt: F32) => func (sources: #[Source]) => func (proxies: #[Proxy]) => func (movers: #[U32]) => func (connected: #[U32]) => func (inv_mass: #[F32]) => func (row_array: #[F32]) => func (new_vel: #[F32]) -> consume =>
-  return with_sleep_islands_width config dt sources proxies movers connected inv_mass row_array rigid.stride new_vel consume
+  return with_sleep_islands_width config dt (func (i: U32) : scene.Rigid => rigid_of sources[i]) proxies movers connected inv_mass row_array rigid.stride new_vel consume
 
-private func with_sleep_islands_width (config: Config) => func (dt: F32) => func sources => func proxies => func (movers: #[U32]) => func (connected: #[U32]) => func (inv_mass: #[F32]) => func (row_array: #[F32]) => func (row_width: U32) => func (new_vel: #[F32]) -> consume =>
+private func with_sleep_islands_width (config: Config) => func (dt: F32) => func (rigid_at: U32 -> scene.Rigid) => func proxies => func (movers: #[U32]) => func (connected: #[U32]) => func (inv_mass: #[F32]) => func (row_array: #[F32]) => func (row_width: U32) => func (new_vel: #[F32]) -> consume =>
   // Sleeping: islands of touching awake bodies sleep together once all of
   // them have been still for long enough.
   let m = movers.length
@@ -879,7 +916,7 @@ private func with_sleep_islands_width (config: Config) => func (dt: F32) => func
   for k in 0..m:
     if inv_mass[k] > 0.0:
       let proxy = proxies[movers[k]]
-      let body = rigid_of (sources.at proxy.source)
+      let body = rigid_at proxy.source
       let time = 0.0
       if body.can_sleep and (connected.is_empty or connected[proxy.source] == 0):
         let v = k * 6
@@ -907,9 +944,9 @@ func with_bodies (sources: #[Source]) => func (proxies: #[Proxy]) => func (mover
   let slot_of = @array.fill proxies.length no_slot
   for k in 0 .. movers.length:
     slot_of[movers[k]] := U32.to_f32 k
-  return with_body_columns sources proxies movers (func (k: U32) : Vec3 => origins[movers[k]]) velocities woke (func (own bodies) => consume bodies slot_of)
+  return with_body_columns sources (func (i: U32) : scene.Rigid => rigid_of sources[i]) proxies movers (func (k: U32) : Vec3 => origins[movers[k]]) velocities woke (func (own bodies) => consume bodies slot_of)
 
-private func with_body_columns sources -> proxies -> (movers: #[U32]) -> (origin_at: U32 -> Vec3) -> (velocities: #[Vec3]) -> (woke: #[F32]) -> consume =>
+private func with_body_columns sources -> (rigid_at: U32 -> scene.Rigid) -> proxies -> (movers: #[U32]) -> (origin_at: U32 -> Vec3) -> (velocities: #[Vec3]) -> (woke: #[F32]) -> consume =>
   let m = movers.length
   let pos = @array.fill (m * 3) 0.0
   let rot = @array.fill (m * 4) 0.0
@@ -922,7 +959,7 @@ private func with_body_columns sources -> proxies -> (movers: #[U32]) -> (origin
   for k in 0..m:
     let proxy = proxies[movers[k]]
     let source = (sources.at proxy.source)
-    let body = rigid_of source
+    let body = rigid_at proxy.source
     let origin = origin_at k
     pos[k * 3] := origin.x
     pos[k * 3 + 1] := origin.y
@@ -1044,7 +1081,10 @@ private func with_contact_rows (dt: F32) -> proxies -> (shape_at: U32 -> shapes.
 // Results for the woken dynamic bodies, in mover order, gathered by index
 // into an exactly sized array: appending records to a List one at a time
 // costs more with every append.
-func moved_results (config: Config) => func sources => func proxies => func (movers: #[U32]) => func (woke: #[F32]) => func (parent: #[U32]) => func (island_time: #[F32]) => func (still: #[F32]) => func (new_pos: #[F32]) => func (new_rot: #[F32]) => func (new_vel: #[F32]) =>
+func moved_results (config: Config) => func (sources: #[Source]) => func (proxies: #[Proxy]) => func (movers: #[U32]) => func (woke: #[F32]) => func (parent: #[U32]) => func (island_time: #[F32]) => func (still: #[F32]) => func (new_pos: #[F32]) => func (new_rot: #[F32]) => func (new_vel: #[F32]) : #[Result] =>
+  return moved_results_with config (func (i: U32) : scene.Rigid => rigid_of sources[i]) proxies movers woke parent island_time still new_pos new_rot new_vel
+
+private func moved_results_with (config: Config) => func (rigid_at: U32 -> scene.Rigid) => func proxies => func (movers: #[U32]) => func (woke: #[F32]) => func (parent: #[U32]) => func (island_time: #[F32]) => func (still: #[F32]) => func (new_pos: #[F32]) => func (new_rot: #[F32]) => func (new_vel: #[F32]) =>
   let m = movers.length
   let slots = @array.fill m 0
   let count = 0
@@ -1056,7 +1096,7 @@ func moved_results (config: Config) => func sources => func proxies => func (mov
   return @array.generate count (func (r: U32) =>
     let k = slots[r]
     let proxy = proxies[movers[k]]
-    let body = rigid_of (sources.at proxy.source)
+    let body = rigid_at proxy.source
     let root = root_of parent k
     let sleep_now = island_time[root] >= config.sleep_time
     let v = k * 6
@@ -1089,9 +1129,9 @@ func stored_capsule_of (shape: shapes.StoredShape) => case shape of
   $shapes.StoredCapsule { a, b, radius } => $Some (a, b, radius)
   _ => $Nothing
 func run_walkers (queries: scene.Queries) -> (sources: #[Source]) -> (sc: Scene) -> (dt: F32) : (shapes.Geometry, Walkers) =>
-  return run_walkers_with queries sources sc dt false
+  return run_walkers_with queries sources (func (i: U32) : scene.Rigid => rigid_of sources[i]) (func (i: U32) : Maybe Walker => sources[i].walker) sc dt false
 
-func run_walkers_with (queries: scene.Queries) -> sources -> (sc: Scene) -> (dt: F32) -> (compact: Bool) : (shapes.Geometry, Walkers) =>
+func run_walkers_with (queries: scene.Queries) -> sources -> (rigid_at: U32 -> scene.Rigid) -> (walker_at: U32 -> Maybe Walker) -> (sc: Scene) -> (dt: F32) -> (compact: Bool) : (shapes.Geometry, Walkers) =>
   let geometry = shapes.empty ()
   let np = scene.count sc
   // Copy movable payloads into `geometry`; fixed scenery stays in `sc.geometry`.
@@ -1109,10 +1149,10 @@ func run_walkers_with (queries: scene.Queries) -> sources -> (sc: Scene) -> (dt:
       if compact and not row.trigger:
         @storage.push movers i
       if row.walker:
-        if let $Some w = (sources.at row.source).walker:
+        if let $Some w = walker_at row.source:
           velocities[i] := w.velocity
       else:
-        velocities[i] := (rigid_of (sources.at row.source)).linear_velocity
+        velocities[i] := (rigid_at row.source).linear_velocity
     if row.walker and not row.trigger:
       @storage.push walkers i
     if row.walker or row.kind == scene.kind_dynamic:
@@ -1143,7 +1183,7 @@ func run_walkers_with (queries: scene.Queries) -> sources -> (sc: Scene) -> (dt:
   for i in walkers:
     let row = proxies[i]
     let source = (sources.at proxies[i].source)
-    if let $Some walker = source.walker:
+    if let $Some walker = walker_at proxies[i].source:
       if let $Some (a, b, radius) = stored_capsule_of proxies[i].shape:
         let body = $character.Body { low: a - source.position, high: b - source.position, radius }
         let filter = $scene.Filter { mask: proxies[i].mask, skip: proxies[i].id, triggers: false, walkers: false, dynamics: true }
@@ -1155,7 +1195,7 @@ func run_walkers_with (queries: scene.Queries) -> sources -> (sc: Scene) -> (dt:
           let platform = proxies[under]
           if platform.kind != scene.kind_static:
             let origin = (sources.at platform.source).position
-            let angular = if platform.kind >= scene.kind_kinematic and not platform.walker then (rigid_of (sources.at platform.source)).angular_velocity else math.zero3
+            let angular = if platform.kind >= scene.kind_kinematic and not platform.walker then (rigid_at platform.source).angular_velocity else math.zero3
             carry := (velocities[under] + angular.cross (source.position - origin)) * dt
         let motion_hits: #[scene.Hit] = #[]
         let moved = character.move_queries motion_hits queries body filter source.position walker carry dt
@@ -1223,14 +1263,14 @@ func extend_walkers_with (walk: own Walkers) -> sources -> (sc: Scene) -> (compa
 // A solve reads one cache bank and writes the next contacts into the other;
 // the caller swaps `first_active` when solved.
 func simulate_queries_into (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[Source]) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
-  return simulate_queries_with queries joint_list config dt sources sc cache results
+  return simulate_queries_with queries joint_list config dt sources (func (i: U32) : scene.Rigid => rigid_of sources[i]) (func (i: U32) : Maybe Walker => sources[i].walker) sc cache results
 
-private func simulate_queries_with (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> sources -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
+private func simulate_queries_with (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> sources -> (rigid_at: U32 -> scene.Rigid) -> (walker_at: U32 -> Maybe Walker) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
   if not (dt > 0.0 and dt - dt == 0.0):
     @storage.truncate results 0
     return (false, cache, results)
-  let (geometry, walk) = run_walkers_with queries sources sc dt true
-  return simulate_walked_columns queries joint_list config dt sources sc cache results geometry walk sc.proxies.length (shapes.read sc.geometry) true
+  let (geometry, walk) = run_walkers_with queries sources rigid_at walker_at sc dt true
+  return simulate_walked_columns queries joint_list config dt sources rigid_at sc cache results geometry walk sc.proxies.length (shapes.read sc.geometry) true
 
 // `walk` must be the controller pass for this scene's current proxy prefix,
 // with any fixed-only suffix added through extend_walkers.
@@ -1239,16 +1279,16 @@ func simulate_walked_into (queries: scene.Queries) -> (joint_list: #[joints.Join
 
 // Prepared worlds keep selected fixed rows pointing into their immutable pools.
 func simulate_walked_with_fixed (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[Source]) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) -> (compact: Bool) : (Bool, CacheAccess, #[Result]) =>
-  return simulate_walked_columns queries joint_list config dt sources sc cache results geometry walk fixed_first fixed_geometry compact
+  return simulate_walked_columns queries joint_list config dt sources (func (i: U32) : scene.Rigid => rigid_of sources[i]) sc cache results geometry walk fixed_first fixed_geometry compact
 
-func simulate_prepared_rows (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[scene.SourceRow]) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) : (Bool, CacheAccess, #[Result]) =>
-  return simulate_walked_columns queries joint_list config dt sources sc cache results geometry walk fixed_first fixed_geometry true
+func simulate_prepared_rows (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[scene.SourceRow]) -> (rigid_at: U32 -> scene.Rigid) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) : (Bool, CacheAccess, #[Result]) =>
+  return simulate_walked_columns queries joint_list config dt sources rigid_at sc cache results geometry walk fixed_first fixed_geometry true
 
-private func simulate_walked_columns (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> sources -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) -> (compact: Bool) : (Bool, CacheAccess, #[Result]) =>
+private func simulate_walked_columns (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> sources -> (rigid_at: U32 -> scene.Rigid) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) -> (compact: Bool) : (Bool, CacheAccess, #[Result]) =>
   if not (dt > 0.0 and dt - dt == 0.0):
     @storage.truncate results 0
     return (false, cache, results)
-  let (fresh, carried, next_results) = solve_walked_with_fixed queries joint_list config dt sources sc (read_cache cache) geometry walk results fixed_first fixed_geometry compact
+  let (fresh, carried, next_results) = solve_walked_with_fixed queries joint_list config dt sources rigid_at sc (read_cache cache) geometry walk results fixed_first fixed_geometry compact
   if cache.first_active:
     cache.second := merge_contacts_into (&fresh[0..fresh.length]) (&carried[0..carried.length]) self
   else:
@@ -1259,9 +1299,9 @@ func swap_cache (solved: Bool) -> (step: own StepAccess) : StepAccess =>
     step.cache.first_active := not self
   return step
 func solve_walked_into (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[Source]) -> (sc: Scene) -> (cache: Cache) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (results: own #[Result]) : (#[CachedContact], #[CachedContact], #[Result]) =>
-  return solve_walked_with_fixed queries joint_list config dt sources sc cache geometry walk results sc.proxies.length (shapes.read sc.geometry) false
+  return solve_walked_with_fixed queries joint_list config dt sources (func (i: U32) : scene.Rigid => rigid_of sources[i]) sc cache geometry walk results sc.proxies.length (shapes.read sc.geometry) false
 
-private func solve_walked_with_fixed (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> sources -> (sc: Scene) -> (cache: Cache) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (results: own #[Result]) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) -> (compact: Bool) : (#[CachedContact], #[CachedContact], #[Result]) =>
+private func solve_walked_with_fixed (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> sources -> (rigid_at: U32 -> scene.Rigid) -> (sc: Scene) -> (cache: Cache) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (results: own #[Result]) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) -> (compact: Bool) : (#[CachedContact], #[CachedContact], #[Result]) =>
   @storage.truncate results 0
   let np = scene.count sc
   if walk.proxies.length != np:
@@ -1279,14 +1319,14 @@ private func solve_walked_with_fixed (queries: scene.Queries) -> (joint_list: #[
   for i in movers:
     let p = walk_proxies[i]
     if p.kind == scene.kind_dynamic and not p.trigger:
-      if (not connected.is_empty and connected[p.source] > 0) or not (rigid_of (sources.at p.source)).sleeping:
+      if (not connected.is_empty and connected[p.source] > 0) or not (rigid_at p.source).sleeping:
         awake[i] := 1.0
   // Sweep each fast body's inscribed sphere against immovable colliders.
   for k in 0 .. m:
     let i = movers[k]
     let origin_slot = if compact then k else i
     if walk_proxies[i].kind == scene.kind_dynamic and awake[i] > 0.0 and not walk_proxies[i].trigger:
-      let body = rigid_of (sources.at walk_proxies[i].source)
+      let body = rigid_at walk_proxies[i].source
       if body.continuous:
         let delta = velocities[i] * dt
         let travel = delta.length
@@ -1384,14 +1424,14 @@ private func solve_walked_with_fixed (queries: scene.Queries) -> (joint_list: #[
       dense_slots[movers[k]] := U32.to_f32 k
   let slot_at = func (i: U32) : F32 =>
     if i < dense_slots.length then dense_slots[i] else sparse_mover_slot movers i
-  let (fresh, carried, walker_results, bodies_moved) = with_body_columns sources proxies movers (func (k: U32) : Vec3 => origins[if compact then k else movers[k]]) velocities woke (func (own bodies) =>
+  let (fresh, carried, walker_results, bodies_moved) = with_body_columns sources rigid_at proxies movers (func (k: U32) : Vec3 => origins[if compact then k else movers[k]]) velocities woke (func (own bodies) =>
     let (row_array, imp_array, row_a_ids, row_b_ids, iw) = with_contact_rows dt proxies shape_at velocities woke by_id candidates bodies slot_at cache rigid.compact_stride
     let substeps = contact_substeps_width config.substeps row_array rigid.compact_stride bodies.inv_mass bodies.pos
-    let prepared = prepare_joints_with joint_list sources sc slot_at
+    let prepared = prepare_joints_with joint_list sources rigid_at sc slot_at
     let $rigid.Bodies {pos, rot, vel, inv_mass, inv_inertia, gravity_scale, linear_damping, angular_damping} = bodies
     let dynamics = $rigid.Dynamics {inv_mass, inv_inertia, gravity_scale, linear_damping, angular_damping}
     let (new_pos, new_rot, new_vel, solved) = rigid.solve_initialized prepared dt substeps config.gravity dynamics row_array rigid.compact_stride pos rot vel imp_array iw
-    return with_sleep_islands_width config dt sources proxies movers connected inv_mass row_array rigid.compact_stride new_vel (func parent -> still -> island_time =>
+    return with_sleep_islands_width config dt rigid_at proxies movers connected inv_mass row_array rigid.compact_stride new_vel (func parent -> still -> island_time =>
       let count = row_array.length / rigid.compact_stride
       // Merge solved and unchanged sleeping contacts in exact U32 id order.
       let fresh = @array.generate count (func (c: U32) =>
@@ -1419,7 +1459,7 @@ private func solve_walked_with_fixed (queries: scene.Queries) -> (joint_list: #[
           kept_rows[kept] := r
           kept := self + 1
       let carried = @array.generate kept (func (r: U32) => cache.contacts[kept_rows[r]])
-      let bodies_moved = moved_results config sources proxies movers woke parent island_time still new_pos new_rot new_vel
+      let bodies_moved = moved_results_with config rigid_at proxies movers woke parent island_time still new_pos new_rot new_vel
       let walker_slots: #[U32] = #[]
       if not compact:
         for i in 0 .. np:
@@ -1461,26 +1501,26 @@ func merge_contacts_into (a: &[CachedContact]) -> (b: &[CachedContact]) -> (dest
       @storage.push destination b[j]
       j := self + 1
   return destination
-func run_step_queries (source_rows: &[scene.SourceRow]) -> (geometry: shapes.Geometry) -> (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
-  return simulate_queries_with (scene.queries sc) links config dt source_rows sc cache results
-func run_rebuilt_queries (source_rows: &[scene.SourceRow]) -> (geometry: shapes.Geometry) -> (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
+func run_step_queries (source_rows: &[scene.SourceRow]) -> (bodies: scene.BodiesRead) -> (geometry: shapes.Geometry) -> (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
+  return simulate_queries_with (scene.queries sc) links config dt source_rows (func (i: U32) : scene.Rigid => rigid_of_row bodies source_rows[i]) (func (i: U32) : Maybe Walker => scene.row_walker bodies source_rows[i]) sc cache results
+func run_rebuilt_queries (source_rows: &[scene.SourceRow]) -> (bodies: scene.BodiesRead) -> (geometry: shapes.Geometry) -> (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
   if not (dt > 0.0 and is_finite dt):
     @storage.truncate results 0
     return (false, cache, results)
-  let built = scene.build_source_rows (scene.empty ()) geometry source_rows
-  return simulate_queries_with (scene.queries built) links config dt source_rows built cache results
+  let built = scene.build_source_rows (scene.empty ()) geometry bodies source_rows
+  return simulate_queries_with (scene.queries built) links config dt source_rows (func (i: U32) : scene.Rigid => rigid_of_row bodies source_rows[i]) (func (i: U32) : Maybe Walker => scene.row_walker bodies source_rows[i]) built cache results
 func simulate_joints_into (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (step: own StepAccess) -> (sc: Scene) : StepAccess =>
-  let $StepAccess { sources: source_rows, geometry, cache, results } = step
-  let (solved, cache, results) = run_step_queries (&source_rows[0..source_rows.length]) geometry links config dt sc cache results
-  return swap_cache solved ($StepAccess { sources: source_rows, geometry, cache, results })
+  let $StepAccess { sources: source_rows, bodies, geometry, cache, results } = step
+  let (solved, cache, results) = run_step_queries (&source_rows[0..source_rows.length]) (scene.read_bodies bodies) geometry links config dt sc cache results
+  return swap_cache solved ($StepAccess { sources: source_rows, bodies, geometry, cache, results })
 func simulate_into (config: Config) -> (dt: F32) -> (step: own StepAccess) -> (sc: Scene) : StepAccess => return
   simulate_joints_into #[] config dt step sc
 // Convenience construction stays invocation-local. Persistent sources, cache
 // banks and results retain the exact caller-named owners across every tick.
 func simulate_rebuilt_into (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (step: own StepAccess) : StepAccess =>
-  let $StepAccess { sources: source_rows, geometry, cache, results } = step
-  let (solved, cache, results) = run_rebuilt_queries (&source_rows[0..source_rows.length]) geometry links config dt cache results
-  return swap_cache solved ($StepAccess { sources: source_rows, geometry, cache, results })
+  let $StepAccess { sources: source_rows, bodies, geometry, cache, results } = step
+  let (solved, cache, results) = run_rebuilt_queries (&source_rows[0..source_rows.length]) (scene.read_bodies bodies) geometry links config dt cache results
+  return swap_cache solved ($StepAccess { sources: source_rows, bodies, geometry, cache, results })
 func step_joints_into (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (step: own StepAccess) : StepAccess => return
   apply_into (simulate_rebuilt_into links config dt step)
 func step_into (config: Config) -> (dt: F32) -> (step: own StepAccess) : StepAccess => step_joints_into #[] config dt step
