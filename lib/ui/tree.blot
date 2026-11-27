@@ -753,66 +753,94 @@ func properties (node: StoredNode) => $Authored {id: node.id, parent: node.paren
   role: node.role, actions: node.actions, focusable: node.focusable, hidden: node.hidden,
   disabled: node.disabled, modal: node.modal, selected: node.selected}
 func topology (revision: U32) -> (nodes: &[StoredNode]) -> (stored: own Topology) : Topology =>
-  let $Topology { modal, keys, key_order, parents: prev_parents, depth: prev_depth, order: prev_order, child_starts: prev_child_starts, child_targets: prev_child_targets } = stored
-  let ids: #[U32] = array.fill nodes.length 0
+  let $Topology { modal, keys, key_order, parents, depth, order, child_starts: prev_child_starts, child_targets: prev_child_targets } = stored
+  let n = nodes.length
+  @storage.truncate keys 0
+  @storage.reserve keys n
   let dense = true
-  for i in 0 .. nodes.length:
+  for i in 0 .. n:
     let id = nodes[i].id
-    ids[i] := id
+    @storage.push keys id
     dense := self and id == i + 1
-  let sorted_ids = if dense then array.generate nodes.length identity else sort.order_u32 ids
-  let parents: #[U32] = array.fill nodes.length nodes.length
+  @storage.truncate key_order 0
   if dense:
-    for i in 0 .. nodes.length:
-      let id = nodes[i].parent
-      if id > 0 and id <= nodes.length:
-        parents[i] := id - 1
+    @storage.reserve key_order n
+    for i in 0 .. n:
+      @storage.push key_order i
   else:
-    let table = $lookup.Keys { values: ids, order: sorted_ids }
-    for i in 0 .. nodes.length:
-      parents[i] := Maybe.unwrap_or nodes.length (lookup.find table nodes[i].parent)
-  let next_keys = replace ids keys
-  let next_order = replace sorted_ids key_order
-  let depth: #[U32] = array.fill nodes.length 0
-  for i in 0 .. nodes.length:
+    let sorted_ids = sort.order_u32 keys
+    @storage.extend key_order sorted_ids
+  @storage.truncate parents 0
+  @storage.reserve parents n
+  if dense:
+    for i in 0 .. n:
+      let id = nodes[i].parent
+      @storage.push parents (if id > 0 and id <= n then id - 1 else n)
+  else:
+    for i in 0 .. n:
+      let target = nodes[i].parent
+      let low: U32 = 0
+      let high = n
+      for 0 .. 32:
+        if low >= high:
+          break
+        let mid = low + (high - low) / 2
+        if keys[key_order[mid]] < target:
+          low := mid + 1
+        else:
+          high := mid
+      let found = if low < n and keys[key_order[low]] == target then key_order[low] else n
+      @storage.push parents found
+  @storage.truncate depth 0
+  @storage.reserve depth n
+  let depth_sorted = true
+  let prev_d: U32 = 0
+  for i in 0 .. n:
     let parent = parents[i]
+    let d: U32 = 0
     if nodes[i].parent == 0:
-      depth[i] := 1
+      d := 1
     else:
       if parent < i:
-        let d = depth[parent]
-        depth[i] := if d > 0 and d < 64 then d + 1 else 0
+        let pd = depth[parent]
+        d := if pd > 0 and pd < 64 then pd + 1 else 0
       else:
         let at = i
-        let d: U32 = 0
         for step in 0 .. 64:
           if nodes[at].parent == 0:
             d := step + 1
             break
           at := parents[at]
-          if at == nodes.length:
+          if at == n:
             break
-        depth[i] := d
-  let edge_from: #[U32] = @storage.with_capacity nodes.length
-  let edge_to: #[U32] = @storage.with_capacity nodes.length
-  for i in 0 .. nodes.length:
-    if nodes[i].parent != 0 and parents[i] < nodes.length:
+    if i > 0 and d < prev_d:
+      depth_sorted := false
+    prev_d := d
+    @storage.push depth d
+  let edge_from: #[U32] = @storage.with_capacity n
+  let edge_to: #[U32] = @storage.with_capacity n
+  for i in 0 .. n:
+    if nodes[i].parent != 0 and parents[i] < n:
       @storage.push edge_from parents[i]
       @storage.push edge_to i
-  let (built, child_starts, child_targets) = graph.from_edges nodes.length edge_from edge_to prev_child_starts prev_child_targets
+  let (built, child_starts, child_targets) = graph.from_edges n edge_from edge_to prev_child_starts prev_child_targets
   if not built:
     return panic "UI topology edge invariant"
-  let next_parents = replace parents prev_parents
-  let next_depth = replace depth prev_depth
-  let next_order_u32 = replace (sort.order_u32 depth) prev_order
+  @storage.truncate order 0
+  if depth_sorted:
+    @storage.reserve order n
+    for i in 0 .. n:
+      @storage.push order i
+  else:
+    @storage.extend order (sort.order_u32 depth)
   return $Topology {
     revision,
     modal,
-    keys: next_keys,
-    key_order: next_order,
-    parents: next_parents,
-    depth: next_depth,
-    order: next_order_u32,
+    keys,
+    key_order,
+    parents,
+    depth,
+    order,
     child_starts,
     child_targets,
   }
