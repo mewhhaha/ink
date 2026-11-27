@@ -1327,7 +1327,7 @@ fn srgb_encode(light: vec3f) -> vec3f {{
     shade = 1.0;
   }} else {{
     shade *= max(0.38, 1.0 - length(in.dir) / 1800.0);
-    shade = floor(shade * 24.0) / 24.0;
+    shade = floor((0.10 + shade * 0.90) * 24.0) / 24.0;
   }}
   let texel = in.rect.xy + clamp(floor(local * in.rect.zw), vec2f(0.0), in.rect.zw - vec2f(1.0));
   let sample_color = textureLoad(atlas_tex, vec2i(texel), 0);
@@ -1736,7 +1736,7 @@ fn srgb_encode(light: vec3f) -> vec3f {
 @fragment fn fragment(in: Out) -> @location(0) vec4f {
   let local = clamp(in.uv, vec2f(0.0), vec2f(0.9999));
   var shade = in.light * max(0.38, 1.0 - length(in.dir) / 1800.0);
-  shade = floor(shade * 24.0) / 24.0;
+  shade = floor((0.10 + shade * 0.90) * 24.0) / 24.0;
   let texel = in.rect.xy + clamp(floor(local * in.rect.zw), vec2f(0.0), in.rect.zw - vec2f(1.0));
   let sample_color = textureLoad(atlas_tex, vec2i(texel), 0);
   if (sample_color.a < 0.5) {
@@ -1774,7 +1774,7 @@ struct Out {
   let c = corners[v];
   let mode = s.parameters.x;
   var px: vec2f;
-  if (mode >= 1.5) {
+  if (mode == 2.0) {
     let a = s.rect.xy;
     let b = s.rect.zw;
     let d = b - a;
@@ -1794,12 +1794,16 @@ fn srgb_encode(light: vec3f) -> vec3f {
 }
 
 @fragment fn fragment(in: Out) -> @location(0) vec4f {
-  if (in.mode < 0.5 || in.mode >= 1.5) {
+  if (in.mode == 0.0 || in.mode == 2.0) {
     return in.color;
   }
   let texel = in.rect.xy + clamp(floor(in.uv * in.rect.zw), vec2f(0.0), in.rect.zw - vec2f(1.0));
   let sample_color = textureLoad(atlas, vec2i(texel), 0);
-  return vec4f(srgb_encode(sample_color.rgb) * in.color.rgb, sample_color.a * in.color.a);
+  var rgb = srgb_encode(sample_color.rgb);
+  if (in.mode == 3.0) {
+    rgb = vec3f(min(1.0, max(rgb.r, max(rgb.g, rgb.b)) * 1.3));
+  }
+  return vec4f(rgb * in.color.rgb, sample_color.a * in.color.a);
 }
 "#;
 
