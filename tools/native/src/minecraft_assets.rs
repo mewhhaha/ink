@@ -1,5 +1,4 @@
-//! Asset and shader generation for the 1:1 Mini Minecraft Pen WebGPU demo
-//! (matching Goose's `30_mini_minecraft.goose` atlas, shaders, and HUD).
+//! Asset and shader generation for the Mini Minecraft Pen WebGPU demo.
 
 use anyhow::Result;
 use flate2::{Compression, write::ZlibEncoder};
@@ -80,21 +79,6 @@ fn hash3(x: i32, y: i32, z: i32, seed: u32) -> u32 {
 }
 
 fn atlas_pixel(tile: usize, x: i32, y: i32) -> [u8; 4] {
-    if tile == 15 {
-        // Two eight-pixel masks in the last tile. The HUD applies their tint.
-        const HEART: [u8; 7] = [0x66, 0xff, 0xff, 0x7e, 0x3c, 0x18, 0x18];
-        const LOAF: [u8; 7] = [0x00, 0x3c, 0x6e, 0xd7, 0xff, 0x7e, 0x3c];
-        let mask = if x < 8 { HEART } else { LOAF };
-        let alpha = if mask
-            .get(y as usize)
-            .is_some_and(|row| row & (0x80 >> (x % 8)) != 0)
-        {
-            255
-        } else {
-            0
-        };
-        return [255, 255, 255, alpha];
-    }
     let mut color = TILE_COLOR[tile];
     let mut grain = (hash3(x, tile as i32, y, 71) % 27) as i32 - 13;
     if tile == 1 && y < 3 + (hash3(x / 2, 0, 0, 8) % 3) as i32 {
@@ -171,6 +155,103 @@ fn generate_atlas_png() -> Result<Vec<u8>> {
         }
     }
     encode_rgba_png(width, height, &pixels)
+}
+
+const HEART: [&[u8; 9]; 9] = [
+    b".00...00.",
+    b"0420.0210",
+    b"043202310",
+    b"023333320",
+    b".0333320.",
+    b"..02320..",
+    b"...020...",
+    b"....0....",
+    b".........",
+];
+const BERRIES: [&[u8; 9]; 9] = [
+    b".....00..",
+    b"....0450.",
+    b"...04550.",
+    b".00.050..",
+    b"0420200..",
+    b"03304320.",
+    b".0203330.",
+    b"..0.020..",
+    b".....0...",
+];
+const HEART_COLORS: [[u8; 3]; 6] = [
+    [27, 13, 21],
+    [143, 27, 52],
+    [180, 30, 52],
+    [233, 51, 56],
+    [255, 191, 167],
+    [255, 191, 167],
+];
+const BERRY_COLORS: [[u8; 3]; 6] = [
+    [31, 21, 15],
+    [136, 63, 26],
+    [159, 77, 32],
+    [224, 133, 49],
+    [255, 207, 114],
+    [151, 169, 87],
+];
+
+fn meter_pixel(code: u8, filled: bool, palette: &[[u8; 3]; 6]) -> [u8; 4] {
+    if code == b'.' {
+        return [0; 4];
+    }
+    let [r, g, b] = if filled || code == b'0' {
+        palette[(code - b'0') as usize]
+    } else {
+        [57, 49, 51]
+    };
+    [r, g, b, 255]
+}
+
+fn slot_pixel(x: usize, y: usize, selected: bool) -> [u8; 4] {
+    let edge = x.min(23 - x).min(y).min(23 - y);
+    if edge == 0 && (x == 0 || x == 23) && (y == 0 || y == 23) {
+        return [0; 4];
+    }
+    match (selected, edge) {
+        (true, 0) => [46, 51, 47, 255],
+        (true, 1) => [232, 234, 207, 255],
+        (true, 2) => [139, 156, 136, 255],
+        (false, 0) => [45, 43, 42, 255],
+        (false, 1) if x == 1 || y == 1 => [131, 124, 114, 255],
+        (false, 1) => [86, 81, 77, 255],
+        (_, 2) => [49, 46, 43, 230],
+        _ => [30, 28, 26, 154],
+    }
+}
+
+fn generate_hud_png() -> Result<Vec<u8>> {
+    const WIDTH: usize = 80;
+    const HEIGHT: usize = 24;
+    let mut pixels = vec![0; WIDTH * HEIGHT * 4];
+    let mut set = |x, y, pixel: [u8; 4]| {
+        let offset = (y * WIDTH + x) * 4;
+        pixels[offset..offset + 4].copy_from_slice(&pixel);
+    };
+
+    // Empty, half and full meter sprites, then ordinary and selected slots.
+    for (row, shape, colors) in [(0, HEART, &HEART_COLORS), (10, BERRIES, &BERRY_COLORS)] {
+        for (y, line) in shape.into_iter().enumerate() {
+            for (x, &code) in line.iter().enumerate() {
+                let filled_half = if row == 0 { x < 5 } else { x >= 4 };
+                set(x, row + y, meter_pixel(code, false, colors));
+                set(x + 10, row + y, meter_pixel(code, filled_half, colors));
+                set(x + 20, row + y, meter_pixel(code, true, colors));
+            }
+        }
+    }
+    for y in 0..24 {
+        for x in 0..24 {
+            set(x + 32, y, slot_pixel(x, y, false));
+            set(x + 56, y, slot_pixel(x, y, true));
+        }
+    }
+    encode_rgba_png(WIDTH as u32, HEIGHT as u32, &pixels)
 }
 
 fn generate_screen_quad_mesh_json() -> String {
@@ -692,6 +773,7 @@ fn srgb_encode(light: vec3f) -> vec3f {
 
 pub fn write_mini_minecraft_assets(assets_dir: &Path) -> Result<()> {
     std::fs::write(assets_dir.join("atlas.png"), generate_atlas_png()?)?;
+    std::fs::write(assets_dir.join("hud.png"), generate_hud_png()?)?;
     std::fs::write(
         assets_dir.join("screen_quad.mesh.json"),
         generate_screen_quad_mesh_json(),
@@ -728,6 +810,8 @@ pub fn write_mini_minecraft_assets(assets_dir: &Path) -> Result<()> {
         "lighting": "unlit",
         "blend": true
     });
+    let mut hud_art_mat = hud_mat.clone();
+    hud_art_mat["texture"] = serde_json::json!("hud.png");
     std::fs::write(
         assets_dir.join("world.material.json"),
         world_mat.to_string() + "\n",
@@ -740,10 +824,14 @@ pub fn write_mini_minecraft_assets(assets_dir: &Path) -> Result<()> {
         assets_dir.join("hud.material.json"),
         hud_mat.to_string() + "\n",
     )?;
+    std::fs::write(
+        assets_dir.join("hud_art.material.json"),
+        hud_art_mat.to_string() + "\n",
+    )?;
 
     let catalog = serde_json::json!({
         "meshes": ["screen_quad.mesh.json", "chip_quad.mesh.json"],
-        "materials": ["world.material.json", "chip.material.json", "hud.material.json"],
+        "materials": ["world.material.json", "chip.material.json", "hud.material.json", "hud_art.material.json"],
         "sounds": []
     });
     std::fs::write(
