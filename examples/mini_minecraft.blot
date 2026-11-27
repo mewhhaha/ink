@@ -64,6 +64,8 @@ private const body_height: F32 = 1.8
 private const eye_height: F32 = 1.62
 private const fixed_step: F32 = 1.0 / 120.0
 private const fov_rad: F32 = 1.15
+private const max_vital: F32 = 100.0
+private const max_berries: U32 = 16
 
 // Keycodes not listed in ink/input/keys
 private const key_f5: U32 = 0x110205
@@ -109,6 +111,10 @@ private const msg_no_save: U32 = 12
 private const msg_loaded: U32 = 13
 private const msg_made_many_planks: U32 = 14
 private const msg_made_many_lamps: U32 = 15
+private const msg_found_berries: U32 = 16
+private const msg_ate_berries: U32 = 17
+private const msg_no_berries: U32 = 18
+private const msg_full: U32 = 19
 
 type Debris is data = $Debris {
   px: F32, py: F32, pz: F32,
@@ -124,6 +130,11 @@ type RayHit is data = $RayHit {
   dist: F32,
 }
 
+type Vitals is data = $Vitals { health: F32, hunger: F32, berries: U32 }
+
+private func fresh_vitals () : Vitals =>
+  return $Vitals { health: max_vital, hunger: max_vital, berries: 0 }
+
 type McScalars is data = $McScalars {
   seed: U32,
   feet_x: F32, feet_y: F32, feet_z: F32,
@@ -132,6 +143,7 @@ type McScalars is data = $McScalars {
   grounded: Bool,
   tool: U32,
   selected: U32,
+  vitals: Vitals,
   day_time: F32,
   elapsed: F32,
   accumulator: F32,
@@ -165,6 +177,7 @@ type McScalars is data = $McScalars {
   save_tool: U32,
   save_selected: U32,
   save_day_time: F32,
+  save_vitals: Vitals,
 }
 
 type McState = {
@@ -503,6 +516,7 @@ private func generate_world (world: own McState) -> (seed: U32) : McState =>
   s.grounded := false
   s.tool := 0
   s.selected := 0
+  s.vitals := fresh_vitals ()
   s.day_time := 90.0
   s.elapsed := 0.0
   s.accumulator := 0.0
@@ -636,6 +650,8 @@ private func step_walk (blocks: &[U32]) -> (s: McScalars) -> (ix: F32) -> (iy: F
   out.feet_z := z3
   out.vel_y := vy_final
   out.grounded := grounded
+  if grounded and not swimming and vy < (0.0 - 14.0):
+    out.vitals.health := max 0.0 (s.vitals.health - (0.0 - vy - 14.0) * 5.0)
   return out
 
 private func cast_ray (blocks: &[U32]) -> (origin: Vec3) -> (dir: Vec3) -> (reach: F32) : RayHit =>
@@ -685,6 +701,28 @@ private func with_msg (s: McScalars) -> (id: U32) -> (count: U32) : McScalars =>
   out.msg_id := id
   out.msg_count := count
   out.msg_time := 4.0
+  return out
+
+private func spend_energy (vitals: Vitals) -> (dt: F32) -> (moving: Bool) -> (running: Bool) : Vitals =>
+  let v = vitals
+  let rate: F32 = if moving then (if running then 1.8 else 0.9) else 0.22
+  v.hunger := max 0.0 (v.hunger - rate * dt)
+  if v.hunger == 0.0:
+    v.health := max 0.0 (v.health - 4.0 * dt)
+  else:
+    if v.hunger >= 75.0 and v.health < max_vital and v.health > 0.0:
+      v.health := min max_vital (v.health + 2.0 * dt)
+      v.hunger := v.hunger - 0.6 * dt
+  return v
+
+private func eat_berries (s: McScalars) : McScalars =>
+  if s.vitals.berries == 0:
+    return with_msg s msg_no_berries 0
+  if s.vitals.hunger == max_vital:
+    return with_msg s msg_full 0
+  let out = with_msg s msg_ate_berries 0
+  out.vitals.berries := out.vitals.berries - 1
+  out.vitals.hunger := min max_vital (out.vitals.hunger + 24.0)
   return out
 
 private func edit_block (world: own McState) -> (cx: F32) -> (cy: F32) -> (cz: F32) -> (b: U32) : McState =>
@@ -748,6 +786,13 @@ private func try_mine (world: own McState) -> (cx: F32) -> (cy: F32) -> (cz: F32
   let s = world.scalars[0]
   if slot >= slot_count or mining_seconds b s.tool <= 0.0:
     return (world, false)
+  let berries = b == blk_leaves and s.vitals.berries < max_berries and hash3_f cx cy cz s.seed % 3 == 0
+  if berries:
+    let out = with_msg s msg_found_berries 0
+    out.vitals.berries := out.vitals.berries + 1
+    world.scalars[0] := out
+    let w1 = edit_block world cx cy cz blk_air
+    return (scatter_debris w1 cx cy cz b, true)
   if world.bag[slot] >= 999:
     world.scalars[0] := with_msg s msg_stack_full 0
     return (world, false)
@@ -868,6 +913,7 @@ private func quick_save (world: own McState) : McState =>
   s.save_tool := s.tool
   s.save_selected := s.selected
   s.save_day_time := s.day_time
+  s.save_vitals := s.vitals
   world.scalars[0] := s
   return world
 
@@ -906,6 +952,7 @@ private func quick_load (world: own McState) : McState =>
   s.tool := s0.save_tool
   s.selected := s0.save_selected
   s.day_time := s0.save_day_time
+  s.vitals := s0.save_vitals
   s.accumulator := 0.0
   s.lamp_count := lcount
   s.next_debris := 0
@@ -982,6 +1029,24 @@ private func push_tile (frame: own render.FrameAccess) -> (scale: F32) -> (x: F3
     u1: (base + 15.95) / 256.0, v1: (15.95 / 16.0),
     color: col, material: mat_hud, parameters: math.vec4 1.0 0.0 0.0 0.0,
   })
+  return frame
+
+private func push_vital_icon (frame: own render.FrameAccess) -> (scale: F32) -> (x: F32) -> (y: F32) -> (atlas_x: F32) -> (fill: F32) -> (color: math.Vec4) : render.FrameAccess =>
+  @storage.push frame.sprites ($render.Sprite {
+    x: x * scale, y: y * scale, width: 20.0 * fill * scale, height: 17.5 * scale,
+    u0: atlas_x / 256.0, v0: 0.0, u1: (atlas_x + fill * 8.0) / 256.0, v1: 7.0 / 16.0,
+    color, material: mat_hud, parameters: math.vec4 1.0 0.0 0.0 0.0,
+  })
+  return frame
+
+private func push_vital_meter (frame: own render.FrameAccess) -> (scale: F32) -> (x: F32) -> (y: F32) -> (atlas_x: F32) -> (value: F32) -> (color: math.Vec4) : render.FrameAccess =>
+  let empty = math.vec4 0.19 0.16 0.16 0.94
+  for i in 0 .. 5:
+    let at = x + U32.to_f32 i * 22.0
+    let fill = clamp 0.0 1.0 (value * 5.0 / max_vital - U32.to_f32 i)
+    frame := push_vital_icon frame scale at y atlas_x 1.0 empty
+    if fill > 0.0:
+      frame := push_vital_icon frame scale at y atlas_x fill color
   return frame
 
 private func push_glyph (frame: own render.FrameAccess) -> (hud_scale: F32) -> (x: F32) -> (y: F32) -> (ch: U32) -> (col: math.Vec4) -> (size: F32) : render.FrameAccess =>
@@ -1084,6 +1149,10 @@ private func msg_text (id: U32) : Text =>
     11 => "SAVED WORLD SNAPSHOT (F9 TO LOAD)"
     12 => "NO SAVED SNAPSHOT YET - PRESS F5 FIRST"
     13 => "WORLD LOADED"
+    16 => "FOUND BERRIES - F TO EAT"
+    17 => "ATE BERRIES"
+    18 => "BREAK LEAVES TO FIND BERRIES"
+    19 => "ALREADY FULL"
     _ => ""
 
 private func build_hud (frame: own render.FrameAccess) -> (s: McScalars) -> (bag: &[U32]) -> (blocks: &[U32]) -> (hit: RayHit) -> (vp_w: F32) -> (vp_h: F32) : render.FrameAccess =>
@@ -1107,7 +1176,7 @@ private func build_hud (frame: own render.FrameAccess) -> (s: McScalars) -> (bag
     let phase: Text = if day < 0.2 then "NIGHT - LIGHT YOUR HOME" else if s.day_time > 450.0 then "DAWN" else if s.day_time > 270.0 then "DUSK - CRAFT SOME LAMPS" else if s.day_time < 150.0 then "MORNING" else "AFTERNOON"
     frame := push_text frame scale 34.0 95.0 phase col_muted 1.0
     let hx = sw - 316.0
-    frame := push_rect frame scale hx 18.0 298.0 192.0 col_panel
+    frame := push_rect frame scale hx 18.0 298.0 208.0 col_panel
     frame := push_text frame scale (hx + 14.0) 31.0 "MAKE YOURSELF AT HOME" col_gold 1.5
     frame := push_text frame scale (hx + 14.0) 58.0 "WASD WALK  /  SPACE JUMP OR SWIM" col_ink 1.0
     frame := push_text frame scale (hx + 14.0) 74.0 "SHIFT RUN  /  ARROWS LOOK" col_ink 1.0
@@ -1117,13 +1186,16 @@ private func build_hud (frame: own render.FrameAccess) -> (s: McScalars) -> (bag
     frame := push_text frame scale (hx + 14.0) 138.0 "MIDDLE CLICK PICKS MATERIAL" col_ink 1.0
     frame := push_text frame scale (hx + 14.0) 154.0 "1-8 OR WHEEL SELECT  /  C CRAFT" col_ink 1.0
     frame := push_text frame scale (hx + 14.0) 170.0 "F5 SAVE  /  F9 LOAD" col_ink 1.0
-    frame := push_text frame scale (hx + 14.0) 186.0 "ESC PAUSE  /  H HIDE HELP" col_ink 1.0
+    frame := push_text frame scale (hx + 14.0) 186.0 "F EAT BERRIES  /  R RESPAWN" col_ink 1.0
+    frame := push_text frame scale (hx + 14.0) 202.0 "ESC PAUSE  /  H HIDE HELP" col_ink 1.0
 
   // Bottom 8-slot hotbar
   let slot_w = 44.0
   let bar_w = U32.to_f32 slot_count * slot_w
   let bar_x = (sw - bar_w) * 0.5
   let bar_y = sh - 48.0
+  frame := push_vital_meter frame scale bar_x (bar_y - 22.0) 240.0 s.vitals.health (math.vec4 0.93 0.27 0.35 1.0)
+  frame := push_vital_meter frame scale (bar_x + bar_w - 108.0) (bar_y - 22.0) 248.0 s.vitals.hunger (math.vec4 0.96 0.63 0.25 1.0)
   frame := push_rect frame scale bar_x bar_y bar_w slot_w col_panel
   for i in 0 .. slot_count:
     let x = bar_x + U32.to_f32 i * slot_w
@@ -1142,7 +1214,7 @@ private func build_hud (frame: own render.FrameAccess) -> (s: McScalars) -> (bag
         frame := f_cnt
 
   // Crosshair, target block label, mining progress bar
-  if not s.crafting and not s.paused:
+  if not s.crafting and not s.paused and s.vitals.health > 0.0:
     let cx = sw * 0.5
     let cy = sh * 0.5
     frame := push_rect frame scale (cx - 7.0) (cy - 2.0) 15.0 5.0 col_panel
@@ -1198,12 +1270,16 @@ private func build_hud (frame: own render.FrameAccess) -> (s: McScalars) -> (bag
     frame := push_text frame scale (mx + 22.0) (my + 264.0) "HOLD SHIFT WITH A RECIPE TO CRAFT ALL." col_gold 1.0
     frame := push_text frame scale (mx + 22.0) (my + 280.0) "TOOLS EQUIP AUTOMATICALLY. C OR ESC CLOSES." col_muted 1.0
   else:
-    if s.paused:
+    if s.paused or s.vitals.health == 0.0:
       let px = (sw - 400.0) * 0.5
       let py = sh * 0.5 - 45.0
+      let dead = s.vitals.health == 0.0
+      let title: Text = if dead then "OUT OF HEALTH" else "PAUSED"
+      let note: Text = if dead then "PRESS R TO RESPAWN" else "CLICK OR ESC TO RESUME. F5 SAVES."
       frame := push_rect frame scale px py 400.0 90.0 col_panel
-      frame := push_centred frame scale (sw * 0.5) (sh * 0.5 - 26.0) "PAUSED" col_gold
-      frame := push_text frame scale (sw * 0.5 - 162.0) (sh * 0.5 + 4.0) "CLICK OR ESC TO RESUME. F5 SAVES." col_ink 1.5
+      frame := push_centred frame scale (sw * 0.5) (sh * 0.5 - 26.0) title col_gold
+      let tx = sw * 0.5 - U32.to_f32 note.length * 4.5
+      frame := push_text frame scale tx (sh * 0.5 + 4.0) note col_ink 1.5
 
   return frame
 
@@ -1256,6 +1332,24 @@ private func encode_packet (frame: render.FrameAccess) -> (out: own #[F32]) : #[
   return host_frame.append_frame schema (persist.requests ()) (sound.read audio) kept
     (&nodes[0..0]) (&labels[0..0]) (render.finish frame) (&service_state.outbox[0..0]) service_state out
 
+private func respawn (state: McScalars) -> (spawn: Vec3) : McScalars =>
+  let s = state
+  s.feet_x := spawn.x
+  s.feet_y := spawn.y
+  s.feet_z := spawn.z
+  s.vel_y := 0.0
+  s.grounded := false
+  s.yaw := 0.0 - 0.4
+  s.pitch := 0.0 - 0.12
+  s.vitals.health := max_vital
+  s.vitals.hunger := max_vital
+  s.paused := false
+  s.crafting := false
+  s.keys_held := 0
+  s.drag_look := false
+  s.msg_time := 0.0
+  return s
+
 private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> (vp_h: F32) -> (evs: &[events.Event]) : (McState, render.FrameAccess) =>
   let dt = clamp 0.0 0.05 raw_dt
   let w_px = if is_finite vp_w and vp_w > 1.0 then vp_w else 960.0
@@ -1265,7 +1359,7 @@ private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> 
   let sh = h_px / scale
 
   let s = world.scalars[0]
-  let was_playing = not s.paused and not s.crafting
+  let was_playing = not s.paused and not s.crafting and s.vitals.health > 0.0
   let was_crafting = s.crafting
   s.msg_time := max 0.0 (s.msg_time - dt)
 
@@ -1273,6 +1367,8 @@ private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> 
   let right_pressed = false
   let middle_pressed = false
   let e_pressed = false
+  let eat_pressed = false
+  let respawn_pressed = false
   let f5_pressed = false
   let f9_pressed = false
   let num_pressed: U32 = 99
@@ -1295,10 +1391,14 @@ private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> 
             s.crafting := false
           else:
             s.paused := not s.paused
-        if code == keys.c and not s.paused:
+        if code == keys.c and not s.paused and s.vitals.health > 0.0:
           s.crafting := not s.crafting
         if code == keys.e:
           e_pressed := true
+        if code == keys.f:
+          eat_pressed := true
+        if code == keys.r:
+          respawn_pressed := true
         if code == key_f5:
           f5_pressed := true
         if code == keys.f9:
@@ -1367,7 +1467,11 @@ private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> 
     s.mouse_right := false
     s.drag_look := false
 
-  let playing = not s.paused and not s.crafting
+  if not lost_focus and respawn_pressed and s.vitals.health == 0.0:
+    let spawn = find_spawn (&world.blocks[0..world.blocks.length]) (&world.column_top[0..world.column_top.length])
+    s := respawn s spawn
+
+  let playing = not s.paused and not s.crafting and s.vitals.health > 0.0
   if playing != was_playing:
     s.wait_for_buttons := true
   if not s.mouse_left and not s.mouse_right:
@@ -1382,7 +1486,7 @@ private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> 
 
   // Crafting interaction
   let sc0 = world.scalars[0]
-  if sc0.crafting and was_crafting:
+  if sc0.crafting and was_crafting and sc0.vitals.health > 0.0:
     let mx = (sw - 504.0) * 0.5
     let my = (sh - 300.0) * 0.5 + 78.0
     let shift_down = (sc0.keys_held & kh_shift) != 0
@@ -1395,7 +1499,9 @@ private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> 
 
   // Playing simulation
   let sc = world.scalars[0]
-  if playing and was_playing:
+  if playing and was_playing and sc.vitals.health > 0.0:
+    if eat_pressed:
+      sc := eat_berries sc
     if num_pressed < slot_count:
       sc.selected := num_pressed
     if wheel_delta != 0.0:
@@ -1423,8 +1529,14 @@ private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> 
     let acc = sc.accumulator + dt
     let steps = min 12 (F32.to_u32 (floor (acc / fixed_step)))
     let blks_view = &world.blocks[0..world.blocks.length]
+    let start_x = sc.feet_x
+    let start_z = sc.feet_z
     for st in 0 .. steps:
-      sc := step_walk blks_view sc ix iy jump run sneak
+      if sc.vitals.health > 0.0:
+        sc := step_walk blks_view sc ix iy jump run sneak
+    let moving = abs (sc.feet_x - start_x) + abs (sc.feet_z - start_z) > 0.0001
+    if sc.vitals.health > 0.0:
+      sc.vitals := spend_energy sc.vitals dt moving run
     sc.accumulator := acc - U32.to_f32 steps * fixed_step
     world.scalars[0] := sc
     world.debris := animate_debris self dt
@@ -1438,7 +1550,7 @@ private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> 
   let ahead = forward_of s2.yaw s2.pitch
   let hit = cast_ray (&world.blocks[0..world.blocks.length]) eye ahead 6.0
 
-  if playing and was_playing and not s2.wait_for_buttons:
+  if playing and was_playing and s2.vitals.health > 0.0 and not s2.wait_for_buttons:
     if middle_pressed:
       world := pick_material world hit
     let sm = world.scalars[0]
@@ -1574,7 +1686,7 @@ private func step_frame (world: own McState) -> (raw_dt: F32) -> (vp_w: F32) -> 
   @storage.push frame.vectors (math.vec4 (ahead.x / lens) (ahead.y / lens) (ahead.z / lens) aspect)
   @storage.push frame.vectors (math.vec4 right.x right.y right.z haze_w)
   @storage.push frame.vectors (math.vec4 cam_up.x cam_up.y cam_up.z 0.0)
-  let tgt_w: F32 = if hit.found and playing then sf.progress else (0.0 - 1.0)
+  let tgt_w: F32 = if hit.found and playing and sf.vitals.health > 0.0 then sf.progress else (0.0 - 1.0)
   @storage.push frame.vectors (math.vec4 hit.ax hit.ay hit.az tgt_w)
   @storage.push frame.vectors (math.vec4 sun_dir.x sun_dir.y sun_dir.z day)
   @storage.push frame.vectors (math.vec4 haze_rgb.x haze_rgb.y haze_rgb.z haze_w)
@@ -1644,7 +1756,7 @@ private func make_world () : McState =>
   let scalars: #[McScalars] = #[$McScalars {
     seed: default_seed, feet_x: 40.5, feet_y: 20.0, feet_z: 40.5, vel_y: 0.0,
     yaw: (0.0 - 0.4), pitch: (0.0 - 0.12), grounded: false,
-    tool: 0, selected: 0, day_time: 90.0, elapsed: 0.0, accumulator: 0.0,
+    tool: 0, selected: 0, vitals: fresh_vitals (), day_time: 90.0, elapsed: 0.0, accumulator: 0.0,
     lamp_count: 0, next_debris: 0,
     crafting: false, paused: false, help: false, wait_for_buttons: false,
     progress: 0.0, mining_valid: false, mining_x: 0.0, mining_y: 0.0, mining_z: 0.0,
@@ -1656,7 +1768,7 @@ private func make_world () : McState =>
     has_save: false, save_seed: default_seed,
     save_fx: 40.5, save_fy: 20.0, save_fz: 40.5, save_vy: 0.0,
     save_yaw: (0.0 - 0.4), save_pitch: (0.0 - 0.12), save_grounded: false,
-    save_tool: 0, save_selected: 0, save_day_time: 90.0,
+    save_tool: 0, save_selected: 0, save_day_time: 90.0, save_vitals: fresh_vitals (),
   }]
   return generate_world {
     scalars, blocks, column_top: cols, bag, lamps, debris, dirty_cells, saved_blocks, saved_bag,
@@ -1690,9 +1802,12 @@ private func execute (world: own McState) -> (operation: U32) -> (payload: &[F32
     @storage.push out s.day_time
     for i in 0 .. slot_count:
       @storage.push out (U32.to_f32 world.bag[i])
+    @storage.push out s.vitals.health
+    @storage.push out s.vitals.hunger
+    @storage.push out (U32.to_f32 s.vitals.berries)
     return (world, out)
   if operation == program.restore:
-    if payload.length >= 19:
+    if payload.length >= 22:
       let seed = F32.to_u32 (max 0.0 payload[0])
       world := generate_world world seed
       for i in 0 .. slot_count:
@@ -1708,6 +1823,10 @@ private func execute (world: own McState) -> (operation: U32) -> (payload: &[F32
       s.tool := min 2 (F32.to_u32 (max 0.0 payload[8]))
       s.selected := min (slot_count - 1) (F32.to_u32 (max 0.0 payload[9]))
       s.day_time := wrap_day (max 0.0 payload[10])
+      let health = if is_finite payload[19] then clamp 0.0 max_vital payload[19] else max_vital
+      let hunger = if is_finite payload[20] then clamp 0.0 max_vital payload[20] else max_vital
+      let berries = if is_finite payload[21] then F32.to_u32 (clamp 0.0 (U32.to_f32 max_berries) payload[21]) else 0
+      s.vitals := $Vitals { health, hunger, berries }
       s.full_upload_left := 2
       world.scalars[0] := s
     return (world, program.append #[1.0] outgoing)
@@ -1833,6 +1952,13 @@ io test_mini_minecraft () : #[F32] =>
     sk := step_walk bview sk 1.0 1.0 false true true
   ok := ok and sk.feet_y > 3.999 and sk.grounded and is_supported bview sk.feet_x sk.feet_y sk.feet_z
 
+  let falling = w.scalars[0]
+  falling.feet_y := 1.05
+  falling.vel_y := 0.0 - 20.0
+  falling.grounded := false
+  let landed = step_walk (&w.blocks[0..w.blocks.length]) falling 0.0 0.0 false false false
+  ok := ok and landed.grounded and landed.vitals.health < max_vital and landed.vitals.health > 0.0
+
   // Bulk crafting
   w.bag[2] := 3
   w.bag[3] := 0
@@ -1844,6 +1970,7 @@ io test_mini_minecraft () : #[F32] =>
   // Quick-save / quick-load (F5/F9)
   let sv = w.scalars[0]
   sv.day_time := 450.0
+  sv.vitals := $Vitals { health: 63.0, hunger: 48.0, berries: 2 }
   w.scalars[0] := sv
   w := quick_save w
   let saved_cs = world_checksum (&w.blocks[0..w.blocks.length])
@@ -1851,12 +1978,51 @@ io test_mini_minecraft () : #[F32] =>
   w.bag[0] := 123
   let sv2 = w.scalars[0]
   sv2.day_time := 90.0
+  sv2.vitals := fresh_vitals ()
   w.scalars[0] := sv2
   w := quick_load w
   ok := ok and world_checksum (&w.blocks[0..w.blocks.length]) == saved_cs and w.scalars[0].day_time == 450.0
+  let loaded = w.scalars[0].vitals
+  ok := ok and loaded.health == 63.0 and loaded.hunger == 48.0 and loaded.berries == 2
 
   // Frame render check
   let empty_evs: #[events.Event] = #[]
   let (_, frame) = step_frame w (1.0 / 60.0) 960.0 600.0 (&empty_evs[0..0])
   ok := ok and frame.draws.length >= 1 and frame.sprites.length > 50 and frame.fields.length == 1
+  return if ok then #[1.0, 0.0] else #[1.0, 1.0]
+
+io test_mini_minecraft_survival () : #[F32] =>
+  let resting = spend_energy (fresh_vitals ()) 1.0 false false
+  let running = spend_energy (fresh_vitals ()) 1.0 true true
+  let starving = spend_energy ($Vitals { health: 3.0, hunger: 0.0, berries: 0 }) 1.0 false false
+  let recovering = spend_energy ($Vitals { health: 60.0, hunger: 90.0, berries: 0 }) 1.0 false false
+  let ok = running.hunger < resting.hunger and resting.hunger < max_vital
+  ok := ok and starving.health == 0.0 and recovering.health == 62.0 and recovering.hunger < 90.0
+
+  let world = make_world ()
+  let seed = world.scalars[0].seed
+  let bx = 0.0
+  for x in 1 .. 20:
+    if hash3_f (U32.to_f32 x) 32.0 10.0 seed % 3 == 0:
+      bx := U32.to_f32 x
+  world := edit_block world bx 32.0 10.0 blk_leaves
+  let (gathered, found) = try_mine world bx 32.0 10.0
+  world := gathered
+  let player = world.scalars[0]
+  ok := ok and found and bx > 0.0 and player.vitals.berries == 1 and world.bag[4] == 0
+  player.vitals.hunger := 40.0
+  let fed = eat_berries player
+  ok := ok and fed.vitals.hunger == 64.0 and fed.vitals.berries == 0
+  player.vitals.health := 0.0
+  let recovered = respawn player (math.vec3 44.5 16.0 44.5)
+  ok := ok and recovered.feet_x == 44.5 and recovered.vitals.health == max_vital and recovered.vitals.hunger == max_vital
+
+  world.scalars[0] := fed
+  let empty: #[F32] = #[]
+  let snapshot: #[F32] = #[]
+  let restored_status: #[F32] = #[]
+  let (saved_world, payload) = execute world program.snapshot (&empty[0..0]) snapshot
+  let (restored, _) = execute saved_world program.restore (&payload[0..payload.length]) restored_status
+  let v = restored.scalars[0].vitals
+  ok := ok and v.hunger == 64.0 and v.health == max_vital and v.berries == 0
   return if ok then #[1.0, 0.0] else #[1.0, 1.0]

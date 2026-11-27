@@ -80,8 +80,8 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
     PenDemoSpec {
         slug: "mini_minecraft",
         title: "Mini Minecraft — Voxel Sandbox",
-        summary: "80×40×80 deterministic voxel world with caves, trees, lake, day/night cycle, glowing lamps, 8-slot hotbar, crafting, and F5/F9 snapshots.",
-        controls: "Click viewport for mouse look (Esc/C releases), WASD walk, Space jump/swim, Shift run, Ctrl ledge-sneak, Left mine, Right/E place, 1–8/wheel slot, C craft, F5/F9 save/load, H help.",
+        summary: "Deterministic voxel world with caves, trees, a day/night cycle, crafting, and survival meters.",
+        controls: "Click for mouse look. WASD walk, Space jump/swim, Shift run, Ctrl sneak, Left mine, Right/E place, 1–8/wheel select, C craft. Break leaves to find berries, F eat, R respawn, F5/F9 save/load, H help.",
         file: "examples/mini_minecraft.blot",
         companions: &[],
         assets: DemoAssets::MiniMinecraft,

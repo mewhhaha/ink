@@ -80,6 +80,21 @@ fn hash3(x: i32, y: i32, z: i32, seed: u32) -> u32 {
 }
 
 fn atlas_pixel(tile: usize, x: i32, y: i32) -> [u8; 4] {
+    if tile == 15 {
+        // Two eight-pixel masks in the last tile. The HUD applies their tint.
+        const HEART: [u8; 7] = [0x66, 0xff, 0xff, 0x7e, 0x3c, 0x18, 0x18];
+        const LOAF: [u8; 7] = [0x00, 0x3c, 0x6e, 0xd7, 0xff, 0x7e, 0x3c];
+        let mask = if x < 8 { HEART } else { LOAF };
+        let alpha = if mask
+            .get(y as usize)
+            .is_some_and(|row| row & (0x80 >> (x % 8)) != 0)
+        {
+            255
+        } else {
+            0
+        };
+        return [255, 255, 255, alpha];
+    }
     let mut color = TILE_COLOR[tile];
     let mut grain = (hash3(x, tile as i32, y, 71) % 27) as i32 - 13;
     if tile == 1 && y < 3 + (hash3(x / 2, 0, 0, 8) % 3) as i32 {
