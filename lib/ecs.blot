@@ -449,17 +449,27 @@ private func put_raw_slow (pool: own Pool a) -> (id: U32) -> (value: a) : Pool a
 // Internal/persistence insert that skips the live-entity check (historical
 // snapshots may restore despawned rows within the saved entity extent).
 func put_raw_row (pool: own Pool a) -> (id: U32) -> (value: a) : Pool a =>
-  if pool.flags == 0 and id < pool.extent:
-    pool.values[id] := value
-    return pool
+  if pool.flags == 0:
+    if id < pool.extent:
+      pool.values[id] := value
+      return pool
+    if id == pool.extent:
+      let $Pool { extent, flags, meta, values } = pool
+      @storage.push values value
+      return $Pool { extent: extent + 1, flags, meta, values }
   return put_raw_slow pool id value
 
 func put_row (alive: Entities) -> (pool: own Pool a) -> (id: U32) -> (value: a) : Pool a =>
   if not (live alive id):
     return panic "insert requires a live entity"
-  if pool.flags == 0 and id < pool.extent:
-    pool.values[id] := value
-    return pool
+  if pool.flags == 0:
+    if id < pool.extent:
+      pool.values[id] := value
+      return pool
+    if id == pool.extent:
+      let $Pool { extent, flags, meta, values } = pool
+      @storage.push values value
+      return $Pool { extent: extent + 1, flags, meta, values }
   return put_raw_slow pool id value
 
 func set_extent (pool: own Pool a) -> (target: U32) : Pool a =>
@@ -795,7 +805,8 @@ func indices (alive: Entities) -> pool : #[U32] =>
   let a_words = alive.words
   let flags = pool.flags
   if flags == 0:
-    let selected: #[U32] = @storage.with_capacity limit
+    let selected = @array.fill limit 0
+    let out: U32 = 0
     let full = limit >> 6
     for wi in 0 .. full:
       let w = a_words[wi]
@@ -804,12 +815,14 @@ func indices (alive: Entities) -> pool : #[U32] =>
       let base = wi << 6
       if U64.eq w all64:
         for b in 0 .. 64:
-          @storage.push selected (base + b)
+          selected[out + b] := base + b
+        out := self + 64
       else:
         for 0 .. 64:
           if U64.eq w zero64:
             break
-          @storage.push selected (base + ctz64 w)
+          selected[out] := base + ctz64 w
+          out := self + 1
           w := U64.bit_and self (U64.sub self one64)
     let rem = limit & 63
     if rem > 0:
@@ -819,8 +832,11 @@ func indices (alive: Entities) -> pool : #[U32] =>
       for 0 .. 64:
         if U64.eq w zero64:
           break
-        @storage.push selected (base + ctz64 w)
+        selected[out] := base + ctz64 w
+        out := self + 1
         w := U64.bit_and self (U64.sub self one64)
+    if out < limit:
+      @storage.truncate selected out
     return selected
   let p_live = pool.meta.at 0
   if p_live == 0:
