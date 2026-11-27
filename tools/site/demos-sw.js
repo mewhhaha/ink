@@ -12,6 +12,7 @@ function isAllowedDemoPath(rel) {
     rel.endsWith('/catalog.json') ||
     rel.endsWith('/game.json') ||
     rel.endsWith('/source.blot') ||
+    rel.includes('/shaders/') ||
     rel.includes('/assets/')
   );
 }

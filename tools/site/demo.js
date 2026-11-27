@@ -12,6 +12,7 @@ const ROOT_SW_URL = new URL('./service-worker.js', import.meta.url).href;
 const DEMOS_SW_URL = new URL('./demos/service-worker.js', import.meta.url).href;
 const DEMOS_SW_SCOPE = new URL('./demos/', import.meta.url).href;
 const RUNTIME_VERSION = new URL(import.meta.url).searchParams.get('v') || '';
+const runtimeBase = new URL(`./demos/pen/${canvasEl.dataset.penHost}/`, import.meta.url);
 
 let startupTimer = null;
 let fatalReason = null;
@@ -286,7 +287,7 @@ if (fpsMode === 'minecraft') {
 }
 
 async function fetchPenWasm(suffix) {
-  const runtime = './demos/pen/pen_web_bg.wasm';
+  const runtime = 'pen_web_bg.wasm';
   let brotli;
   try {
     brotli = new DecompressionStream('brotli');
@@ -294,7 +295,7 @@ async function fetchPenWasm(suffix) {
     // Browsers without Brotli streaming use the server's Wasm response.
   }
   if (brotli) {
-    const response = await fetch(new URL(`${runtime}.br${suffix}`, import.meta.url));
+    const response = await fetch(new URL(`${runtime}.br${suffix}`, runtimeBase));
     if (response.ok && response.body) {
       const body = response.headers.get('Content-Encoding') === 'br'
         ? response.body
@@ -302,7 +303,7 @@ async function fetchPenWasm(suffix) {
       return new Response(body, { headers: { 'Content-Type': 'application/wasm' } });
     }
   }
-  return fetch(new URL(`${runtime}${suffix}`, import.meta.url));
+  return fetch(new URL(`${runtime}${suffix}`, runtimeBase));
 }
 
 async function bootDemo() {
@@ -316,7 +317,7 @@ async function bootDemo() {
   }
   await ensureJspiOrIsolation();
   const suffix = RUNTIME_VERSION ? `?v=${encodeURIComponent(RUNTIME_VERSION)}` : '';
-  const penModuleUrl = new URL(`./demos/pen/pen_web.js${suffix}`, import.meta.url).href;
+  const penModuleUrl = new URL(`pen_web.js${suffix}`, runtimeBase).href;
   const [{ default: init, start }, wasm] = await Promise.all([import(penModuleUrl), fetchPenWasm(suffix)]);
   await init({ module_or_path: wasm });
 

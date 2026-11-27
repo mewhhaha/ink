@@ -31,12 +31,32 @@ const REQUIRED_PEN_RUNTIME_FILES: &[&str] = &[
     "pen_web_bg.wasm",
     "pen_web_bg.wasm.br",
     "guest.js",
+];
+
+const OPTIONAL_PEN_RUNTIME_FILES: &[&str] = &[
     "structured.js",
     "kernels.js",
     "kernel_worker.js",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
 ];
 
-const OPTIONAL_PEN_NOTICE_FILES: &[&str] = &["LICENSE", "THIRD_PARTY_NOTICES.md"];
+#[derive(Clone, Copy)]
+enum PenWebHost {
+    ThreeD,
+    Compact,
+    Full,
+}
+
+impl PenWebHost {
+    fn directory(self) -> &'static str {
+        match self {
+            Self::ThreeD => "web-3d",
+            Self::Compact => "web-compact",
+            Self::Full => "web",
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DemoAssets {
@@ -55,6 +75,7 @@ struct PenDemoSpec {
     companions: &'static [&'static str],
     assets: DemoAssets,
     fps_mode: Option<&'static str>,
+    host: PenWebHost,
 }
 
 struct WasmExampleSpec {
@@ -77,6 +98,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         companions: &["examples/mini_doom_e1m1.blot"],
         assets: DemoAssets::MiniDoom,
         fps_mode: Some("doom"),
+        host: PenWebHost::ThreeD,
     },
     PenDemoSpec {
         slug: "mini_minecraft",
@@ -87,6 +109,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         companions: &[],
         assets: DemoAssets::MiniMinecraft,
         fps_mode: Some("minecraft"),
+        host: PenWebHost::ThreeD,
     },
     PenDemoSpec {
         slug: "gi_lighting",
@@ -97,6 +120,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         companions: &[],
         assets: DemoAssets::ProceduralPbr3d,
         fps_mode: None,
+        host: PenWebHost::Full,
     },
     PenDemoSpec {
         slug: "sketch_ui",
@@ -107,6 +131,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
+        host: PenWebHost::Compact,
     },
     PenDemoSpec {
         slug: "d2_lighting",
@@ -117,6 +142,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
+        host: PenWebHost::Compact,
     },
     PenDemoSpec {
         slug: "physics_sandbox",
@@ -127,6 +153,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
+        host: PenWebHost::Compact,
     },
     PenDemoSpec {
         slug: "nav_playground",
@@ -137,6 +164,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
+        host: PenWebHost::Compact,
     },
     PenDemoSpec {
         slug: "ik_rig",
@@ -147,6 +175,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
+        host: PenWebHost::Compact,
     },
 ];
 
@@ -688,6 +717,7 @@ fn render_pen_demo_html(
 ) -> String {
     let title = escape_html(spec.title);
     let controls = escape_html(spec.controls);
+    let host = spec.host.directory();
     let actions = format!(
         r#"<button class="tool-btn" id="fullscreen-btn" type="button" data-state="enter" aria-label="Enter fullscreen">{ICON_EXPAND}{ICON_COLLAPSE}<span class="tool-label">Fullscreen</span></button>"#
     );
@@ -697,7 +727,7 @@ fn render_pen_demo_html(
         .unwrap_or_default();
     let main = format!(
         r#"      <div class="stage" id="stage">
-        <canvas id="game" tabindex="0"{fps_attr} aria-label="{title}"></canvas>
+        <canvas id="game" tabindex="0"{fps_attr} data-pen-host="{host}" aria-label="{title}"></canvas>
         <p class="stage-loading" id="loading" role="status">Loading WebGPU runtime…</p>
         <p class="stage-error" id="status" role="alert"></p>
       </div>
@@ -709,7 +739,7 @@ fn render_pen_demo_html(
     let scripts =
         format!("  <script type=\"module\" src=\"../../demo.js?v={runtime_version}\"></script>\n");
     let preloads = format!(
-        r#"  <link rel="modulepreload" href="../../demos/pen/pen_web.js?v={runtime_version}">
+        r#"  <link rel="modulepreload" href="../../demos/pen/{host}/pen_web.js?v={runtime_version}">
   <link rel="preload" as="fetch" href="./game.wasm" crossorigin>
 "#
     );
@@ -1032,7 +1062,6 @@ fn build_pen_demo(
     spec: &PenDemoSpec,
     staging_root: &Path,
     out_dir: &Path,
-    copy_shared_runtime: bool,
     site: &SiteMeta,
 ) -> Result<()> {
     let proj = staging_root.join(spec.slug);
@@ -1093,10 +1122,15 @@ fn build_pen_demo(
     )?;
 
     let export_dir = proj.join("dist/web");
-    let status = Command::new(pen_bin)
-        .args(["build", "--project"])
-        .arg(&proj)
-        .args(["--web", "--web-compact", "--out"])
+    let mut build = Command::new(pen_bin);
+    build.args(["build", "--project"]).arg(&proj).arg("--web");
+    match spec.host {
+        PenWebHost::ThreeD => build.args(["--web-features", "web-3d"]),
+        PenWebHost::Compact => build.args(["--web-features", "compact"]),
+        PenWebHost::Full => &mut build,
+    };
+    let status = build
+        .arg("--out")
         .arg(&export_dir)
         .status()
         .with_context(|| {
@@ -1108,23 +1142,26 @@ fn build_pen_demo(
         })?;
     ensure!(status.success(), "pen build --web failed for {}", spec.slug);
 
-    if copy_shared_runtime {
-        let shared = out_dir.join("demos/pen");
+    let shared = out_dir.join("demos/pen").join(spec.host.directory());
+    if !shared.is_dir() {
         std::fs::create_dir_all(&shared)?;
         for name in REQUIRED_PEN_RUNTIME_FILES {
             copy_file_checked(&export_dir.join(name), &shared.join(name))?;
         }
-        for name in OPTIONAL_PEN_NOTICE_FILES {
-            let src = export_dir.join(name);
-            if src.is_file() {
-                copy_file_checked(&src, &shared.join(name))?;
-            }
+    }
+    for name in OPTIONAL_PEN_RUNTIME_FILES {
+        let src = export_dir.join(name);
+        let dst = shared.join(name);
+        if src.is_file() && !dst.is_file() {
+            copy_file_checked(&src, &dst)?;
         }
     }
 
     let demo_out = out_dir.join("demos").join(spec.slug);
     std::fs::create_dir_all(demo_out.join("assets"))?;
     copy_assets_dir(&export_dir.join("assets"), &demo_out.join("assets"))?;
+    // Pen fetches deferred shaders relative to the page, independent of the host URL.
+    copy_assets_dir(&export_dir.join("shaders"), &demo_out.join("shaders"))?;
     for name in ["game.wasm", "catalog.json", "game.json"] {
         copy_file_checked(&export_dir.join(name), &demo_out.join(name))?;
     }
@@ -1136,8 +1173,7 @@ fn build_pen_demo(
     }
     copy_assets_dir(&export_dir.join("locales"), &demo_out.join("locales"))?;
     copy_file_checked(&root.join(spec.file), &demo_out.join("source.blot"))?;
-    let runtime_version =
-        runtime_version_tag(&std::fs::read(out_dir.join("demos/pen/pen_web_bg.wasm"))?);
+    let runtime_version = runtime_version_tag(&std::fs::read(shared.join("pen_web_bg.wasm"))?);
     std::fs::write(
         demo_out.join("index.html"),
         render_pen_demo_html(spec, &runtime_version, &site.asset_version, site.has_docs),
@@ -1231,7 +1267,7 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
         has_docs,
     };
 
-    for (idx, spec) in PEN_DEMOS.iter().enumerate() {
+    for spec in PEN_DEMOS {
         eprintln!("Building Pen WebGPU demo: {}...", spec.slug);
         build_pen_demo(
             &root,
@@ -1241,7 +1277,6 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
             spec,
             &staging_root,
             out_dir,
-            idx == 0,
             &site,
         )?;
     }
@@ -1418,9 +1453,11 @@ mod tests {
             assert!(html.contains("<details class=\"source\" data-src=\"./source.blot\">"));
             assert!(html.contains("data-copy"));
             assert!(html.contains("../../demo.js?v=rt42"));
-            assert!(
-                html.contains("rel=\"modulepreload\" href=\"../../demos/pen/pen_web.js?v=rt42\"")
-            );
+            let host = demo.host.directory();
+            assert!(html.contains(&format!("data-pen-host=\"{host}\"")));
+            assert!(html.contains(&format!(
+                "rel=\"modulepreload\" href=\"../../demos/pen/{host}/pen_web.js?v=rt42\""
+            )));
             assert!(html.contains("rel=\"preload\" as=\"fetch\" href=\"./game.wasm\" crossorigin"));
             assert!(html.contains("../../app.js?v=abc123"));
             assert!(html.contains("../../style.css?v=abc123"));
