@@ -41,6 +41,7 @@ type Poly is data = $Poly {
 type Geometry is data = $Geometry {
   points: #[Point3], planes: #[Plane4],
   rings: #[Ring], indices: #[U32], heights: #[F32], source_planes: #[Vec4],
+  hulls: #[StoredPoly], heightfields: #[terrain.Stored], meshes: #[StoredMesh],
 }
 type Read is data = $Read {
   points: &[Point3],
@@ -49,6 +50,9 @@ type Read is data = $Read {
   indices: &[U32],
   heights: &[F32],
   source_planes: &[Vec4],
+  hulls: &[StoredPoly],
+  heightfields: &[terrain.Stored],
+  meshes: &[StoredMesh],
 }
 func read (g: Geometry): Read => $Read {
   points: &g.points[0..g.points.length],
@@ -57,6 +61,9 @@ func read (g: Geometry): Read => $Read {
   indices: &g.indices[0..g.indices.length],
   heights: &g.heights[0..g.heights.length],
   source_planes: &g.source_planes[0..g.source_planes.length],
+  hulls: &g.hulls[0..g.hulls.length],
+  heightfields: &g.heightfields[0..g.heightfields.length],
+  meshes: &g.meshes[0..g.meshes.length],
 }
 func empty () : Geometry =>
   let points: #[Point3] = #[]
@@ -65,7 +72,10 @@ func empty () : Geometry =>
   let indices: #[U32] = #[]
   let heights: #[F32] = #[]
   let source_planes: #[Vec4] = #[]
-  return $Geometry {points, planes, rings, indices, heights, source_planes}
+  let hulls: #[StoredPoly] = #[]
+  let heightfields: #[terrain.Stored] = #[]
+  let meshes: #[StoredMesh] = #[]
+  return $Geometry {points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes}
 // Temporary working geometry remains alive through this known consumer.
 func with_geometry consume => consume (own (empty ()))
 // A retained geometry rebuild is a structural boundary. All borrowed shapes
@@ -77,6 +87,9 @@ func clear (geometry: own Geometry) : Geometry =>
   @storage.truncate geometry.indices 0
   @storage.truncate geometry.heights 0
   @storage.truncate geometry.source_planes 0
+  @storage.truncate geometry.hulls 0
+  @storage.truncate geometry.heightfields 0
+  @storage.truncate geometry.meshes 0
   return geometry
 
 type Shape is data =
@@ -162,9 +175,9 @@ const box_topology: U32 = 0xFFFFFFFF
 
 // An oriented box.
 func box_poly (geometry: own Geometry) -> (center: Vec3) -> (rotation: Quat) -> (half: Vec3) : (StoredPoly, Geometry) =>
-  let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+  let $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
   let (poly, points, planes) = box_columns points planes center rotation half
-  return (poly, $Geometry { points, planes, rings, indices, heights, source_planes })
+  return (poly, $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 
 private func box_spans (center: Vec3) -> (p: U32) -> (f: U32) : StoredPoly => $StoredPoly { center,
   verts: { start: p, count: 8 },
@@ -199,25 +212,31 @@ private func aligned_box_columns (points: own #[Point3]) -> (planes: own #[Plane
   let dz = 0.0 * cx + 0.0 * cy + cz
   let nz = F32.neg 0.0
   let poly = box_spans center points.length planes.length
-  let vertices: #[Point3] = #[
-    { x: lx, y: ly, z: lz }, { x: rx, y: ly, z: lz },
-    { x: lx, y: ry, z: lz }, { x: rx, y: ry, z: lz },
-    { x: lx, y: ly, z: rz }, { x: rx, y: ly, z: rz },
-    { x: lx, y: ry, z: rz }, { x: rx, y: ry, z: rz },
-    { x: rx, y: py, z: pz }, { x: lx, y: cy, z: cz },
-    { x: px, y: ry, z: pz }, { x: cx, y: ly, z: cz },
-    { x: px, y: py, z: rz }, { x: cx, y: cy, z: lz },
-    { x: 1.0, y: 0.0, z: 0.0 }, { x: 0.0, y: 1.0, z: 0.0 }, { x: 0.0, y: 0.0, z: 1.0 },
-  ]
-  for vertex in vertices:
-    @storage.push points vertex
-  let faces: #[Plane4] = #[
-    { x: 1.0, y: 0.0, z: 0.0, w: dx + hx }, { x: -1.0, y: nz, z: nz, w: F32.neg dx + hx },
-    { x: 0.0, y: 1.0, z: 0.0, w: dy + hy }, { x: nz, y: -1.0, z: nz, w: F32.neg dy + hy },
-    { x: 0.0, y: 0.0, z: 1.0, w: dz + hz }, { x: nz, y: nz, z: -1.0, w: F32.neg dz + hz },
-  ]
-  for face in faces:
-    @storage.push planes face
+  @storage.reserve points 17
+  @storage.reserve planes 6
+  @storage.push points { x: lx, y: ly, z: lz }
+  @storage.push points { x: rx, y: ly, z: lz }
+  @storage.push points { x: lx, y: ry, z: lz }
+  @storage.push points { x: rx, y: ry, z: lz }
+  @storage.push points { x: lx, y: ly, z: rz }
+  @storage.push points { x: rx, y: ly, z: rz }
+  @storage.push points { x: lx, y: ry, z: rz }
+  @storage.push points { x: rx, y: ry, z: rz }
+  @storage.push points { x: rx, y: py, z: pz }
+  @storage.push points { x: lx, y: cy, z: cz }
+  @storage.push points { x: px, y: ry, z: pz }
+  @storage.push points { x: cx, y: ly, z: cz }
+  @storage.push points { x: px, y: py, z: rz }
+  @storage.push points { x: cx, y: cy, z: lz }
+  @storage.push points { x: 1.0, y: 0.0, z: 0.0 }
+  @storage.push points { x: 0.0, y: 1.0, z: 0.0 }
+  @storage.push points { x: 0.0, y: 0.0, z: 1.0 }
+  @storage.push planes { x: 1.0, y: 0.0, z: 0.0, w: dx + hx }
+  @storage.push planes { x: -1.0, y: nz, z: nz, w: F32.neg dx + hx }
+  @storage.push planes { x: 0.0, y: 1.0, z: 0.0, w: dy + hy }
+  @storage.push planes { x: nz, y: -1.0, z: nz, w: F32.neg dy + hy }
+  @storage.push planes { x: 0.0, y: 0.0, z: 1.0, w: dz + hz }
+  @storage.push planes { x: nz, y: nz, z: -1.0, w: F32.neg dz + hz }
   return (poly, points, planes)
 
 func box_columns (points: own #[Point3]) -> (g_planes: own #[Plane4]) -> (center: Vec3) -> (rotation: Quat) -> (half: Vec3) : (StoredPoly, #[Point3], #[Plane4]) =>
@@ -1094,7 +1113,7 @@ func hull_poly (geometry: own Geometry) -> (planes_in: &[Vec4]) : (Maybe StoredP
   if ea.length == 0:
     return ($Nothing, geometry)
   let dirs = @array.generate directions (func (d: U32) => { x: found_dirs[d * 3], y: found_dirs[d * 3 + 1], z: found_dirs[d * 3 + 2] })
-  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
+  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
   let (verts_span, points) = pack_span points (&verts[0..verts.length])
   let (centers_span, points) = pack_span points (&kept_centers[0..kept_centers.length])
   let (dirs_span, points) = pack_span points (&dirs[0..dirs.length])
@@ -1106,7 +1125,7 @@ func hull_poly (geometry: own Geometry) -> (planes_in: &[Vec4]) : (Maybe StoredP
   return ($Some ($StoredPoly {
     center, verts: verts_span, planes: planes_span, rings: rings_span,
     ring_indices: ring_indices_span, centers: centers_span, ea: ea_span, eb: eb_span, dirs: dirs_span,
-  }), $Geometry { points, planes: g_planes, rings, indices, heights, source_planes })
+  }), $Geometry { points, planes: g_planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 
 // A polytope built in its own space, placed in the world by position,
 // rotation and scale.
@@ -1174,7 +1193,7 @@ func poly_place (geometry: own Geometry) -> (poly: Poly) -> (position: Vec3) -> 
   let rcx = ox + cx
   let rcy = oy + cy
   let rcz = oz + cz
-  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
+  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
   let (verts_span, points) = pack_span points (&verts[0..verts.length])
   let (centers_span, points) = pack_span points (&centers[0..centers.length])
   let (dirs_span, points) = pack_span points (&dirs[0..dirs.length])
@@ -1190,7 +1209,7 @@ func poly_place (geometry: own Geometry) -> (poly: Poly) -> (position: Vec3) -> 
     },
     verts: verts_span, planes: planes_span, rings: rings_span, ring_indices: ring_indices_span,
     centers: centers_span, ea: ea_span, eb: eb_span, dirs: dirs_span },
-    $Geometry { points, planes: g_planes, rings, indices, heights, source_planes })
+    $Geometry { points, planes: g_planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 
 // Place a StoredPoly that already resides in `geometry`, copying out its views
 // before appending the transformed geometry.
@@ -1253,7 +1272,7 @@ func poly_place_stored (geometry: own Geometry) -> (stored: StoredPoly) -> (posi
     @storage.push eb_arr item
   let c = stored.center
   let (cx, cy, cz) = math.rotate_parts qx qy qz qw (c.x * sx) (c.y * sy) (c.z * sz)
-  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
+  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
   let (verts_span, points) = pack_span points (&verts[0..verts.length])
   let (centers_span, points) = pack_span points (&centers[0..centers.length])
   let (dirs_span, points) = pack_span points (&dirs[0..dirs.length])
@@ -1265,7 +1284,7 @@ func poly_place_stored (geometry: own Geometry) -> (stored: StoredPoly) -> (posi
   return ($StoredPoly { center: $Vec3 { x: ox + cx, y: oy + cy, z: oz + cz },
     verts: verts_span, planes: planes_span, rings: rings_span, ring_indices: ring_indices_span,
     centers: centers_span, ea: ea_span, eb: eb_span, dirs: dirs_span },
-    $Geometry { points, planes: g_planes, rings, indices, heights, source_planes })
+    $Geometry { points, planes: g_planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 
 // Bounds ----------------------------------------------------------------------
 
@@ -1325,16 +1344,17 @@ func capsule_inertia (radius: F32) => func (half_segment: F32) =>
 // `indices`, BVH bounds in `heights`. `vertices` and `indices` are the authored
 // world-space soup; see `mesh.cook` for what is rejected or dropped.
 func cook_mesh (geometry: own Geometry) -> (vertices: &[Point3]) -> (soup: &[U32]) : (Maybe StoredMesh, Geometry) =>
-  let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+  let $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
   let (cooked, points, planes, indices, heights) = mesh.cook points planes indices heights vertices soup
   let stored = Maybe.map (func (m: mesh.Stored) => $StoredMesh {
     verts: m.verts, tris: m.tris, planes: m.planes, bounds: m.bounds, order: m.order, base: m.base,
   }) cooked
-  return (stored, $Geometry { points, planes, rings, indices, heights, source_planes })
+  return (stored, $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 
 
 // Plain persistent schemas. Spans carry no owner pointer; every access also
-// receives the exact Geometry bundle for this world lineage.
+// receives the exact Geometry bundle for this world lineage. Large non-capsule
+// shapes live in Geometry side pools so ProxyRow stays compact for capsules/spheres.
 type Span = { start: U32, count: U32 }
 type StoredPoly is data = $StoredPoly {
   center: Vec3, verts: Span, planes: Span, rings: Span, ring_indices: Span,
@@ -1343,16 +1363,33 @@ type StoredPoly is data = $StoredPoly {
 type StoredMesh is data = $StoredMesh {
   verts: Span, tris: Span, planes: Span, bounds: Span, order: Span, base: U32,
 }
-type StoredShape is data = $StoredCapsule { a: Vec3, b: Vec3, radius: F32 }
-  | $StoredHull StoredPoly | $StoredHeightfield terrain.Stored | $StoredMeshShape StoredMesh
+type StoredShape is data =
+  | $StoredCapsule { a: Vec3, b: Vec3, radius: F32 }
+  | $StoredHull U32
+  | $StoredHeightfield U32
+  | $StoredMeshShape U32
+func store_hull (geometry: own Geometry) -> (poly: StoredPoly) : (StoredShape, Geometry) =>
+  let $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
+  let idx = hulls.length
+  @storage.push hulls poly
+  return ($StoredHull idx, $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
+func store_heightfield (geometry: own Geometry) -> (stored: terrain.Stored) : (StoredShape, Geometry) =>
+  let $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
+  let idx = heightfields.length
+  @storage.push heightfields stored
+  return ($StoredHeightfield idx, $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
+func store_mesh (geometry: own Geometry) -> (stored: StoredMesh) : (StoredShape, Geometry) =>
+  let $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
+  let idx = meshes.length
+  @storage.push meshes stored
+  return ($StoredMeshShape idx, $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 func pack_span (owner: own #[a]) -> (values: &[a]) : (Span, #[a]) =>
   let start = owner.length
-  for value in values:
-    @storage.push owner value
+  @storage.extend owner values
   return ({ start, count: values.length }, owner)
 func span_view owner -> (span: Span) => owner.view span.start (span.start + span.count)
 func pack_mesh (geometry: own Geometry) -> (m: mesh.Mesh) : (StoredMesh, Geometry) =>
-  let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+  let $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
   let (verts, points) = pack_span points m.verts
   let (tris, indices) = pack_span indices m.tris
   let (plane_span, planes) = pack_span planes m.planes
@@ -1360,7 +1397,7 @@ func pack_mesh (geometry: own Geometry) -> (m: mesh.Mesh) : (StoredMesh, Geometr
   let (order, indices) = pack_span indices m.index.order
   return ($StoredMesh {
     verts, tris, planes: plane_span, bounds, order, base: m.index.base,
-  }, $Geometry { points, planes, rings, indices, heights, source_planes })
+  }, $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 func unpack_poly geometry -> (p: StoredPoly) : Poly =>
   let box = p.rings.start == box_topology
   return $Poly {
@@ -1383,7 +1420,7 @@ func pack (geometry: own Geometry) -> (value: Shape) : (StoredShape, Geometry) =
   if let $Capsule { a, b, radius } = value:
     return ($StoredCapsule { a, b, radius }, geometry)
   if let $Hull p = value:
-    let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    let $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
     let (verts, points) = pack_span points p.verts
     let (centers, points) = pack_span points p.centers
     let (dirs, points) = pack_span points p.dirs
@@ -1392,23 +1429,27 @@ func pack (geometry: own Geometry) -> (value: Shape) : (StoredShape, Geometry) =
     let (ring_indices, indices) = pack_span indices p.ring_indices
     let (ea, indices) = pack_span indices p.ea
     let (eb, indices) = pack_span indices p.eb
-    return ($StoredHull ($StoredPoly {
+    let hull_idx = hulls.length
+    @storage.push hulls ($StoredPoly {
       center: p.center, verts, planes: plane_span, rings: ring_span,
       ring_indices, centers, ea, eb, dirs,
-    }), $Geometry { points, planes, rings, indices, heights, source_planes })
+    })
+    return ($StoredHull hull_idx, $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
   if let $Heightfield ground = value:
-    let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    let $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
     let (stored, heights) = terrain.pack heights ground
-    return ($StoredHeightfield stored, $Geometry { points, planes, rings, indices, heights, source_planes })
+    let hf_idx = heightfields.length
+    @storage.push heightfields stored
+    return ($StoredHeightfield hf_idx, $Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
   let $Mesh m = value else:
     return panic "unreachable shape"
   let (stored, geometry) = pack_mesh geometry m
-  return ($StoredMeshShape stored, geometry)
+  return store_mesh geometry stored
 func unpack geometry -> (value: StoredShape) : Shape => case value of
   $StoredCapsule { a, b, radius } => $Capsule { a, b, radius }
-  $StoredHull p => $Hull (unpack_poly geometry p)
-  $StoredHeightfield ground => $Heightfield (terrain.unpack geometry.heights ground)
-  $StoredMeshShape m => $Mesh (unpack_mesh geometry m)
+  $StoredHull idx => $Hull (unpack_poly geometry geometry.hulls[idx])
+  $StoredHeightfield idx => $Heightfield (terrain.unpack geometry.heights geometry.heightfields[idx])
+  $StoredMeshShape idx => $Mesh (unpack_mesh geometry geometry.meshes[idx])
 
 
 // Reuse fixed spans for ordinary pose/shape edits. A changed payload length
@@ -1420,34 +1461,37 @@ func replace_span (owner: own #[a]) -> (before: Span) -> (values: &[a]) : (Span,
     owner[before.start + i] := values[i]
   return (before, owner)
 // Reuse the box's writable spans. Topology is immutable and needs no copy.
-func replace_box (geometry: own Geometry) -> (old: StoredPoly) -> (p: Poly) : (StoredShape, Geometry) =>
-  let $Geometry {points, planes, rings, indices, heights, source_planes} = geometry
+func replace_box (geometry: own Geometry) -> (old_index: U32) -> (p: Poly) : (StoredShape, Geometry) =>
+  let $Geometry {points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes} = geometry
+  let old = hulls[old_index]
   let (verts, points) = replace_span points old.verts p.verts
   let (centers, points) = replace_span points old.centers p.centers
   let (dirs, points) = replace_span points old.dirs p.dirs
   let (plane_span, planes) = replace_span planes old.planes p.planes
-  let shape = $StoredHull ($StoredPoly {center: p.center, verts, planes: plane_span,
+  hulls[old_index] := $StoredPoly {center: p.center, verts, planes: plane_span,
     rings: {start: box_topology, count: 6}, ring_indices: {start: box_topology, count: 24},
-    centers, ea: {start: box_topology, count: 12}, eb: {start: box_topology, count: 12}, dirs})
-  return (shape, $Geometry {points, planes, rings, indices, heights, source_planes})
+    centers, ea: {start: box_topology, count: 12}, eb: {start: box_topology, count: 12}, dirs}
+  return ($StoredHull old_index, $Geometry {points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes})
 
 func replace (geometry: own Geometry) -> (before: StoredShape) -> (value: Shape) : (StoredShape, Geometry) =>
-  if let $StoredMeshShape old = before:
+  if let $StoredMeshShape old_index = before:
     if let $Mesh m = value:
+      let old = geometry.meshes[old_index]
       if old.verts.count == m.verts.length and old.tris.count == m.tris.length and old.bounds.count == m.index.bounds.length and old.order.count == m.index.order.length:
-        let $Geometry {points, planes, rings, indices, heights, source_planes} = geometry
+        let $Geometry {points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes} = geometry
         let (verts, points) = replace_span points old.verts m.verts
         let (tris, indices) = replace_span indices old.tris m.tris
         let (order, indices) = replace_span indices old.order m.index.order
         let (plane_span, planes) = replace_span planes old.planes m.planes
         let (bounds, heights) = replace_span heights old.bounds m.index.bounds
-        let shape = $StoredMeshShape ($StoredMesh {verts, tris, planes: plane_span, bounds, order, base: m.index.base})
-        return (shape, $Geometry {points, planes, rings, indices, heights, source_planes})
-  let $StoredHull old = before else:
+        meshes[old_index] := $StoredMesh {verts, tris, planes: plane_span, bounds, order, base: m.index.base}
+        return ($StoredMeshShape old_index, $Geometry {points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes})
+  let $StoredHull old_index = before else:
     return pack geometry value
   let $Hull p = value else:
     return pack geometry value
-  let $Geometry {points, planes, rings, indices, heights, source_planes} = geometry
+  let $Geometry {points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes} = geometry
+  let old = hulls[old_index]
   let (verts, points) = replace_span points old.verts p.verts
   let (centers, points) = replace_span points old.centers p.centers
   let (dirs, points) = replace_span points old.dirs p.dirs
@@ -1456,5 +1500,5 @@ func replace (geometry: own Geometry) -> (before: StoredShape) -> (value: Shape)
   let (ring_indices, indices) = replace_span indices old.ring_indices p.ring_indices
   let (ea, indices) = replace_span indices old.ea p.ea
   let (eb, indices) = replace_span indices old.eb p.eb
-  let shape = $StoredHull ($StoredPoly {center: p.center, verts, planes: plane_span, rings: ring_span, ring_indices, centers, ea, eb, dirs})
-  return (shape, $Geometry {points, planes, rings, indices, heights, source_planes})
+  hulls[old_index] := $StoredPoly {center: p.center, verts, planes: plane_span, rings: ring_span, ring_indices, centers, ea, eb, dirs}
+  return ($StoredHull old_index, $Geometry {points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes})

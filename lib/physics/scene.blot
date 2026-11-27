@@ -172,14 +172,19 @@ func shifted_row (geometry: own shapes.Geometry) -> (row: ProxyRow) -> (shift: V
   if let $shapes.StoredCapsule { a, b, radius } = row.shape:
     row.shape := $shapes.StoredCapsule { a: a + shift, b: b + shift, radius }
   else:
-    if let $shapes.StoredHull poly = row.shape:
+    if let $shapes.StoredHull idx = row.shape:
+      let poly = geometry.hulls[idx]
       let (placed, next_geom) = shapes.poly_place_stored geometry poly shift math.identity_quat math.one3
+      let (stored, next_geom) = shapes.store_hull next_geom placed
       geometry := next_geom
-      row.shape := $shapes.StoredHull placed
+      row.shape := stored
     else:
-      if let $shapes.StoredHeightfield t = row.shape:
+      if let $shapes.StoredHeightfield idx = row.shape:
+        let t = geometry.heightfields[idx]
         t.origin := self + shift
-        row.shape := $shapes.StoredHeightfield t
+        let (stored, next_geom) = shapes.store_heightfield geometry t
+        geometry := next_geom
+        row.shape := stored
   row.low := self + shift
   row.high := self + shift
   return (row, geometry)
@@ -283,9 +288,9 @@ func scale_by (a: Vec3) => func (b: Vec3) => shapes.mul3 a b
 // Pose arithmetic stays scalar, in Vec3 operation order: each Vec3 temporary
 // costs a heap allocation.
 func pack_heightfield (geometry: own shapes.Geometry) -> (t: terrain.Terrain) : (terrain.Stored, shapes.Geometry) =>
-  let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+  let $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
   let (stored, heights) = terrain.pack heights t
-  return (stored, $shapes.Geometry { points, planes, rings, indices, heights, source_planes })
+  return (stored, $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 
 func shape_of (geometry: own shapes.Geometry) -> (source: Source) -> (collider: Collider) : (Maybe (shapes.StoredShape, Vec3, F32), shapes.Geometry) =>
   if not (is_finite source.position.x and is_finite source.position.y and is_finite source.position.z and is_finite source.scale.x and is_finite source.scale.y and is_finite source.scale.z and is_finite source.rotation.x and is_finite source.rotation.y and is_finite source.rotation.z and is_finite source.rotation.w and is_finite collider.offset.x and is_finite collider.offset.y and is_finite collider.offset.z):
@@ -306,10 +311,12 @@ func shape_of (geometry: own shapes.Geometry) -> (source: Source) -> (collider: 
   let center = $Vec3 { x: cx, y: cy, z: cz }
   if let $Heightfield t = collider.shape:
     let (stored_t, next_geom) = pack_heightfield geometry t
-    return ($Some ($shapes.StoredHeightfield stored_t, math.zero3, 0.0), next_geom)
+    let (stored, next_geom) = shapes.store_heightfield next_geom stored_t
+    return ($Some (stored, math.zero3, 0.0), next_geom)
   if let $Mesh m = collider.shape:
-    let (stored, next_geom) = shapes.pack_mesh geometry m
-    return ($Some ($shapes.StoredMeshShape stored, math.zero3, 0.0), next_geom)
+    let (stored_m, next_geom) = shapes.pack_mesh geometry m
+    let (stored, next_geom) = shapes.store_mesh next_geom stored_m
+    return ($Some (stored, math.zero3, 0.0), next_geom)
   if let $Box = collider.shape:
     if not (is_finite collider.size.x and is_finite collider.size.y and is_finite collider.size.z):
       return ($Nothing, geometry)
@@ -323,7 +330,8 @@ func shape_of (geometry: own shapes.Geometry) -> (source: Source) -> (collider: 
     if not (is_finite hx and is_finite hy and is_finite hz and is_finite inertia.x and is_finite inertia.y and is_finite inertia.z and is_finite inscribed and is_finite span and is_finite (abs cx + span) and is_finite (abs cy + span) and is_finite (abs cz + span)):
       return ($Nothing, geometry)
     let (poly, next_geom) = shapes.box_poly geometry center source.rotation half
-    return ($Some ($shapes.StoredHull poly, inertia, inscribed), next_geom)
+    let (stored, next_geom) = shapes.store_hull next_geom poly
+    return ($Some (stored, inertia, inscribed), next_geom)
   if let $Sphere = collider.shape:
     if not (is_finite collider.radius):
       return ($Nothing, geometry)
@@ -361,7 +369,8 @@ func shape_of (geometry: own shapes.Geometry) -> (source: Source) -> (collider: 
     if not (math.finite3 low and math.finite3 high and math.finite3 half and math.finite3 inertia and is_finite inscribed):
       return ($Nothing, geometry)
     let (poly, next_geom) = shapes.poly_place geometry local source.position source.rotation source.scale
-    return ($Some ($shapes.StoredHull poly, inertia, inscribed), next_geom)
+    let (stored, next_geom) = shapes.store_hull next_geom poly
+    return ($Some (stored, inertia, inscribed), next_geom)
   return ($Nothing, geometry)
 
 func kind_of (source: Source) => body_kind source.rigid source.walker
@@ -460,7 +469,8 @@ func proxy_of (geometry: own shapes.Geometry) -> (index: U32) -> (source: Source
   // Bounds without unpacking hulls or allocating temporary Vec3s.
   let (low, high) = case stored_shape of
     $shapes.StoredCapsule { a, b, radius } => ($Vec3 { x: min a.x b.x - radius, y: min a.y b.y - radius, z: min a.z b.z - radius }, $Vec3 { x: max a.x b.x + radius, y: max a.y b.y + radius, z: max a.z b.z + radius })
-    $shapes.StoredHull poly => do:
+    $shapes.StoredHull idx => do:
+      let poly = geometry.hulls[idx]
       if poly.verts.count == 0:
         break (shapes.zero, shapes.zero)
       let start = poly.verts.start
@@ -501,10 +511,11 @@ func proxy_of (geometry: own shapes.Geometry) -> (index: U32) -> (source: Source
   }), geometry)
 
 private func replace_proxy_shape (geometry: own shapes.Geometry) -> (old: shapes.StoredShape) -> (scratch: shapes.Geometry) -> (next: shapes.StoredShape) : (shapes.StoredShape, shapes.Geometry) =>
-  if let $shapes.StoredHull next_poly = next:
+  if let $shapes.StoredHull next_idx = next:
+    let next_poly = scratch.hulls[next_idx]
     if next_poly.rings.start == shapes.box_topology:
-      if let $shapes.StoredHull previous = old:
-        return shapes.replace_box geometry previous (shapes.unpack_poly scratch next_poly)
+      if let $shapes.StoredHull previous_idx = old:
+        return shapes.replace_box geometry previous_idx (shapes.unpack_poly scratch next_poly)
   return shapes.replace geometry old (shapes.unpack scratch next)
 
 // Explicit dirty source indices mutate the live scene without rebuilding unchanged geometry.
@@ -960,7 +971,7 @@ func ray_sphere_any (center: Vec3) -> (rad: F32) -> (origin: Vec3) -> (delta: Ve
   return is_finite t and t >= 0.0 and t <= 1.0
 
 func ray_hits_stored geometry -> (stored: shapes.StoredShape) -> (origin: Vec3) -> (delta: Vec3) : Bool => case stored of
-  $shapes.StoredHull poly => ray_hull_any (shapes.unpack_poly geometry poly) origin delta
+  $shapes.StoredHull idx => ray_hull_any (shapes.unpack_poly geometry geometry.hulls[idx]) origin delta
   $shapes.StoredCapsule { a: ca, b: cb, radius: cr } =>
     if ca.x == cb.x and ca.y == cb.y and ca.z == cb.z then ray_sphere_any ca cr origin delta else Maybe.is_some (cast_shape ($shapes.Capsule { a: ca, b: cb, radius: cr }) origin origin 0.0 delta)
   _ => Maybe.is_some (cast_shape (shapes.unpack geometry stored) origin origin 0.0 delta)
@@ -1098,14 +1109,14 @@ func empty () : Scene =>
   let slots: #[U32] = #[]
   return access (shapes.empty ()) proxies bounds order leaves slots
 // Primitive-only builds carry just the written columns across the loop.
-private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (index: U32) -> source -> collider : (Maybe ProxyRow, #[shapes.Point3], #[shapes.Plane4]) =>
+private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (hulls: own #[shapes.StoredPoly]) -> (index: U32) -> source -> collider : (Maybe ProxyRow, #[shapes.Point3], #[shapes.Plane4], #[shapes.StoredPoly]) =>
   let kind = body_kind source.rigid source.walker
   let is_walker = Maybe.is_some source.walker
   let scale = if is_walker then math.one3 else source.scale
   let rotation = if is_walker then math.identity_quat else source.rotation
   let offset = if kind == kind_dynamic then math.zero3 else collider.offset
   if not (math.finite3 source.position and math.finite3 scale and math.finite_quat rotation and math.finite3 offset):
-    return ($Nothing, points, planes)
+    return ($Nothing, points, planes, hulls)
   let cx = source.position.x
   let cy = source.position.y
   let cz = source.position.z
@@ -1115,7 +1126,7 @@ private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[
     cy := self + oy
     cz := self + oz
   if not (is_finite cx and is_finite cy and is_finite cz and math.finite3 collider.size):
-    return ($Nothing, points, planes)
+    return ($Nothing, points, planes, hulls)
   let hx = abs collider.size.x * abs scale.x * 0.5
   let hy = abs collider.size.y * abs scale.y * 0.5
   let hz = abs collider.size.z * abs scale.z * 0.5
@@ -1124,7 +1135,7 @@ private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[
   let inscribed = min hx (min hy hz)
   let span = hx + hy + hz
   if not (math.finite3 half and math.finite3 inertia and is_finite inscribed and is_finite span and is_finite (abs cx + span) and is_finite (abs cy + span) and is_finite (abs cz + span)):
-    return ($Nothing, points, planes)
+    return ($Nothing, points, planes, hulls)
   let (poly, points, planes) = shapes.box_columns points planes ($Vec3 { x: cx, y: cy, z: cz }) rotation half
   let low_x = points[poly.verts.start].x
   let low_y = points[poly.verts.start].y
@@ -1160,10 +1171,12 @@ private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[
   let low = $Vec3 { x: low_x, y: low_y, z: low_z }
   let high = $Vec3 { x: high_x, y: high_y, z: high_z }
   if not (math.finite3 low and math.finite3 high and is_finite collider.friction and is_finite collider.restitution):
-    return ($Nothing, points, planes)
+    return ($Nothing, points, planes, hulls)
+  let hull_idx = hulls.length
+  @storage.push hulls poly
   return ($Some ($ProxyRow { source: index, id: source.id, kind, walker: is_walker,
-    shape: $shapes.StoredHull poly, inertia, inscribed, low, high, layer: collider.layer,
-    mask: collider.mask, friction: collider.friction, restitution: collider.restitution, trigger: collider.trigger }), points, planes)
+    shape: $shapes.StoredHull hull_idx, inertia, inscribed, low, high, layer: collider.layer,
+    mask: collider.mask, friction: collider.friction, restitution: collider.restitution, trigger: collider.trigger }), points, planes, hulls)
 
 // Capsules have no payload spans, so they do not make the surrounding
 // box build carry geometry through its loop.
@@ -1245,7 +1258,7 @@ private func build_sphere_rows_direct (rows: own #[ProxyRow]) -> (slots: own #[U
   slots := finish_slots self rows.length
   return (rows, slots, extents)
 
-private func build_primitive_rows_direct (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32], #[shapes.Point3], #[shapes.Plane4]) =>
+private func build_primitive_rows_direct (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (hulls: own #[shapes.StoredPoly]) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32], #[shapes.Point3], #[shapes.Plane4], #[shapes.StoredPoly]) =>
   let n = sources.length
   @storage.reserve rows n
   @storage.reserve slots n
@@ -1254,9 +1267,10 @@ private func build_primitive_rows_direct (points: own #[shapes.Point3]) -> (plan
     let row = $Nothing
     if let $Some col = src.collider:
       if let $Box = col.shape:
-        let (value, next_points, next_planes) = build_box_columns points planes i src col
+        let (value, next_points, next_planes, next_hulls) = build_box_columns points planes hulls i src col
         points := next_points
         planes := next_planes
+        hulls := next_hulls
         row := value
       else:
         if let $Sphere = col.shape:
@@ -1269,7 +1283,7 @@ private func build_primitive_rows_direct (points: own #[shapes.Point3]) -> (plan
       @storage.push rows value
     @storage.push slots slot
   slots := finish_slots self rows.length
-  return (rows, slots, points, planes)
+  return (rows, slots, points, planes, hulls)
 
 private func build_rows_direct (geometry: own shapes.Geometry) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32], shapes.Geometry) =>
   @storage.truncate rows 0
@@ -1288,9 +1302,9 @@ private func build_rows_direct (geometry: own shapes.Geometry) -> (rows: own #[P
     let (rows, slots, _) = build_sphere_rows_direct rows slots sources
     return (rows, slots, geometry)
   if primitives:
-    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
-    let (rows, slots, points, planes) = build_primitive_rows_direct points planes rows slots sources
-    return (rows, slots, $shapes.Geometry { points, planes, rings, indices, heights, source_planes })
+    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
+    let (rows, slots, points, planes, hulls) = build_primitive_rows_direct points planes hulls rows slots sources
+    return (rows, slots, $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
   @storage.reserve rows n
   @storage.reserve slots n
   for i in 0 .. n:
@@ -1330,14 +1344,15 @@ func build_into (destination: own Scene) -> (sources: #[Source]) : Scene =>
     let index = spatial.build_flat index extents
     return $Scene { geometry, proxies: stored, index, slots, source_count: n }
   if primitives:
-    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
     if box_count > 0:
       @storage.reserve points (box_count * 17)
       @storage.reserve planes (box_count * 6)
-    let (stored, slots, points, planes) = build_primitive_rows_direct points planes proxies slots sources
+      @storage.reserve hulls box_count
+    let (stored, slots, points, planes, hulls) = build_primitive_rows_direct points planes hulls proxies slots sources
     let extents = proxy_extents stored
     let index = spatial.build_flat index extents
-    return $Scene { geometry: $shapes.Geometry { points, planes, rings, indices, heights, source_planes }, proxies: stored, index, slots, source_count: n }
+    return $Scene { geometry: $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes }, proxies: stored, index, slots, source_count: n }
   @storage.reserve proxies n
   @storage.reserve slots n
   for i in 0 .. n:
@@ -1377,7 +1392,7 @@ func copy_into (destination: own Scene) -> (source: Scene) : Scene =>
 
 // Authored source persistence uses the same flat schema boundary as proxies.
 // Source and Collider remain convenient invocation-local borrowed values.
-type StoredKind is data = $StoredBox | $StoredSphere | $StoredCapsule | $StoredBrush | $StoredHeightfield terrain.Stored | $StoredLevel shapes.StoredMesh
+type StoredKind is data = $StoredBox | $StoredSphere | $StoredCapsule | $StoredBrush | $StoredHeightfield U32 | $StoredLevel U32
 type ColliderRow is data = $ColliderRow {
   shape: StoredKind,
   size: Vec3,
@@ -1423,19 +1438,25 @@ func pack_collider (geometry: own shapes.Geometry) -> (value: Collider) : (Colli
     return (pack_collider_row $StoredBrush value, geometry)
   if let $Heightfield ground = value.shape:
     let (stored, next_geom) = pack_heightfield geometry ground
-    return (pack_collider_row ($StoredHeightfield stored) value, next_geom)
+    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = next_geom
+    let idx = heightfields.length
+    @storage.push heightfields stored
+    return (pack_collider_row ($StoredHeightfield idx) value, $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
   let $Mesh m = value.shape else:
     return (pack_collider_row $StoredBox value, geometry)
   let (stored, next_geom) = shapes.pack_mesh geometry m
-  return (pack_collider_row ($StoredLevel stored) value, next_geom)
+  let $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = next_geom
+  let idx = meshes.length
+  @storage.push meshes stored
+  return (pack_collider_row ($StoredLevel idx) value, $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 func unpack_collider geometry -> (value: ColliderRow) =>
   let shape = case value.shape of
     $StoredBox => $Box
     $StoredSphere => $Sphere
     $StoredCapsule => $Capsule
     $StoredBrush => $Brush
-    $StoredHeightfield ground => $Heightfield (terrain.unpack geometry.heights ground)
-    $StoredLevel m => $Mesh (shapes.unpack_mesh geometry m)
+    $StoredHeightfield idx => $Heightfield (terrain.unpack geometry.heights geometry.heightfields[idx])
+    $StoredLevel idx => $Mesh (shapes.unpack_mesh geometry geometry.meshes[idx])
   return $Collider { shape,
     size: value.size,
     radius: value.radius,
@@ -1448,9 +1469,9 @@ func unpack_collider geometry -> (value: ColliderRow) =>
     trigger: value.trigger,
   }
 func pack_source_planes (geometry: own shapes.Geometry) -> (values: &[math.Vec4]) : (shapes.Span, shapes.Geometry) =>
-  let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+  let $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
   let (span, source_planes) = shapes.pack_span source_planes values
-  return (span, $shapes.Geometry { points, planes, rings, indices, heights, source_planes })
+  return (span, $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
 func pack_source (geometry: own shapes.Geometry) -> (value: Source) : (SourceRow, shapes.Geometry) =>
   let collider: Maybe ColliderRow = $Nothing
   if let $Some c = value.collider:
@@ -1576,7 +1597,7 @@ private func build_sphere_source_rows (rows: own #[ProxyRow]) -> (slots: own #[U
   slots := finish_slots self rows.length
   return (rows, slots)
 
-private func build_primitive_source_rows (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: &[SourceRow]) : (#[ProxyRow], #[U32], #[shapes.Point3], #[shapes.Plane4]) =>
+private func build_primitive_source_rows (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (hulls: own #[shapes.StoredPoly]) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: &[SourceRow]) : (#[ProxyRow], #[U32], #[shapes.Point3], #[shapes.Plane4], #[shapes.StoredPoly]) =>
   @storage.reserve rows sources.length
   @storage.reserve slots sources.length
   for i in 0 .. sources.length:
@@ -1584,9 +1605,10 @@ private func build_primitive_source_rows (points: own #[shapes.Point3]) -> (plan
     let row = $Nothing
     if let $Some col = src.collider:
       if let $StoredBox = col.shape:
-        let (value, next_points, next_planes) = build_box_columns points planes i src col
+        let (value, next_points, next_planes, next_hulls) = build_box_columns points planes hulls i src col
         points := next_points
         planes := next_planes
+        hulls := next_hulls
         row := value
       else:
         if let $StoredSphere = col.shape:
@@ -1599,7 +1621,7 @@ private func build_primitive_source_rows (points: own #[shapes.Point3]) -> (plan
       @storage.push rows value
     @storage.push slots slot
   slots := finish_slots self rows.length
-  return (rows, slots, points, planes)
+  return (rows, slots, points, planes, hulls)
 
 private func build_rows_from_stored (geometry: own shapes.Geometry) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (src_geom: shapes.Geometry) -> (sources: &[SourceRow]) : (#[ProxyRow], #[U32], shapes.Geometry) =>
   @storage.truncate rows 0
@@ -1622,12 +1644,13 @@ private func build_rows_from_stored (geometry: own shapes.Geometry) -> (rows: ow
     let (rows, slots) = build_sphere_source_rows rows slots sources
     return (rows, slots, geometry)
   if primitives:
-    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes } = geometry
     if box_count > 0:
       @storage.reserve points (box_count * 17)
       @storage.reserve planes (box_count * 6)
-    let (rows, slots, points, planes) = build_primitive_source_rows points planes rows slots sources
-    return (rows, slots, $shapes.Geometry { points, planes, rings, indices, heights, source_planes })
+      @storage.reserve hulls box_count
+    let (rows, slots, points, planes, hulls) = build_primitive_source_rows points planes hulls rows slots sources
+    return (rows, slots, $shapes.Geometry { points, planes, rings, indices, heights, source_planes, hulls, heightfields, meshes })
   @storage.reserve rows n
   @storage.reserve slots n
   for i in 0 .. n:

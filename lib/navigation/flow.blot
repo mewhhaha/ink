@@ -781,6 +781,9 @@ private func directions_full (directions: own #[F32]) -> (costs: #[F32]) -> (g: 
       directions[cell * 2 + 1] := dy
   return directions
 
+private func pack_entry (cost: F32) -> (cell: U32) : U64 =>
+  return U64.bit_or (U64.shl (U32.to_u64 (F32.to_bits cost)) 32) (U32.to_u64 cell)
+
 // Full builds can use a private frontier without translating live entries
 // to the public resumable heap at the end of each step.
 private func integrate_full (costs: own #[F32]) -> (g: navigation.Grid) -> (goals: &[U32]) -> (heap_keys: own #[F32]) -> (heap_cells: own #[U32]) : (#[F32], #[F32], #[U32]) =>
@@ -795,73 +798,65 @@ private func integrate_full (costs: own #[F32]) -> (g: navigation.Grid) -> (goal
   let weights = g.costs
   let col_mask = width - 1
   let power_of_two = (width & col_mask) == 0
+  let zero64: U64 = 0
+  let heap: #[U64] = @array.fill (max 64 (width * 4)) zero64
   for goal in goals:
     if goal < n and weights[goal] > 0.0 and costs[goal] != 0.0:
       costs[goal] := 0.0
-      @storage.push heap_keys 0.0
-      @storage.push heap_cells goal
+      if count >= heap.length:
+        let grown = max (count + 8) (heap.length + heap.length)
+        @storage.reserve heap (grown - heap.length)
+        for _ in heap.length .. grown:
+          @storage.push heap zero64
+      let candidate = pack_entry 0.0 goal
       let at = count
-      let target = heap_cells[at]
-      let candidate = heap_keys[at]
       for 0 .. 16:
         if at == 0:
           break
         let parent = (at - 1) / 4
-        let pk = heap_keys[parent]
-        let pi = heap_cells[parent]
-        if pk < candidate or (pk == candidate and pi <= target):
+        let pe = heap[parent]
+        if pe <= candidate:
           break
-        heap_keys[at] := pk
-        heap_cells[at] := pi
+        heap[at] := pe
         at := parent
-      heap_keys[at] := candidate
-      heap_cells[at] := target
+      heap[at] := candidate
       count := self + 1
   for 0 .. 4294967295:
     if count == 0:
       break
-    let cell = heap_cells[0]
-    let key = heap_keys[0]
+    let top = heap[0]
+    let cell = U64.to_u32 top
+    let key = F32.from_bits (U64.to_u32 (U64.shr top 32))
     count := self - 1
     if count > 0:
-      let moved = heap_cells[count]
-      let moved_key = heap_keys[count]
+      let moved = heap[count]
       let at: U32 = 0
       for 0 .. 16:
         if count < 2 or at > (count - 2) / 4:
           break
         let first = at * 4 + 1
         let child = first
-        let best = heap_keys[first]
-        let other = heap_cells[first]
+        let best = heap[first]
         if first + 1 < count:
-          let ck = heap_keys[first + 1]
-          let ci = heap_cells[first + 1]
-          if ck < best or (ck == best and ci < other):
+          let ce = heap[first + 1]
+          if ce < best:
             child := first + 1
-            best := ck
-            other := ci
+            best := ce
         if first + 2 < count:
-          let ck = heap_keys[first + 2]
-          let ci = heap_cells[first + 2]
-          if ck < best or (ck == best and ci < other):
+          let ce = heap[first + 2]
+          if ce < best:
             child := first + 2
-            best := ck
-            other := ci
+            best := ce
         if first + 3 < count:
-          let ck = heap_keys[first + 3]
-          let ci = heap_cells[first + 3]
-          if ck < best or (ck == best and ci < other):
+          let ce = heap[first + 3]
+          if ce < best:
             child := first + 3
-            best := ck
-            other := ci
-        if moved_key < best or (moved_key == best and moved <= other):
+            best := ce
+        if moved <= best:
           break
-        heap_keys[at] := best
-        heap_cells[at] := other
+        heap[at] := best
         at := child
-      heap_keys[at] := moved_key
-      heap_cells[at] := moved
+      heap[at] := moved
     if key > costs[cell]:
       continue
     let x = if power_of_two then cell & col_mask else cell % width
@@ -872,88 +867,74 @@ private func integrate_full (costs: own #[F32]) -> (g: navigation.Grid) -> (goal
     let wd = cell < n - width and weights[cell + width] > 0.0
     let ortho = key + entering
     let diag = key + diag_len * entering
-    let reserve = heap_cells.length
+    let reserve = heap.length
     if reserve - count < 8:
       let grown = max (count + 8) (reserve + reserve)
+      @storage.reserve heap (grown - reserve)
       for _ in reserve .. grown:
-        @storage.push heap_cells 0
-        @storage.push heap_keys 0.0
+        @storage.push heap zero64
     let added = count
     if wl:
       let target = cell - 1
       if ortho < costs[target]:
         costs[target] := ortho
-        heap_cells[count] := target
-        heap_keys[count] := ortho
+        heap[count] := pack_entry ortho target
         count := self + 1
     if wr:
       let target = cell + 1
       if ortho < costs[target]:
         costs[target] := ortho
-        heap_cells[count] := target
-        heap_keys[count] := ortho
+        heap[count] := pack_entry ortho target
         count := self + 1
     if wu:
       let target = cell - width
       if ortho < costs[target]:
         costs[target] := ortho
-        heap_cells[count] := target
-        heap_keys[count] := ortho
+        heap[count] := pack_entry ortho target
         count := self + 1
     if wd:
       let target = cell + width
       if ortho < costs[target]:
         costs[target] := ortho
-        heap_cells[count] := target
-        heap_keys[count] := ortho
+        heap[count] := pack_entry ortho target
         count := self + 1
     if wu and wl:
       let target = cell - width - 1
       if diag < costs[target] and weights[target] > 0.0:
         costs[target] := diag
-        heap_cells[count] := target
-        heap_keys[count] := diag
+        heap[count] := pack_entry diag target
         count := self + 1
     if wu and wr:
       let target = cell - width + 1
       if diag < costs[target] and weights[target] > 0.0:
         costs[target] := diag
-        heap_cells[count] := target
-        heap_keys[count] := diag
+        heap[count] := pack_entry diag target
         count := self + 1
     if wd and wl:
       let target = cell + width - 1
       if diag < costs[target] and weights[target] > 0.0:
         costs[target] := diag
-        heap_cells[count] := target
-        heap_keys[count] := diag
+        heap[count] := pack_entry diag target
         count := self + 1
     if wd and wr:
       let target = cell + width + 1
       if diag < costs[target] and weights[target] > 0.0:
         costs[target] := diag
-        heap_cells[count] := target
-        heap_keys[count] := diag
+        heap[count] := pack_entry diag target
         count := self + 1
     for i in added .. count:
       let at = i
-      let target = heap_cells[at]
-      let candidate = heap_keys[at]
+      let candidate = heap[at]
       for 0 .. 16:
         if at == 0:
           break
         let parent = (at - 1) / 4
-        let pk = heap_keys[parent]
-        let pi = heap_cells[parent]
-        if pk < candidate or (pk == candidate and pi <= target):
+        let pe = heap[parent]
+        if pe <= candidate:
           break
-        heap_keys[at] := pk
-        heap_cells[at] := pi
+        heap[at] := pe
         at := parent
-      heap_keys[at] := candidate
-      heap_cells[at] := target
-  @storage.truncate heap_keys 0
-  @storage.truncate heap_cells 0
+      heap[at] := candidate
   return (costs, heap_keys, heap_cells)
 
 func flow_into (flow: own Flow) -> (g: navigation.Grid) -> (goals: &[U32]) : Flow =>
