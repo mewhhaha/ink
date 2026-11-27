@@ -15,7 +15,6 @@ const RUNTIME_VERSION = new URL(import.meta.url).searchParams.get('v') || '';
 
 let startupTimer = null;
 let fatalReason = null;
-let adapterSummary = '';
 const diagLines = [];
 
 function recordDiagnostic(text) {
@@ -116,9 +115,7 @@ function formatFatalError(reason) {
   if (diagLines.length) {
     lines.push('', ...diagLines);
   }
-  if (adapterSummary) {
-    lines.push('', adapterSummary);
-  }
+  lines.push('', `Pen runtime ${RUNTIME_VERSION || 'dev'}`);
   lines.push('', 'Reload the page or try a hardware WebGPU adapter.');
   return lines.join('\n');
 }
@@ -288,6 +285,26 @@ if (fpsMode === 'minecraft') {
   });
 }
 
+async function fetchPenWasm(suffix) {
+  const runtime = './demos/pen/pen_web_bg.wasm';
+  let brotli;
+  try {
+    brotli = new DecompressionStream('brotli');
+  } catch {
+    // Browsers without Brotli streaming use the server's Wasm response.
+  }
+  if (brotli) {
+    const response = await fetch(new URL(`${runtime}.br${suffix}`, import.meta.url));
+    if (response.ok && response.body) {
+      const body = response.headers.get('Content-Encoding') === 'br'
+        ? response.body
+        : response.body.pipeThrough(brotli);
+      return new Response(body, { headers: { 'Content-Type': 'application/wasm' } });
+    }
+  }
+  return fetch(new URL(`${runtime}${suffix}`, import.meta.url));
+}
+
 async function bootDemo() {
   statusEl.textContent = '';
   setLoading('Loading WebGPU runtime…');
@@ -298,23 +315,10 @@ async function bootDemo() {
     return;
   }
   await ensureJspiOrIsolation();
-  try {
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-    if (adapter) {
-      const info = adapter.info || {};
-      const parts = [info.vendor, info.architecture, info.device, info.description].filter(Boolean);
-      const fallback = info.isFallbackAdapter ? ' fallback' : '';
-      const lim = adapter.limits || {};
-      adapterSummary = `Adapter: ${parts.join(' / ') || 'unknown'}${fallback} (storage=${lim.maxStorageBuffersPerShaderStage ?? '?'}, tex2d=${lim.maxTextureDimension2D ?? '?'}, ver=${RUNTIME_VERSION || 'dev'})`;
-    }
-  } catch {
-    // Diagnostic probe only; Pen requests its own adapter below.
-  }
   const suffix = RUNTIME_VERSION ? `?v=${encodeURIComponent(RUNTIME_VERSION)}` : '';
   const penModuleUrl = new URL(`./demos/pen/pen_web.js${suffix}`, import.meta.url).href;
-  const penWasmUrl = new URL(`./demos/pen/pen_web_bg.wasm${suffix}`, import.meta.url);
-  const { default: init, start } = await import(penModuleUrl);
-  await init({ module_or_path: penWasmUrl });
+  const [{ default: init, start }, wasm] = await Promise.all([import(penModuleUrl), fetchPenWasm(suffix)]);
+  await init({ module_or_path: wasm });
 
   let timedOut = false;
   const markReady = () => {

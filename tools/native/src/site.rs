@@ -29,6 +29,7 @@ const GITHUB_BLOB: &str = "https://github.com/mewhhaha/ink/blob/main/";
 const REQUIRED_PEN_RUNTIME_FILES: &[&str] = &[
     "pen_web.js",
     "pen_web_bg.wasm",
+    "pen_web_bg.wasm.br",
     "guest.js",
     "structured.js",
     "kernels.js",
@@ -522,6 +523,7 @@ struct DetailPage<'a> {
     slug: &'a str,
     has_docs: bool,
     asset_version: &'a str,
+    preloads: &'a str,
     actions: &'a str,
     main: &'a str,
     scripts: &'a str,
@@ -534,6 +536,7 @@ fn render_detail_html(page: &DetailPage) -> String {
         slug,
         has_docs,
         asset_version,
+        preloads,
         actions,
         main,
         scripts,
@@ -550,7 +553,7 @@ fn render_detail_html(page: &DetailPage) -> String {
   <meta name="theme-color" content="#000000">
   <title>{title} — Ink</title>
   <link rel="stylesheet" href="../../style.css?v={asset_version}">
-</head>
+{preloads}</head>
 <body class="{body_class}">
   <header class="topbar">
     <div class="topbar-inner">
@@ -705,12 +708,18 @@ fn render_pen_demo_html(
     );
     let scripts =
         format!("  <script type=\"module\" src=\"../../demo.js?v={runtime_version}\"></script>\n");
+    let preloads = format!(
+        r#"  <link rel="modulepreload" href="../../demos/pen/pen_web.js?v={runtime_version}">
+  <link rel="preload" as="fetch" href="./game.wasm" crossorigin>
+"#
+    );
     render_detail_html(&DetailPage {
         body_class: "page-demo",
         title: spec.title,
         slug: spec.slug,
         has_docs,
         asset_version,
+        preloads: &preloads,
         actions: &actions,
         main: &main,
         scripts: &scripts,
@@ -761,6 +770,7 @@ fn render_wasm_example_html(
         slug: spec.slug,
         has_docs,
         asset_version,
+        preloads: "",
         actions: "",
         main: &main,
         scripts: &scripts,
@@ -1086,7 +1096,7 @@ fn build_pen_demo(
     let status = Command::new(pen_bin)
         .args(["build", "--project"])
         .arg(&proj)
-        .args(["--web", "--out"])
+        .args(["--web", "--web-compact", "--out"])
         .arg(&export_dir)
         .status()
         .with_context(|| {
@@ -1118,6 +1128,13 @@ fn build_pen_demo(
     for name in ["game.wasm", "catalog.json", "game.json"] {
         copy_file_checked(&export_dir.join(name), &demo_out.join(name))?;
     }
+    for name in ["scene.bin", "text.json"] {
+        let file = export_dir.join(name);
+        if file.is_file() {
+            copy_file_checked(&file, &demo_out.join(name))?;
+        }
+    }
+    copy_assets_dir(&export_dir.join("locales"), &demo_out.join("locales"))?;
     copy_file_checked(&root.join(spec.file), &demo_out.join("source.blot"))?;
     let runtime_version =
         runtime_version_tag(&std::fs::read(out_dir.join("demos/pen/pen_web_bg.wasm"))?);
@@ -1401,6 +1418,10 @@ mod tests {
             assert!(html.contains("<details class=\"source\" data-src=\"./source.blot\">"));
             assert!(html.contains("data-copy"));
             assert!(html.contains("../../demo.js?v=rt42"));
+            assert!(
+                html.contains("rel=\"modulepreload\" href=\"../../demos/pen/pen_web.js?v=rt42\"")
+            );
+            assert!(html.contains("rel=\"preload\" as=\"fetch\" href=\"./game.wasm\" crossorigin"));
             assert!(html.contains("../../app.js?v=abc123"));
             assert!(html.contains("../../style.css?v=abc123"));
             assert!(html.contains("../../docs/index.html"));
