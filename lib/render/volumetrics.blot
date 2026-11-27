@@ -28,8 +28,8 @@ func exp (x: F32) : F32 =>
   let t = if power < -126.0 then -126.0 else if power > 126.0 then 126.0 else power
   let n = floor (t + 0.5)
   let y = (t - n) * ln2
-  let series = 1.0 + y * (1.0 + y * (0.5 + y * (0.16666666666666666 + y * (0.041666666666666664 + y * (0.008333333333333333 + y * (0.001388888888888889 + y * (0.0001984126984126984 + y * 0.0000248015873015873)))))))
-  let (scale, _, _, _) = @simd.u32x4.from_bits (F32.to_u32 (n + 127.0) << 23, 0, 0, 0)
+  let series = 1.0 + y * (1.0 + y * (0.5 + y * (0.16666666666666666 + y * (0.041666666666666664 + y * (0.008333333333333333 + y * (0.001388888888888889 + y * 0.0001984126984126984))))))
+  let scale = F32.from_bits (F32.to_u32 (n + 127.0) << 23)
   return series * scale
 
 // The natural logarithm of a positive finite number (`color.log2` otherwise).
@@ -120,7 +120,7 @@ func slice_length (distance: F32) -> (slices: U32) -> (ray: Vec3) -> (k: U32) : 
 // depths along view Z. Multiply each thickness by the ray's length at use.
 type SliceGeometry is data = $SliceGeometry {centre: F32, thickness: F32}
 func prepare_slices (distance: F32) -> (slices: U32) : #[SliceGeometry] =>
-  let result: #[SliceGeometry] = #[]
+  let result: #[SliceGeometry] = @storage.with_capacity slices
   let previous = boundary_depth distance slices 0.0
   for k in 0 .. slices:
     let coordinate = U32.to_f32 k
@@ -371,21 +371,24 @@ func integrate_terminal (slices: &[Slice]) : (Vec3, F32) =>
 
 private func integrate_boundaries (slices: &[Slice]) -> (write: Bool) -> (column: own #[F32]) : (#[F32], Vec3, F32) =>
   let n = slices.length
-  let light_depth = (0.0, 0.0, 0.0, 0.0)
+  let lr = 0.0
+  let lg = 0.0
+  let lb = 0.0
+  let depth = 0.0
   let transmittance = 1.0
   for k in 0 .. n:
     let slice = slices[k]
     let tau = slice.extinction * slice.delta
     let keep = if tau == 0.0 then 1.0 else exp (0.0 - tau)
     let gain_scale = integrated_gain slice tau keep
-    let source = (slice.source.x, slice.source.y, slice.source.z, tau)
-    let gain = @simd.f32x4.mul source (gain_scale, gain_scale, gain_scale, 1.0)
-    light_depth := @simd.f32x4.add self (@simd.f32x4.mul (transmittance, transmittance, transmittance, 1.0) gain)
+    lr := self + transmittance * (slice.source.x * gain_scale)
+    lg := self + transmittance * (slice.source.y * gain_scale)
+    lb := self + transmittance * (slice.source.z * gain_scale)
+    depth := self + tau
     transmittance := self * keep
     if write:
-      @simd.store column ((k + 1) * column_stride) light_depth
-  let (r, g, b, depth) = light_depth
-  return (column, $Vec3 {x: r, y: g, z: b}, depth)
+      @simd.store column ((k + 1) * column_stride) (lr, lg, lb, depth)
+  return (column, $Vec3 {x: lr, y: lg, z: lb}, depth)
 
 func column_light (column: #[F32]) -> (boundary: U32) : Vec3 =>
   if boundary > 4294967295 / column_stride or column.length < column_stride or boundary * column_stride > column.length - column_stride:

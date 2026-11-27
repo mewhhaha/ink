@@ -384,6 +384,66 @@ private func body_kind (rigid: Maybe Rigid) -> (walker: Maybe Walker) : U32 => c
     $Some _ => kind_kinematic
     $Nothing => kind_static
 
+// Push sphere proxy directly into rows/extents so the return stays flat (5 words) instead of boxing ProxyRow.
+private func push_sphere_proxy (rows: own #[ProxyRow]) -> (extents: own #[F32]) -> (index: U32) -> (kind: U32) -> (is_walker: Bool) -> source -> collider : (Bool, #[ProxyRow], #[F32]) =>
+  let ox_in = if kind == kind_dynamic then 0.0 else collider.offset.x
+  let oy_in = if kind == kind_dynamic then 0.0 else collider.offset.y
+  let oz_in = if kind == kind_dynamic then 0.0 else collider.offset.z
+  let sc_x = if is_walker then 1.0 else source.scale.x
+  let sc_y = if is_walker then 1.0 else source.scale.y
+  let sc_z = if is_walker then 1.0 else source.scale.z
+  let qx = if is_walker then 0.0 else source.rotation.x
+  let qy = if is_walker then 0.0 else source.rotation.y
+  let qz = if is_walker then 0.0 else source.rotation.z
+  let qw = if is_walker then 1.0 else source.rotation.w
+  if not (is_finite source.position.x and is_finite source.position.y and is_finite source.position.z and is_finite sc_x and is_finite sc_y and is_finite sc_z and is_finite qx and is_finite qy and is_finite qz and is_finite qw and is_finite ox_in and is_finite oy_in and is_finite oz_in and is_finite collider.radius and is_finite collider.friction and is_finite collider.restitution):
+    return (false, rows, extents)
+  let sx = abs sc_x
+  let sy = abs sc_y
+  let sz = abs sc_z
+  let cx = source.position.x
+  let cy = source.position.y
+  let cz = source.position.z
+  if ox_in != 0.0 or oy_in != 0.0 or oz_in != 0.0:
+    let (ox, oy, oz) = math.rotate_parts qx qy qz qw (ox_in * sc_x) (oy_in * sc_y) (oz_in * sc_z)
+    cx := self + ox
+    cy := self + oy
+    cz := self + oz
+  let radius = max 0.0 collider.radius * max sx (max sy sz)
+  let i = shapes.sphere_inertia radius
+  if not (is_finite cx and is_finite cy and is_finite cz and is_finite radius and is_finite i and is_finite (abs cx + radius) and is_finite (abs cy + radius) and is_finite (abs cz + radius)):
+    return (false, rows, extents)
+  let center = $Vec3 { x: cx, y: cy, z: cz }
+  let lx = cx - radius
+  let ly = cy - radius
+  let lz = cz - radius
+  let hx = cx + radius
+  let hy = cy + radius
+  let hz = cz + radius
+  @storage.push rows ($ProxyRow {
+    source: index,
+    id: source.id,
+    kind,
+    walker: is_walker,
+    shape: $shapes.StoredCapsule { a: center, b: center, radius },
+    inertia: $Vec3 { x: i, y: i, z: i },
+    inscribed: radius,
+    low: $Vec3 { x: lx, y: ly, z: lz },
+    high: $Vec3 { x: hx, y: hy, z: hz },
+    layer: collider.layer,
+    mask: collider.mask,
+    friction: collider.friction,
+    restitution: collider.restitution,
+    trigger: collider.trigger,
+  })
+  @storage.push extents lx
+  @storage.push extents ly
+  @storage.push extents lz
+  @storage.push extents hx
+  @storage.push extents hy
+  @storage.push extents hz
+  return (true, rows, extents)
+
 private func sphere_proxy_row (index: U32) -> (kind: U32) -> (is_walker: Bool) -> source -> collider : Maybe ProxyRow =>
   let ox_in = if kind == kind_dynamic then 0.0 else collider.offset.x
   let oy_in = if kind == kind_dynamic then 0.0 else collider.offset.y
@@ -1104,13 +1164,14 @@ func empty () : Scene =>
   let leaves: #[U32] = #[]
   let slots: #[U32] = #[]
   return access (shapes.empty ()) proxies bounds order leaves slots
-// Primitive-only builds carry just the written columns across the loop.
-private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (hulls: own #[shapes.StoredPoly]) -> (index: U32) -> (kind: U32) -> (is_walker: Bool) -> source -> collider : (Maybe ProxyRow, #[shapes.Point3], #[shapes.Plane4], #[shapes.StoredPoly]) =>
+// Primitive-only builds carry just the written columns across the loop and push
+// rows/extents directly so the return tuple stays flat (11 words, never boxed).
+private func push_box_columns (rows: own #[ProxyRow]) -> (extents: own #[F32]) -> (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (hulls: own #[shapes.StoredPoly]) -> (index: U32) -> (kind: U32) -> (is_walker: Bool) -> source -> collider : (Bool, #[ProxyRow], #[F32], #[shapes.Point3], #[shapes.Plane4], #[shapes.StoredPoly]) =>
   let scale = if is_walker then math.one3 else source.scale
   let rotation = if is_walker then math.identity_quat else source.rotation
   let offset = if kind == kind_dynamic then math.zero3 else collider.offset
   if not (math.finite3 source.position and math.finite3 scale and math.finite_quat rotation and math.finite3 offset):
-    return ($Nothing, points, planes, hulls)
+    return (false, rows, extents, points, planes, hulls)
   let cx = source.position.x
   let cy = source.position.y
   let cz = source.position.z
@@ -1120,7 +1181,7 @@ private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[
     cy := self + oy
     cz := self + oz
   if not (is_finite cx and is_finite cy and is_finite cz and math.finite3 collider.size):
-    return ($Nothing, points, planes, hulls)
+    return (false, rows, extents, points, planes, hulls)
   let hx = abs collider.size.x * abs scale.x * 0.5
   let hy = abs collider.size.y * abs scale.y * 0.5
   let hz = abs collider.size.z * abs scale.z * 0.5
@@ -1129,7 +1190,7 @@ private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[
   let inscribed = min hx (min hy hz)
   let span = hx + hy + hz
   if not (math.finite3 half and math.finite3 inertia and is_finite inscribed and is_finite span and is_finite (abs cx + span) and is_finite (abs cy + span) and is_finite (abs cz + span)):
-    return ($Nothing, points, planes, hulls)
+    return (false, rows, extents, points, planes, hulls)
   let (poly, points, planes) = shapes.box_columns points planes ($Vec3 { x: cx, y: cy, z: cz }) rotation half
   let low_x = points[poly.verts.start].x
   let low_y = points[poly.verts.start].y
@@ -1165,12 +1226,19 @@ private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[
   let low = $Vec3 { x: low_x, y: low_y, z: low_z }
   let high = $Vec3 { x: high_x, y: high_y, z: high_z }
   if not (math.finite3 low and math.finite3 high and is_finite collider.friction and is_finite collider.restitution):
-    return ($Nothing, points, planes, hulls)
+    return (false, rows, extents, points, planes, hulls)
   let hull_idx = hulls.length
   @storage.push hulls poly
-  return ($Some ($ProxyRow { source: index, id: source.id, kind, walker: is_walker,
+  @storage.push rows ($ProxyRow { source: index, id: source.id, kind, walker: is_walker,
     shape: $shapes.StoredHull hull_idx, inertia, inscribed, low, high, layer: collider.layer,
-    mask: collider.mask, friction: collider.friction, restitution: collider.restitution, trigger: collider.trigger }), points, planes, hulls)
+    mask: collider.mask, friction: collider.friction, restitution: collider.restitution, trigger: collider.trigger })
+  @storage.push extents low_x
+  @storage.push extents low_y
+  @storage.push extents low_z
+  @storage.push extents high_x
+  @storage.push extents high_y
+  @storage.push extents high_z
+  return (true, rows, extents, points, planes, hulls)
 
 // Capsules have no payload spans, so they do not make the surrounding
 // box build carry geometry through its loop.
@@ -1231,23 +1299,42 @@ private func build_sphere_rows_direct (rows: own #[ProxyRow]) -> (slots: own #[U
         let bounds_ok = is_finite (abs cx + radius) and is_finite (abs cy + radius) and is_finite (abs cz + radius)
         if material_ok and bounds_ok and is_finite inertia:
           slot := rows.length
-          @storage.push rows (sphere_row i src.id kind_static false collider cx cy cz radius inertia)
-          @storage.push extents (cx - radius)
-          @storage.push extents (cy - radius)
-          @storage.push extents (cz - radius)
-          @storage.push extents (cx + radius)
-          @storage.push extents (cy + radius)
-          @storage.push extents (cz + radius)
+          let center = $Vec3 { x: cx, y: cy, z: cz }
+          let lx = cx - radius
+          let ly = cy - radius
+          let lz = cz - radius
+          let hx = cx + radius
+          let hy = cy + radius
+          let hz = cz + radius
+          @storage.push rows ($ProxyRow {
+            source: i,
+            id: src.id,
+            kind: kind_static,
+            walker: false,
+            shape: $shapes.StoredCapsule { a: center, b: center, radius },
+            inertia: $Vec3 { x: inertia, y: inertia, z: inertia },
+            inscribed: radius,
+            low: $Vec3 { x: lx, y: ly, z: lz },
+            high: $Vec3 { x: hx, y: hy, z: hz },
+            layer: collider.layer,
+            mask: collider.mask,
+            friction: collider.friction,
+            restitution: collider.restitution,
+            trigger: collider.trigger,
+          })
+          @storage.push extents lx
+          @storage.push extents ly
+          @storage.push extents lz
+          @storage.push extents hx
+          @storage.push extents hy
+          @storage.push extents hz
       else:
-        if let $Some row = sphere_proxy_row i (body_kind src.rigid src.walker) (Maybe.is_some src.walker) src collider:
-          slot := rows.length
-          @storage.push rows row
-          @storage.push extents row.low.x
-          @storage.push extents row.low.y
-          @storage.push extents row.low.z
-          @storage.push extents row.high.x
-          @storage.push extents row.high.y
-          @storage.push extents row.high.z
+        let next_slot = rows.length
+        let (pushed, next_rows, next_extents) = push_sphere_proxy rows extents i (body_kind src.rigid src.walker) (Maybe.is_some src.walker) src collider
+        rows := next_rows
+        extents := next_extents
+        if pushed:
+          slot := next_slot
     @storage.push slots slot
   slots := finish_slots self rows.length
   return (rows, slots, extents)
@@ -1259,29 +1346,36 @@ private func build_primitive_rows_direct (points: own #[shapes.Point3]) -> (plan
   let extents: #[F32] = @storage.with_capacity (n * 6)
   for i in 0 .. n:
     let src = sources[i]
-    let row = $Nothing
+    let slot = 0xFFFFFFFF
     if let $Some col = src.collider:
       if let $Box = col.shape:
-        let (value, next_points, next_planes, next_hulls) = build_box_columns points planes hulls i (body_kind src.rigid src.walker) (Maybe.is_some src.walker) src col
+        let next_slot = rows.length
+        let (pushed, next_rows, next_extents, next_points, next_planes, next_hulls) = push_box_columns rows extents points planes hulls i (body_kind src.rigid src.walker) (Maybe.is_some src.walker) src col
+        rows := next_rows
+        extents := next_extents
         points := next_points
         planes := next_planes
         hulls := next_hulls
-        row := value
+        if pushed:
+          slot := next_slot
       else:
         if let $Sphere = col.shape:
-          row := sphere_proxy_row i (body_kind src.rigid src.walker) (Maybe.is_some src.walker) src col
+          let next_slot = rows.length
+          let (pushed, next_rows, next_extents) = push_sphere_proxy rows extents i (body_kind src.rigid src.walker) (Maybe.is_some src.walker) src col
+          rows := next_rows
+          extents := next_extents
+          if pushed:
+            slot := next_slot
         else:
-          row := primitive_capsule_row i src
-    let slot = 0xFFFFFFFF
-    if let $Some value = row:
-      slot := rows.length
-      @storage.push rows value
-      @storage.push extents value.low.x
-      @storage.push extents value.low.y
-      @storage.push extents value.low.z
-      @storage.push extents value.high.x
-      @storage.push extents value.high.y
-      @storage.push extents value.high.z
+          if let $Some value = primitive_capsule_row i src:
+            slot := rows.length
+            @storage.push rows value
+            @storage.push extents value.low.x
+            @storage.push extents value.low.y
+            @storage.push extents value.low.z
+            @storage.push extents value.high.x
+            @storage.push extents value.high.y
+            @storage.push extents value.high.z
     @storage.push slots slot
   slots := finish_slots self rows.length
   return (rows, slots, extents, points, planes, hulls)
@@ -1639,15 +1733,12 @@ private func build_sphere_source_rows (rows: own #[ProxyRow]) -> (slots: own #[U
     let slot = 0xFFFFFFFF
     if let $Some collider = src.collider:
       let kind = row_body_kind bodies.rigids src
-      if let $Some row = sphere_proxy_row i kind (src.walker != no_body) src collider:
-        slot := rows.length
-        @storage.push rows row
-        @storage.push extents row.low.x
-        @storage.push extents row.low.y
-        @storage.push extents row.low.z
-        @storage.push extents row.high.x
-        @storage.push extents row.high.y
-        @storage.push extents row.high.z
+      let next_slot = rows.length
+      let (pushed, next_rows, next_extents) = push_sphere_proxy rows extents i kind (src.walker != no_body) src collider
+      rows := next_rows
+      extents := next_extents
+      if pushed:
+        slot := next_slot
     @storage.push slots slot
   slots := finish_slots self rows.length
   return (rows, slots, extents)
@@ -1659,31 +1750,38 @@ private func build_primitive_source_rows (points: own #[shapes.Point3]) -> (plan
   let extents: #[F32] = @storage.with_capacity (n * 6)
   for i in 0 .. n:
     let src = sources[i]
-    let row = $Nothing
+    let slot = 0xFFFFFFFF
     if let $Some col = src.collider:
       let kind = row_body_kind bodies.rigids src
       let is_walker = src.walker != no_body
       if let $StoredBox = col.shape:
-        let (value, next_points, next_planes, next_hulls) = build_box_columns points planes hulls i kind is_walker src col
+        let next_slot = rows.length
+        let (pushed, next_rows, next_extents, next_points, next_planes, next_hulls) = push_box_columns rows extents points planes hulls i kind is_walker src col
+        rows := next_rows
+        extents := next_extents
         points := next_points
         planes := next_planes
         hulls := next_hulls
-        row := value
+        if pushed:
+          slot := next_slot
       else:
         if let $StoredSphere = col.shape:
-          row := sphere_proxy_row i kind is_walker src col
+          let next_slot = rows.length
+          let (pushed, next_rows, next_extents) = push_sphere_proxy rows extents i kind is_walker src col
+          rows := next_rows
+          extents := next_extents
+          if pushed:
+            slot := next_slot
         else:
-          row := primitive_capsule_row i (unpack_primitive_source bodies src)
-    let slot = 0xFFFFFFFF
-    if let $Some value = row:
-      slot := rows.length
-      @storage.push rows value
-      @storage.push extents value.low.x
-      @storage.push extents value.low.y
-      @storage.push extents value.low.z
-      @storage.push extents value.high.x
-      @storage.push extents value.high.y
-      @storage.push extents value.high.z
+          if let $Some value = primitive_capsule_row i (unpack_primitive_source bodies src):
+            slot := rows.length
+            @storage.push rows value
+            @storage.push extents value.low.x
+            @storage.push extents value.low.y
+            @storage.push extents value.low.z
+            @storage.push extents value.high.x
+            @storage.push extents value.high.y
+            @storage.push extents value.high.z
     @storage.push slots slot
   slots := finish_slots self rows.length
   return (rows, slots, extents, points, planes, hulls)
