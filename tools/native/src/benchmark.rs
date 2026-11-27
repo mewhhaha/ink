@@ -4,10 +4,10 @@ use crate::{
     workloads::{self, Workload},
 };
 use anyhow::{Context, Result, ensure};
-use blot_host::GuestModule;
 use pen_plugins::BuildResult;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use squid_host::GuestModule;
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -72,7 +72,7 @@ fn source_inventory(paths: &[std::path::PathBuf]) -> Result<BTreeMap<String, Str
             }
         } else if path
             .extension()
-            .is_some_and(|x| x == "blot" || x == "wgsl" || x == "json")
+            .is_some_and(|x| x == "sq" || x == "wgsl" || x == "json")
         {
             let path = path.canonicalize()?;
             result.insert(
@@ -98,7 +98,7 @@ fn toolchain() -> Result<serde_json::Value> {
         .settings
         .as_ref()
         .and_then(|s| s["program"].as_str())
-        .unwrap_or("blotc");
+        .unwrap_or("squidc");
     let binary = &config
         .plugins
         .get(&compiler.plugin)
@@ -143,10 +143,10 @@ fn bounded_call(f: &mut Fixture, w: &Workload, size: usize, deadline: Instant) -
         w.name
     );
     Ok(match result {
-        blot_host::Value::F32(v) => vec![v as f64],
-        blot_host::Value::U32(v) => vec![v as f64],
-        blot_host::Value::ArrayF32(v) => v.into_iter().map(f64::from).collect(),
-        blot_host::Value::ArrayU32(v) => v.into_iter().map(f64::from).collect(),
+        squid_host::Value::F32(v) => vec![v as f64],
+        squid_host::Value::U32(v) => vec![v as f64],
+        squid_host::Value::ArrayF32(v) => v.into_iter().map(f64::from).collect(),
+        squid_host::Value::ArrayU32(v) => v.into_iter().map(f64::from).collect(),
         _ => anyhow::bail!("unsupported benchmark result"),
     })
 }
@@ -202,13 +202,13 @@ pub fn run(filters: &[String]) -> Result<()> {
                 .into_iter()
                 .filter(|(name, _)| {
                     [
-                        "blot:rc_retains",
-                        "blot:rc_releases",
-                        "blot:rc_destroyed",
-                        "blot:cycle_passes",
-                        "blot:cycle_vertices",
-                        "blot:cycle_edges",
-                        "blot:cycle_bytes",
+                        "squid:rc_retains",
+                        "squid:rc_releases",
+                        "squid:rc_destroyed",
+                        "squid:cycle_passes",
+                        "squid:cycle_vertices",
+                        "squid:cycle_edges",
+                        "squid:cycle_bytes",
                     ]
                     .contains(&name.as_str())
                 })
@@ -290,18 +290,15 @@ mod tests {
     fn inventory_includes_fixture_helpers_and_standard_library_sources() {
         let w = workloads::workloads()
             .into_iter()
-            .find(|w| w.fixture == "../tests/codec.blot")
+            .find(|w| w.fixture == "../tests/codec.sq")
             .unwrap();
         let report = compile(&w).unwrap().report;
         let paths = report["dependencies"].as_object().unwrap();
-        for expected in [
-            "tests/codec.blot",
-            "tests/fixtures/derived/model_derived.blot",
-        ] {
+        for expected in ["tests/codec.sq", "tests/fixtures/derived/model_derived.sq"] {
             assert!(paths.contains_key(expected), "missing {expected}");
         }
-        assert!(paths.keys().any(|p| p.ends_with("/std/prelude.blot")));
-        assert!(paths.keys().any(|p| p.ends_with("/std/array.blot")));
+        assert!(paths.keys().any(|p| p.ends_with("/std/prelude.sq")));
+        assert!(paths.keys().any(|p| p.ends_with("/std/array.sq")));
         assert!(paths.values().all(|v| v.as_str().unwrap().len() == 64));
     }
     #[test]

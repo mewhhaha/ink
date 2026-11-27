@@ -22,7 +22,7 @@ fn lanes(keys: &[f64], fresh: &[f64], buttons: &[f64]) -> Vec<f64> {
 }
 #[test]
 fn animation_key_search_matches_linear_reference() {
-    let mut f = Fixture::new("tests/perf/animation-input.blot");
+    let mut f = Fixture::new("tests/perf/animation-input.sq");
     for count in [0usize, 1, 2, 16, 128, 1024, 8192] {
         let times: Vec<f64> = (0..count).map(|i| (i / 3) as f64).collect();
         let query = [
@@ -76,7 +76,7 @@ fn animation_key_search_matches_linear_reference() {
 }
 #[test]
 fn input_restore_preserves_order_and_rejects_malformed_sets() {
-    let mut f = Fixture::new("tests/perf/animation-input.blot");
+    let mut f = Fixture::new("tests/perf/animation-input.sq");
     for count in [0, 1, 64, 128, 256, 512] {
         let keys: Vec<f64> = (0..count).map(|i| (16777215 - i * 11) as f64).collect();
         let values = lanes(&keys, &[9.0, 9.0, 3.0], &[7.0, 0.0, 2.0]);
@@ -124,7 +124,7 @@ fn input_restore_preserves_order_and_rejects_malformed_sets() {
 }
 #[test]
 fn flock_witnesses_ordering_and_memory_plateau() {
-    let mut f = Fixture::new("tests/perf/flock.blot");
+    let mut f = Fixture::new("tests/perf/flock.sq");
     for count in [128, 512, 2048] {
         let rows = count / 32;
         let neighbors = 2 * (31 * rows + (rows - 1) * 32);

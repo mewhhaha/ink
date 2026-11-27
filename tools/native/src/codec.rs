@@ -1,7 +1,7 @@
 use crate::*;
 #[test]
 fn codec_records_variants_nested_collections_and_validation() {
-    let mut f = Fixture::new("tests/codec.blot");
+    let mut f = Fixture::new("tests/codec.sq");
     assert_eq!(
         f.words("persistence", ()),
         vec![16777219, u32::MAX, 16777217, 3, 3]
@@ -15,7 +15,7 @@ fn codec_records_variants_nested_collections_and_validation() {
 }
 #[test]
 fn codec_bit_exact_words_floats_and_invalid_framing() {
-    let mut f = Fixture::new("tests/codec.blot");
+    let mut f = Fixture::new("tests/codec.sq");
     let words = vec![0, 16777217, 0x80000000, u32::MAX];
     let packed = f.floats("packed", words.clone());
     assert_eq!(f.words("unpacked", packed.clone()), words);

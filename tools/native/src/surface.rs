@@ -5,9 +5,9 @@
 // Beer-Lambert volumes and the transmitted light, the subsurface diffuse and
 // parallax occlusion mapping. They are written from the formulas of the
 // materials contract (Pen's WGSL library follows the same ones), not from the
-// Blot, and use f64 throughout: Blot's arithmetic is F32, so agreement is to
+// Squid, and use f64 throughout: Squid's arithmetic is F32, so agreement is to
 // F32's precision (and to its `color.power`'s, about 1e-6 relative) and not by
-// construction. Blot blends `a + (b - a) t`; this blends `a (1 - t) + b t`.
+// construction. Squid blends `a + (b - a) t`; this blends `a (1 - t) + b t`.
 use crate::*;
 use std::f64::consts::PI;
 use std::sync::OnceLock;
@@ -56,7 +56,7 @@ fn max3(a: V) -> f64 {
     a[0].max(a[1]).max(a[2])
 }
 
-/// A surface's 29 lanes in the order `tests/surface.blot` reads them.
+/// A surface's 29 lanes in the order `tests/surface.sq` reads them.
 #[derive(Clone, Copy, Debug)]
 struct Surface {
     base: V,
@@ -151,7 +151,7 @@ impl Frame {
         .concat()
     }
 }
-/// The input of Blot's `surface` entry: surface, frame, light, radiance.
+/// The input of Squid's `surface` entry: surface, frame, light, radiance.
 fn surface_input(s: &Surface, f: &Frame, light: V, radiance: V) -> Vec<f64> {
     [s.lanes(), f.lanes(), light.to_vec(), radiance.to_vec()].concat()
 }
@@ -270,7 +270,7 @@ fn sheen_albedo_exact(nv: f64, roughness: f64, steps: usize) -> f64 {
     }
     (2.0 * sum * (PI / steps as f64) / steps as f64).min(1.0)
 }
-/// The node values of the table the Blot carries: 32 columns evenly spaced in
+/// The node values of the table the Squid carries: 32 columns evenly spaced in
 /// sqrt(nv) and 16 rows in sqrt((roughness - 0.07) / 0.93), row major.
 fn sheen_table_node(row: usize, column: usize, steps: usize) -> f64 {
     let s = column as f64 / (TABLE_NV - 1) as f64;
@@ -652,7 +652,7 @@ fn parallax_shadow(height: &dyn Fn(f64, f64) -> f64, u: f64, v: f64, light: V, s
 
 /// The albedo of a response: the sum over a midpoint grid of `n` cosines
 /// (0 to 1, or -1 to 1 for the `sphere`) by `2n` azimuths about +Y, as the
-/// Blot `albedo` entry sums it.
+/// Squid `albedo` entry sums it.
 fn integrate(n: usize, sphere: bool, f: &dyn Fn(V) -> V) -> V {
     let low = if sphere { -1.0 } else { 0.0 };
     let mut total = BLACK;
@@ -670,7 +670,7 @@ fn integrate(n: usize, sphere: bool, f: &dyn Fn(V) -> V) -> V {
 // ---------------------------------------------------------------- the tests
 
 fn fixture() -> Fixture {
-    Fixture::new("tests/surface.blot")
+    Fixture::new("tests/surface.sq")
 }
 struct Lcg(u64);
 impl Lcg {
@@ -816,7 +816,7 @@ const TABLE_BEGIN: &str = "// sheen-table:begin\n";
 const TABLE_END: &str = "// sheen-table:end\n";
 #[test]
 fn sheen_table_in_the_source_is_the_quadrature() {
-    let path = root().join("lib/render/lighting.blot");
+    let path = root().join("lib/render/lighting.sq");
     let source = std::fs::read_to_string(&path).unwrap();
     let begin = source.find(TABLE_BEGIN).unwrap() + TABLE_BEGIN.len();
     let end = source.find(TABLE_END).unwrap();
@@ -1172,9 +1172,9 @@ fn anisotropy_is_isotropic_at_zero_and_stretches_the_highlight_along_the_tangent
     }
 }
 
-/// A Blot `albedo` of a surface: its response summed over the hemisphere of
+/// A Squid `albedo` of a surface: its response summed over the hemisphere of
 /// lights (the whole sphere when `sphere`) about +Y on an n x 2n grid.
-fn albedo_blot(f: &mut Fixture, s: &Surface, fr: &Frame, n: usize, sphere: bool) -> V {
+fn albedo_squid(f: &mut Fixture, s: &Surface, fr: &Frame, n: usize, sphere: bool) -> V {
     let input = [
         s.lanes(),
         fr.lanes(),
@@ -1340,7 +1340,7 @@ fn clear_coat_is_smith_layered_by_the_views_fresnel_and_never_brighter_than_its_
             r[1]
         );
     }
-    // Energy, Blot against the reference on the lights' grid for coats the
+    // Energy, Squid against the reference on the lights' grid for coats the
     // 96-cell grid resolves (roughness 0.3 and up): the layered sum is the
     // reference's, at most the base's albedo plus the coat alone, at least the
     // coat alone and never above max(1, uncoated base) + 3e-3 (the grid's error);
@@ -1357,7 +1357,7 @@ fn clear_coat_is_smith_layered_by_the_views_fresnel_and_never_brighter_than_its_
         [1.0, 0.03, 0.2],
     ] {
         let fr = Frame::new(up, unit(view));
-        let base = albedo_blot(&mut f, &white, &fr, 96, false);
+        let base = albedo_squid(&mut f, &white, &fr, 96, false);
         for (w, rc) in [(1.0, 0.3), (0.5, 0.6), (1.0, 1.0), (0.25, 0.45)] {
             let mut coated = white;
             coated.coat = w;
@@ -1365,8 +1365,8 @@ fn clear_coat_is_smith_layered_by_the_views_fresnel_and_never_brighter_than_its_
             let mut alone = nothing;
             alone.coat = w;
             alone.coat_roughness = rc;
-            let layered = albedo_blot(&mut f, &coated, &fr, 96, false);
-            let coat_alone = albedo_blot(&mut f, &alone, &fr, 96, false);
+            let layered = albedo_squid(&mut f, &coated, &fr, 96, false);
+            let coat_alone = albedo_squid(&mut f, &alone, &fr, 96, false);
             let want = integrate(96, false, &|l| response(&coated, &fr, l));
             for c in 0..3 {
                 assert!(
@@ -1387,7 +1387,7 @@ fn clear_coat_is_smith_layered_by_the_views_fresnel_and_never_brighter_than_its_
             }
         }
         white.coat = 0.0;
-        assert_eq!(albedo_blot(&mut f, &white, &fr, 96, false), base);
+        assert_eq!(albedo_squid(&mut f, &white, &fr, 96, false), base);
     }
     // Energy at every view down to a cosine of 0.02 and every coat roughness from
     // 0.04 to 1, at full weight, by the reference's direct integration (whose
@@ -1574,11 +1574,11 @@ fn charlie_sheen_has_the_contract_values_a_table_and_layers_by_albedo() {
         ([1.0, 0.5, 0.0], 1.0),
     ] {
         let fr = Frame::new(up, unit(view));
-        let base = albedo_blot(&mut f, &white, &fr, 96, false);
+        let base = albedo_squid(&mut f, &white, &fr, 96, false);
         let mut fuzzy = white;
         fuzzy.sheen_color = WHITE;
         fuzzy.sheen_roughness = rs;
-        let layered = albedo_blot(&mut f, &fuzzy, &fr, 96, false);
+        let layered = albedo_squid(&mut f, &fuzzy, &fr, 96, false);
         let want = integrate(96, false, &|l| response(&fuzzy, &fr, l));
         for c in 0..3 {
             // The base gives up the table's albedo, which is within 0.006 of the
@@ -1599,7 +1599,7 @@ fn charlie_sheen_has_the_contract_values_a_table_and_layers_by_albedo() {
         alone.specular = 0.0;
         alone.sheen_color = WHITE;
         alone.sheen_roughness = rs;
-        let own = albedo_blot(&mut f, &alone, &fr, 192, false);
+        let own = albedo_squid(&mut f, &alone, &fr, 192, false);
         let table_value = sheen_albedo(unit(view)[1], rs);
         assert!(
             (own[0] - table_value).abs() <= 0.01 + 0.02 * table_value,
@@ -1964,7 +1964,7 @@ fn subsurface_wraps_its_light_conserves_energy_and_glows_from_behind() {
     }
 }
 
-/// The analytic height fields of `tests/surface.blot`'s `parallax` entry.
+/// The analytic height fields of `tests/surface.sq`'s `parallax` entry.
 fn field_lanes(kind: f64, a: [f64; 4]) -> Vec<f64> {
     vec![kind, a[0], a[1], a[2], a[3]]
 }
@@ -2424,7 +2424,7 @@ fn iridescence_fresnel_ref(
 
 #[test]
 fn thin_film_iridescence_and_dispersion_match_f64_reference() {
-    let mut f = Fixture::new("tests/surface.blot");
+    let mut f = Fixture::new("tests/surface.sq");
     let bare_11 = ((1.1f64 - 1.0) / (1.1 + 1.0)).powi(2);
     for (outside, film, cos_t1, thickness, base_f0, ior, disp) in [
         (1.0, 1.3, 1.0, 0.0, [bare_11; 3], 1.1, 0.0),

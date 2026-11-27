@@ -42,7 +42,7 @@ fn grid(n: usize, size: f64, height: impl Fn(f64, f64) -> f64) -> (Vec<V>, Vec<u
 
 #[test]
 fn mesh_cooks_flat_grid() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let (v, i) = grid(2, 4.0, |_, _| 0.0);
     let out = f.floats("cook", packet(&v, &i, &[]));
     println!("{out:?}");
@@ -161,7 +161,7 @@ fn random_soup(seed: u32, count: usize) -> (Vec<V>, Vec<u32>) {
 
 #[test]
 fn mesh_segment_gaps_match_brute_force() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let mut r = Random(7);
     let (mut compared, mut crossed, mut touching) = (0, 0, 0);
     for seed in 0..12 {
@@ -221,7 +221,7 @@ fn ray_triangle(o: V, d: V, t: [V; 3]) -> Option<f64> {
 
 #[test]
 fn mesh_rays_match_brute_force() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let mut r = Random(3);
     let (mut hits, mut misses) = (0, 0);
     for seed in 0..10 {
@@ -269,7 +269,7 @@ fn contacts_of(f: &mut Fixture, v: &[V], i: &[u32], query: &[f64]) -> Vec<[f64; 
 
 #[test]
 fn mesh_capsule_contacts_match_reference_in_every_region() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let tri: [V; 3] = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 2.0]];
     let (v, i) = (tri.to_vec(), vec![0u32, 2, 1]);
     // Segments chosen over the face, an edge, a vertex and beyond; spheres
@@ -319,7 +319,7 @@ fn mesh_capsule_contacts_match_reference_in_every_region() {
 
 #[test]
 fn mesh_hull_contacts_match_separating_axis_reference() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let mut r = Random(11);
     let (mut touching, mut apart, mut edge_edge) = (0, 0, 0);
     for _ in 0..160 {
@@ -505,7 +505,7 @@ fn world(
 
 #[test]
 fn box_and_capsule_slide_over_a_tessellated_floor_without_bumps() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     // A box, a sphere and a capsule sliding at 4 m/s over 144 triangles with
     // alternating diagonals: seams every 0.83 m, crossed at every angle.
     let floor = Floor {
@@ -595,7 +595,7 @@ fn bits(t: &Trace) -> Vec<u64> {
 
 #[test]
 fn stacking_on_a_mesh_floor_matches_a_hull_floor_and_sleeps() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let mesh = Floor {
         kind: 0.0,
         n: 6.0,
@@ -644,7 +644,7 @@ fn stacking_on_a_mesh_floor_matches_a_hull_floor_and_sleeps() {
 
 #[test]
 fn mesh_simulation_replays_bit_for_bit_and_prepared_matches_rebuilt() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let floors = [
         Floor {
             kind: 0.0,
@@ -714,7 +714,7 @@ fn mesh_simulation_replays_bit_for_bit_and_prepared_matches_rebuilt() {
 
 #[test]
 fn a_box_dropped_on_a_mesh_comes_to_rest_and_sleeps() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let floor = Floor {
         kind: 3.0,
         n: 12.0,
@@ -761,7 +761,7 @@ fn walk(
 
 #[test]
 fn character_walks_over_mesh_stairs_and_slopes() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     // Eight 15 cm steps, 40 cm deep, then a landing.
     let stairs = Floor {
         kind: 2.0,
@@ -832,7 +832,7 @@ fn character_walks_over_mesh_stairs_and_slopes() {
 
 #[test]
 fn updating_a_scene_with_a_mesh_matches_rebuilding_it() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     for (kind, param) in [(0, 0.0), (1, 0.3), (2, 0.2)] {
         let (v, i) = match kind {
             2 => stairs(5, 6.0, param),
@@ -882,7 +882,7 @@ fn cooked(f: &mut Fixture, v: &[V], i: &[u32]) -> f64 {
 
 #[test]
 fn degenerate_and_malformed_meshes_are_rejected_or_cleaned() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let square: Vec<V> = vec![
         [0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0],
@@ -952,7 +952,7 @@ fn degenerate_and_malformed_meshes_are_rejected_or_cleaned() {
 
 #[test]
 fn debug_draws_every_mesh_edge_once() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     for n in [1usize, 3, 5] {
         let (v, i) = grid(n, 4.0, |_, _| 0.0);
         // Horizontal and vertical lattice edges plus one diagonal per cell.
@@ -966,7 +966,7 @@ fn debug_draws_every_mesh_edge_once() {
 
 #[test]
 fn non_finite_queries_return_without_hitting_anything() {
-    let mut f = Fixture::new("tests/mesh_collider.blot");
+    let mut f = Fixture::new("tests/mesh_collider.sq");
     let (v, i) = grid(3, 4.0, |_, _| 0.0);
     let nan = f64::NAN;
     let gap = f.floats(

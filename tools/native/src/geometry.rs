@@ -1,7 +1,7 @@
 use crate::*;
 #[test]
 fn redundant_rotated_hulls_keep_topology_and_analytic_distances() {
-    let mut f = Fixture::new("tests/perf/geometry.blot");
+    let mut f = Fixture::new("tests/perf/geometry.sq");
     for angle in [0f64, 0.17, 0.63, 1.1] {
         let (s, c) = angle.sin_cos();
         let rotate = |v: [f64; 3]| [c * v[0] - s * v[2], v[1], s * v[0] + c * v[2]];
@@ -83,7 +83,7 @@ fn redundant_rotated_hulls_keep_topology_and_analytic_distances() {
 }
 #[test]
 fn near_parallel_planes_keep_tighter_half_space() {
-    let mut f = Fixture::new("tests/perf/geometry.blot");
+    let mut f = Fixture::new("tests/perf/geometry.sq");
     let planes = [
         [1., 0., 0., 1.],
         [-1., 0., 0., 1.],

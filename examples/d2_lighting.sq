@@ -1,0 +1,215 @@
+// Run the headless example check with pen test-squid examples/d2_lighting.sq.
+// To display the room, use this file as src/main.sq in a Pen project with
+// the ink/ and pen/ imports configured as in Ink's pen.json. The asset catalog
+// can be empty ({"meshes":[],"materials":[]}).
+import { Vec2 } from "std/vector"
+import * as events from "ink/events"
+import * as i18n from "ink/i18n"
+import * as math from "ink/math"
+import * as pen_events from "ink/pen/events"
+import * as shapes from "ink/physics/d2/shapes"
+import * as world from "ink/physics/d2/world"
+import * as render from "ink/render"
+import * as d2 from "ink/render/d2"
+import * as lines from "ink/render/lines"
+import * as host_frame from "ink/pen/host"
+import * as program from "ink/pen/program"
+import * as persist from "ink/persist"
+import * as preferences from "ink/preferences"
+import * as services from "ink/services"
+import * as sound from "ink/sound"
+import * as tree from "ink/ui/tree"
+import * as protocol from "pen/protocol"
+
+private const floor_center = math.vec2 0.0 (-2.75)
+private const wall_center = math.vec2 0.75 (-1.15)
+private const wall_half = math.vec2 0.3 1.35
+private const ball_radius: F32 = 0.35
+
+private func initial_ball () : shapes.Body2D =>
+  let ball = shapes.dynamic_circle (math.vec2 (-1.8) 2.0) ball_radius 1.0 0.65 0.35
+  return shapes.body_with_vel (math.vec2 2.0 0.0) 0.0 ball
+
+private func advance (dt: F32) -> (ball: shapes.Body2D) : shapes.Body2D =>
+  let bodies = #[
+    ball,
+    shapes.static_box floor_center 4.0 0.25 0.0 0.8,
+    shapes.static_box wall_center wall_half.x wall_half.y 0.0 0.8,
+    shapes.static_box (math.vec2 (-3.85) 0.0) 0.15 3.0 0.0 0.8,
+    shapes.static_box (math.vec2 3.85 0.0) 0.15 3.0 0.0 0.8,
+  ]
+  let (stepped, _) = world.step_world (math.vec2 0.0 (-9.81)) (min dt (1.0 / 30.0)) 8 bodies
+  return stepped[0]
+
+func hud_label locale : #[U32] =>
+  let key: #[U32] = #[108, 105, 103, 104, 116] // light
+  let english = i18n.add_text key #[76, 73, 84] (i18n.empty_catalog #[101, 110]) // LIT
+  let primary = if i18n.same_ignore_case (i18n.primary_language locale) #[101, 115]
+    then i18n.add_text key #[76, 85, 90] (i18n.empty_catalog locale) // LUZ
+    else i18n.empty_catalog locale
+  return case i18n.translate primary english key of
+    $Some label => @storage.copy label
+    $Nothing => #[]
+
+// A tiny 3-by-5 font for the five letters used by this asset-free HUD.
+private func glyph (code: U32) : U32 =>
+  case code of
+    76 => 0x7249 // L
+    73 => 0x7497 // I
+    84 => 0x2497 // T
+    85 => 0x7b6d // U
+    90 => 0x72a7 // Z
+    _ => 0
+
+private func screen (camera: d2.Camera2d) -> (viewport: Vec2) -> (point: Vec2) : Vec2 =>
+  return math.vec2 (viewport.x * 0.5 + (point.x - camera.center.x) * camera.zoom)
+    (viewport.y * 0.5 - (point.y - camera.center.y) * camera.zoom)
+
+func room_frame (ball: shapes.Body2D) -> (viewport: Vec2) -> locale : render.FrameAccess =>
+  let zoom = min (viewport.x / 10.0) (viewport.y / 8.0)
+  let camera = $d2.Camera2d { center: math.vec2 0.0 0.0, zoom, rotation: 0.0 }
+  let tilemap = $d2.TilemapHeader {
+    material_idx: -1.0, origin: math.vec2 (-4.0) 3.0, tile_size: math.vec2 1.0 1.0,
+    grid_w: 8, grid_h: 6, atlas_cols: 1, atlas_rows: 1,
+    anim_time: 0.0, anim_fps: 0.0, tint: math.vec4 0.16 0.20 0.28 1.0,
+  }
+  let cells: #[U32] = #[]
+  for _ in 0 .. 48:
+    @storage.push cells (d2.tile_cell 1 false false false 0)
+  let sprites = #[$d2.Sprite2d {
+    material_idx: -1.0, pos: wall_center, size: math.vec2 (wall_half.x * 2.0) (wall_half.y * 2.0),
+    pivot: math.vec2 0.5 0.5, rotation: 0.0, z_layer: 1.0,
+    uv_rect: math.vec4 0.0 0.0 1.0 1.0, color: math.vec4 0.37 0.42 0.51 1.0,
+    nine_slice: math.vec4 0.1 0.1 0.1 0.1, flip_x: false, flip_y: false, tex_size: math.vec2 1.0 1.0,
+  }]
+  let ball_px = screen camera viewport ball.pos
+  let wall_px = screen camera viewport wall_center
+  let radius_px = ball_radius * zoom
+  let half_px = math.vec2 (wall_half.x * zoom) (wall_half.y * zoom)
+  let emitters: #[d2.Emitter2d] = #[
+    $d2.Circle { center: ball_px, radius: radius_px, material: math.vec4 3.2 1.35 0.4 1.0 },
+    $d2.Rect {
+      rect: math.vec4 (wall_px.x - half_px.x) (wall_px.y - half_px.y) (2.0 * half_px.x) (2.0 * half_px.y),
+      material: math.vec4 0.0 0.0 0.0 1.0,
+    },
+  ]
+  let max_dim = max viewport.x viewport.y
+  let spacing = max 12 (min 24 (F32.to_u32 (max_dim / 76.0)))
+  let rc = $d2.Rc2dConfig { mode: 2, c0_spacing: spacing, c0_dirs: 8, cascades: 3, ambient: 0.22, multiply: 0.58, add: 0.85 }
+  let frame = render.empty_frame ()
+  frame := d2.emit_world_extension camera true ($Some tilemap) (&cells[0..cells.length]) (&sprites[0..sprites.length]) rc (&emitters[0..emitters.length]) self
+
+  let card = d2.card (math.vec4 16.0 16.0 78.0 44.0) 8.0 (math.vec4 0.03 0.05 0.08 0.95)
+    (math.vec4 0.36 0.54 0.72 1.0) 1.0 (math.vec4 0.0 0.0 0.0 0.6) (math.vec2 0.0 3.0) 4.0
+  let label = hud_label locale
+  let hud: #[d2.SdfShape] = #[card]
+  for i in 0 .. label.length:
+    let pixels = glyph label[i]
+    for bit in 0 .. 15:
+      if ((pixels >> bit) & 1) != 0:
+        let x = 33.0 + U32.to_f32 (i * 16 + (bit % 3) * 4)
+        let y = 28.0 + U32.to_f32 ((bit / 3) * 4)
+        let dot = d2.rounded_rect (math.vec4 x y 4.0 4.0) (math.vec4 0.0 0.0 0.0 0.0) (math.vec4 0.75 0.88 1.0 1.0)
+        dot.overlay := true
+        @storage.push hud dot
+  frame := d2.emit_sdf_extension (&hud[0..hud.length]) self
+
+  let style = $lines.LineStyle { width_px: 1.5, dash_len_px: 5.0, gap_len_px: 3.0, feather_px: 1.0, layer: $lines.OnTop }
+  let debug_color = math.vec4 0.25 0.85 1.0 0.8
+  let segments: #[lines.Segment] = #[]
+  segments := lines.push_d2_rect (screen camera viewport floor_center) (math.vec2 (4.0 * zoom) (0.25 * zoom)) 0.0 true debug_color style self
+  segments := lines.push_d2_rect wall_px half_px 0.0 true debug_color style self
+  segments := lines.push_d2_circle ball_px radius_px 32 true debug_color style self
+  return lines.emit_extension ($lines.XRayConfig { alpha: 0.25, desaturate: 0.5 }) (&segments[0..segments.length]) frame
+
+private const schema: U32 = 1
+
+private func checkpoint (ball: shapes.Body2D) -> (out: own #[F32]) : #[F32] =>
+  return program.append #[ball.pos.x, ball.pos.y, ball.vel.x, ball.vel.y, ball.angle, ball.ang_vel] out
+
+private func encode (frame: render.FrameAccess) -> (out: own #[F32]) : #[F32] =>
+  let kept = preferences.make
+    ($preferences.Quality { msaa: 1, fxaa: false, scale: 1.0, filtering: 0, shadows: 0,
+      occlusion: false, sky: false, fog: 0.0, effects: false, bloom: false, reflections: 0, volumetrics: 0 })
+    ($preferences.Volumes { master: 0.0, effects: 0.0, music: 0.0 })
+    ($preferences.Controls { left_handed: false })
+  let audio = sound.empty_access ()
+  let nodes: #[tree.StoredNode] = #[]
+  let labels: #[U32] = #[]
+  let next: #[U32] = #[1]
+  let requests: #[services.Request] = #[]
+  let waiting: #[services.Request] = #[]
+  let filling: #[services.Filling] = #[]
+  let answers: #[services.Answer] = #[]
+  let statuses: #[U32] = #[]
+  let payload: #[F32] = #[]
+  let service_state = services.access next requests waiting filling answers statuses payload
+  return host_frame.append_frame schema (persist.requests ()) (sound.read audio) kept (&nodes[0..0])
+    (&labels[0..0]) (render.finish frame) (&service_state.outbox[0..0]) service_state out
+
+private func dispatch (balls: own #[shapes.Body2D]) -> (operation: U32) -> (payload: &[F32]) -> (out: own #[F32]) : (#[shapes.Body2D], #[F32]) =>
+  if operation == 1:
+    let start = initial_ball ()
+    balls[0] := start
+    return (balls, checkpoint start out)
+  if operation == 2:
+    let raw_events: #[protocol.Event] = #[]
+    let input = protocol.decode_input_into payload raw_events
+    let launched = balls[0]
+    let vw = max 1.0 input.width
+    let vh = max 1.0 input.height
+    let zoom = max 1.0 (min (vw / 10.0) (vh / 8.0))
+    for r in input.events:
+      let ev = pen_events.from_packet r
+      if let $events.PointerDown { button, x, y } = ev:
+        if button == 0:
+          let wx = (x - vw * 0.5) / zoom
+          let wy = (vh * 0.5 - y) / zoom
+          let dx = wx - launched.pos.x
+          let dy = wy - launched.pos.y
+          let len = max 0.25 (sqrt (dx * dx + dy * dy))
+          let speed = min 9.0 (3.5 + len * 1.4)
+          launched := shapes.body_with_vel (math.vec2 (dx / len * speed) (max 2.5 (dy / len * speed + 2.5))) 0.0 launched
+    let updated = advance input.elapsed launched
+    balls[0] := updated
+    let frame = room_frame updated (math.vec2 input.width input.height) #[101, 115]
+    return (balls, encode frame out)
+  if operation == 3:
+    let current = balls[0]
+    return (balls, checkpoint current out)
+  if operation == 4:
+    let valid = payload.length == 6
+    if valid:
+      balls[0] := shapes.body_with_motion (math.vec2 payload[0] payload[1]) (math.vec2 payload[2] payload[3])
+        payload[4] payload[5] (initial_ball ())
+    return (balls, program.append #[if valid then 1.0 else 0.0] out)
+  return (balls, out)
+
+io main (host: #[F32] -> #[F32] ! {Foreign}) : Unit ! {Foreign} =>
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
+  let balls: #[shapes.Body2D] = #[initial_ball ()]
+  use _ <- program.run dispatch (func (own b) -> (_: Bool) => b) balls schema false incoming outgoing host
+  return ()
+
+io test_d2_lighting_room () : #[F32] =>
+  let start = initial_ball ()
+  let moved = advance (1.0 / 60.0) start
+  let label = hud_label #[101, 115, 45, 77, 88]
+  let fallback = hud_label #[102, 114]
+  let frame = room_frame moved (math.vec2 640.0 480.0) #[101, 115]
+  let tags_ok = frame.extensions.length == 3 and frame.extensions[0].tag == 65009
+    and frame.extensions[1].tag == 65008 and frame.extensions[2].tag == 65006
+  let label_ok = label.length == 3 and label[1] == 85 and fallback.length == 3 and fallback[1] == 73
+  let movement_ok = moved.pos.x > start.pos.x and moved.pos.y < start.pos.y
+  let room = frame.extensions[0].values
+  let first_cell = frame.extension_values[room.start + 29]
+  let light_x = frame.extension_values[room.start + 103]
+  let packet_ok = room.count == 120 and first_cell == 1.0 and light_x > 200.0 and light_x < 240.0
+    and frame.extensions[2].values.count == 642
+  let passed = tags_ok and label_ok and movement_ok and packet_ok
+  if passed:
+    return #[1.0, 0.0]
+  return #[1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0, 4.0,
+    if tags_ok then 1.0 else 0.0, if label_ok then 1.0 else 0.0,
+    if movement_ok then 1.0 else 0.0, if packet_ok then 1.0 else 0.0]

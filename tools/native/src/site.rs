@@ -2,16 +2,16 @@
 //!
 //! Generates a minimal, zero-dashboard static site:
 //! - `index.html`: pure HTML index (no JS, no filters/search) linking to
-//!   top-level WebGPU demo pages and Blot Wasm example pages.
+//!   top-level WebGPU demo pages and Squid Wasm example pages.
 //! - `demos/<slug>/`: top-level Pen WebGPU demo pages sharing one deduplicated
 //!   Pen browser host under `demos/pen/` plus a scoped `demos/service-worker.js`.
-//! - `examples/<slug>/`: top-level pure-Blot Wasm example pages with an on-demand
-//!   `source.blot` viewer and ABI 8 browser runner.
-//! - `docs/`: compiler-backed HTML API reference (`blot doc ink --html`).
+//! - `examples/<slug>/`: top-level pure-Squid Wasm example pages with an on-demand
+//!   `source.sq` viewer and ABI 8 browser runner.
+//! - `docs/`: compiler-backed HTML API reference (`squid doc ink --html`).
 use anyhow::{Context, Result, bail, ensure};
-use blot_host::{GuestModule, Parameter, ValueType};
 use pen_plugins::{BuildResult, Plugins};
 use serde::Serialize;
+use squid_host::{GuestModule, Parameter, ValueType};
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -20,7 +20,7 @@ use std::{
 
 const STYLE_CSS: &str = include_str!("../../site/style.css");
 const APP_JS: &str = include_str!("../../site/app.js");
-const BLOT_HIGHLIGHT_JS: &str = include_str!("../../site/blot-highlight.js");
+const SQUID_HIGHLIGHT_JS: &str = include_str!("../../site/squid-highlight.js");
 const DEMO_JS: &str = include_str!("../../site/demo.js");
 const DEMOS_SW_JS: &str = include_str!("../../site/demos-sw.js");
 const RETIRE_ROOT_SW_JS: &str = include_str!("../../site/service-worker.js");
@@ -94,8 +94,8 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         title: "Mini Doom — Freedoom E1M1",
         summary: "Playable Freedoom E1M1 with BSP doors and lifts, four weapons, four enemy types, exploding barrels, Tab automap, and WAD sound effects.",
         controls: "Click viewport for mouse look (Esc pauses/releases), WASD walk, Shift run, E/Space use doors & switches, Click/Ctrl fire, 1–4 weapons, Tab map, H help.",
-        file: "examples/mini_doom.blot",
-        companions: &["examples/mini_doom_e1m1.blot"],
+        file: "examples/mini_doom.sq",
+        companions: &["examples/mini_doom_e1m1.sq"],
         assets: DemoAssets::MiniDoom,
         fps_mode: Some("doom"),
         host: PenWebHost::ThreeD,
@@ -105,7 +105,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         title: "Mini Minecraft — Voxel Sandbox",
         summary: "Deterministic voxel world with caves, trees, a day/night cycle, crafting, and survival meters.",
         controls: "Click for mouse look. WASD walk, Space jump/swim, Shift run, Ctrl sneak, Left mine, Right/E place, 1–8/wheel select, C craft. Break leaves to find berries, F eat, R respawn, F5/F9 save/load, H help.",
-        file: "examples/mini_minecraft.blot",
+        file: "examples/mini_minecraft.sq",
         companions: &[],
         assets: DemoAssets::MiniMinecraft,
         fps_mode: Some("minecraft"),
@@ -116,7 +116,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         title: "3D GI & Lighting Scenarios",
         summary: "Live 3D sanctuary switching between Sunlit DDGI, Cornell bounce, 48-Light Night, Volumetric Dusk, and Neon LTC.",
         controls: "Switch lighting scenarios (1–5), toggle DDGI / RT tiers, adjust Sun Angle & Fog, or drag to orbit.",
-        file: "examples/gi_lighting.blot",
+        file: "examples/gi_lighting.sq",
         companions: &[],
         assets: DemoAssets::ProceduralPbr3d,
         fps_mode: None,
@@ -127,7 +127,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         title: "Drawful Sketch UI",
         summary: "Hand-drawn immediate-mode widgets, 5 fps line boil, themes, and a doodle pad.",
         controls: "Click or press Tab / Shift+Tab, Arrows, and Enter to use widgets; draw inside the chalkboard pad.",
-        file: "examples/sketch_ui.blot",
+        file: "examples/sketch_ui.sq",
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
@@ -138,7 +138,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         title: "2D Physics & Radiance Cascades GI",
         summary: "2D rigid body casting real-time global illumination shadows around a wall.",
         controls: "Click anywhere in the room to launch the glowing orb across the wall.",
-        file: "examples/d2_lighting.blot",
+        file: "examples/d2_lighting.sq",
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
@@ -149,7 +149,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         title: "3D Physics & Joints Sandbox",
         summary: "Wireframe rigid-body crate tower hit by a swinging distance-joint pendulum.",
         controls: "Press KICK! or RESET, toggle AUTO ORBIT, and adjust GRAVITY or CAM YAW.",
-        file: "examples/physics_sandbox.blot",
+        file: "examples/physics_sandbox.sq",
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
@@ -160,7 +160,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         title: "Navmesh, Funnel & ORCA Crowd",
         summary: "Convex polygon navmesh, A* corridor, funnel path, and six ORCA crowd agents.",
         controls: "Click anywhere in the arena to move the goal; tweak CLEARANCE or click SWAP.",
-        file: "examples/nav_playground.blot",
+        file: "examples/nav_playground.sq",
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
@@ -171,7 +171,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         title: "Procedural IK & Springs",
         summary: "Two-bone analytic IK and a 6-bone FABRIK chain tracking a spring target.",
         controls: "Move the pointer across the stage, click for trauma shake, or adjust sliders.",
-        file: "examples/ik_rig.blot",
+        file: "examples/ik_rig.sq",
         companions: &[],
         assets: DemoAssets::Empty,
         fps_mode: None,
@@ -186,7 +186,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "orbit",
         title: "Quaternion Orbit",
         summary: "Axis-angle quaternion rotation of the forward vector around +Y.",
-        file: "examples/orbit.blot",
+        file: "examples/orbit.sq",
         default_arg: 1.5708,
         param_label: "angle (rad)",
         max_arg: None,
@@ -195,7 +195,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "ecs",
         title: "Core ECS Pools",
         summary: "Spawning entities and stepping caller-owned component pools.",
-        file: "examples/ecs.blot",
+        file: "examples/ecs.sq",
         default_arg: 0.5,
         param_label: "seconds",
         max_arg: None,
@@ -204,7 +204,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "incremental_ecs",
         title: "Incremental ECS & Deltas",
         summary: "Cached queries, spawn recipes, coalesced commands, journals, and relations.",
-        file: "examples/incremental_ecs.blot",
+        file: "examples/incremental_ecs.sq",
         default_arg: 0.0,
         param_label: "",
         max_arg: None,
@@ -213,7 +213,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "collections",
         title: "Maps, Sets & Handles",
         summary: "Caller-owned hash maps, typed generational handles, and explicit copies.",
-        file: "examples/collections.blot",
+        file: "examples/collections.sq",
         default_arg: 0.0,
         param_label: "",
         max_arg: None,
@@ -222,7 +222,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "physics",
         title: "3D Free-Fall Physics",
         summary: "Stepping a dynamic 3D rigid sphere with caller-owned contact storage.",
-        file: "examples/physics.blot",
+        file: "examples/physics.sq",
         default_arg: 10.0,
         param_label: "height (m)",
         max_arg: None,
@@ -231,7 +231,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "steps",
         title: "Fixed Timestep & Pose Lerp",
         summary: "Fixed-step accumulator with catch-up limit and pose interpolation.",
-        file: "examples/steps.blot",
+        file: "examples/steps.sq",
         default_arg: 0.05,
         param_label: "delta (s)",
         max_arg: None,
@@ -240,7 +240,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "joints",
         title: "Distance-Joint Pendulum",
         summary: "3D rigid body constrained to a world anchor via distance joints.",
-        file: "examples/joints.blot",
+        file: "examples/joints.sq",
         default_arg: 16.0,
         param_label: "ticks (0–16)",
         max_arg: Some(16),
@@ -249,7 +249,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "ground",
         title: "Heightfield Terrain",
         summary: "Bilinear heightfield elevation sampling in world space.",
-        file: "examples/ground.blot",
+        file: "examples/ground.sq",
         default_arg: 0.0,
         param_label: "x (m)",
         max_arg: None,
@@ -258,7 +258,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "navigation",
         title: "Grid A* Pathfinding",
         summary: "Weighted 4-neighbor A* shortest path on an authored grid.",
-        file: "examples/navigation.blot",
+        file: "examples/navigation.sq",
         default_arg: 0.0,
         param_label: "start cell (0–11)",
         max_arg: Some(11),
@@ -267,7 +267,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "navmesh",
         title: "Navmesh Funnel & ORCA",
         summary: "Polygon navmesh corridor search, funnel pull, and reciprocal avoidance.",
-        file: "examples/navmesh.blot",
+        file: "examples/navmesh.sq",
         default_arg: 0.0,
         param_label: "",
         max_arg: None,
@@ -276,7 +276,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "animation",
         title: "Skeletal Blend & Foot IK",
         summary: "Clip evaluation, cross-fading, root motion, and pose synthesis.",
-        file: "examples/animation.blot",
+        file: "examples/animation.sq",
         default_arg: 1.5,
         param_label: "speed",
         max_arg: None,
@@ -285,7 +285,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "cinematic",
         title: "Timeline & Sequencer Shot",
         summary: "Multi-track Hermite curves, camera director blends, and cues.",
-        file: "examples/cinematic.blot",
+        file: "examples/cinematic.sq",
         default_arg: 0.5,
         param_label: "seconds",
         max_arg: None,
@@ -294,7 +294,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "rollback",
         title: "Two-Peer GGPO Rollback",
         summary: "Deterministic rollback netcode with snapshot rings and checksums.",
-        file: "examples/rollback.blot",
+        file: "examples/rollback.sq",
         default_arg: 40.0,
         param_label: "frames",
         max_arg: Some(2000),
@@ -303,7 +303,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "showcase_editor",
         title: "Scene Graph, Editor & Kernels",
         summary: "Ray picking, undo/redo, play-in-editor snapshots, and SIMD kernels.",
-        file: "examples/showcase_editor.blot",
+        file: "examples/showcase_editor.sq",
         default_arg: 0.5,
         param_label: "time (s)",
         max_arg: None,
@@ -312,7 +312,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "game",
         title: "Composed Game State",
         summary: "End-to-end game tick combining math, timing, and explicit state.",
-        file: "examples/game.blot",
+        file: "examples/game.sq",
         default_arg: 0.5,
         param_label: "seconds",
         max_arg: None,
@@ -321,7 +321,7 @@ const WASM_EXAMPLES: &[WasmExampleSpec] = &[
         slug: "mechanisms",
         title: "Cross-Module Mechanisms",
         summary: "Clocks, handles, derived caches, preferences, and task queues together.",
-        file: "examples/mechanisms.blot",
+        file: "examples/mechanisms.sq",
         default_arg: 0.0,
         param_label: "",
         max_arg: None,
@@ -368,9 +368,9 @@ fn find_pen_bin() -> PathBuf {
     PathBuf::from("pen")
 }
 
-fn find_blot2_root(root: &Path) -> Result<PathBuf> {
-    let candidate = root.join("../blot2").canonicalize().context(
-        "sibling ../blot2 checkout not found (required for Blot stdlib and native compiler)",
+fn find_squid_lang_root(root: &Path) -> Result<PathBuf> {
+    let candidate = root.join("../squid-lang").canonicalize().context(
+        "sibling ../squid-lang checkout not found (required for Squid stdlib and native compiler)",
     )?;
     ensure!(
         candidate.join("std").is_dir(),
@@ -380,18 +380,18 @@ fn find_blot2_root(root: &Path) -> Result<PathBuf> {
     Ok(candidate)
 }
 
-fn find_blotc(blot2: &Path) -> Result<PathBuf> {
-    let direct = blot2.join("compiler-goose/build/blotc-goose");
+fn find_squidc(squid_lang: &Path) -> Result<PathBuf> {
+    let direct = squid_lang.join("compiler-goose/build/squidc-goose");
     if direct.is_file() {
         return Ok(direct);
     }
-    let gz = blot2.join("generated/compiler/blotc.gz");
+    let gz = squid_lang.join("generated/compiler/squidc.gz");
     if gz.is_file() {
         return Ok(gz);
     }
     bail!(
-        "no Blot compiler found under {} (expected compiler-goose/build/blotc-goose or generated/compiler/blotc.gz)",
-        blot2.display()
+        "no Squid compiler found under {} (expected compiler-goose/build/squidc-goose or generated/compiler/squidc.gz)",
+        squid_lang.display()
     );
 }
 
@@ -463,7 +463,7 @@ fn asset_version_tag() -> String {
     fnv_tag(&[
         STYLE_CSS.as_bytes(),
         APP_JS.as_bytes(),
-        BLOT_HIGHLIGHT_JS.as_bytes(),
+        SQUID_HIGHLIGHT_JS.as_bytes(),
     ])
 }
 
@@ -527,7 +527,7 @@ fn render_drawer_html(current_slug: &str, has_docs: bool) -> String {
 {demos}          </ul>
         </section>
         <section class="drawer-group" aria-labelledby="drawer-examples">
-          <h2 id="drawer-examples">Blot Wasm examples <span class="drawer-count">{example_count}</span></h2>
+          <h2 id="drawer-examples">Squid Wasm examples <span class="drawer-count">{example_count}</span></h2>
           <ul>
 {examples}          </ul>
         </section>
@@ -609,7 +609,7 @@ fn render_source_details(spec_file: &str, open: bool) -> String {
     let github_url = format!("{GITHUB_BLOB}{spec_file}");
     let open = if open { " open" } else { "" };
     format!(
-        r#"      <details class="source" data-src="./source.blot"{open}>
+        r#"      <details class="source" data-src="./source.sq"{open}>
         <summary>
           <span>Source</span>
           <span class="source-head">{file}</span>
@@ -664,7 +664,7 @@ fn render_index_html(has_docs: bool, asset_version: &str) -> String {
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#000000">
   <title>Ink Examples</title>
-  <meta name="description" content="Asset-free game systems examples for Blot and Pen.">
+  <meta name="description" content="Asset-free game systems examples for Squid and Pen.">
   <link rel="stylesheet" href="./style.css?v={asset_version}">
 </head>
 <body class="page-index">
@@ -681,7 +681,7 @@ fn render_index_html(has_docs: bool, asset_version: &str) -> String {
     <main>
       <section class="intro" aria-labelledby="intro-heading">
         <h1 id="intro-heading">Ink examples</h1>
-        <p>Game systems written in Blot: ECS, physics, navigation, animation, rollback and UI. The WebGPU demos render live through Pen; the Wasm examples run their entry points right in the page.</p>
+        <p>Game systems written in Squid: ECS, physics, navigation, animation, rollback and UI. The WebGPU demos render live through Pen; the Wasm examples run their entry points right in the page.</p>
       </section>
 
       <section class="section" aria-labelledby="webgpu-heading">
@@ -693,10 +693,10 @@ fn render_index_html(has_docs: bool, asset_version: &str) -> String {
 {pen_cards}        </div>
       </section>
 
-      <section class="section" aria-labelledby="blot-heading">
+      <section class="section" aria-labelledby="squid-heading">
         <div class="section-head">
-          <h2 id="blot-heading">Blot Wasm examples <span class="section-count">{example_count}</span></h2>
-          <p>Pure Blot compiled to WebAssembly, with a runner and the full source.</p>
+          <h2 id="squid-heading">Squid Wasm examples <span class="section-count">{example_count}</span></h2>
+          <p>Pure Squid compiled to WebAssembly, with a runner and the full source.</p>
         </div>
         <div class="list">
 {wasm_rows}        </div>
@@ -1056,8 +1056,8 @@ fn copy_assets_dir(src: &Path, dst: &Path) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn build_pen_demo(
     root: &Path,
-    blot2: &Path,
-    blotc: &Path,
+    squid_lang: &Path,
+    squidc: &Path,
     pen_bin: &Path,
     spec: &PenDemoSpec,
     staging_root: &Path,
@@ -1068,7 +1068,7 @@ fn build_pen_demo(
     let _ = std::fs::remove_dir_all(&proj);
     let assets_dir = proj.join("src/assets");
     std::fs::create_dir_all(&assets_dir)?;
-    copy_file_checked(&root.join(spec.file), &proj.join("src/main.blot"))?;
+    copy_file_checked(&root.join(spec.file), &proj.join("src/main.sq"))?;
     for companion in spec.companions {
         let src = root.join(companion);
         let name = src
@@ -1096,19 +1096,19 @@ fn build_pen_demo(
     let pen_json = serde_json::json!({
         "game": { "name": spec.slug, "title": format!("Ink — {}", spec.title) },
         "plugins": {
-            "blot": {
+            "squid": {
                 "read": [
-                    blot2.join("std"),
+                    squid_lang.join("std"),
                     root.join("lib"),
                     root.join("tests/fixtures/pen")
                 ],
-                "run": { "blotc": blotc }
+                "run": { "squidc": squidc }
             }
         },
         "compiler": {
-            "plugin": "blot",
+            "plugin": "squid",
             "settings": {
-                "std": blot2.join("std"),
+                "std": squid_lang.join("std"),
                 "imports": {
                     "ink/": format!("{}/", root.join("lib").display()),
                     "pen/": format!("{}/", root.join("tests/fixtures/pen").display())
@@ -1172,7 +1172,7 @@ fn build_pen_demo(
         }
     }
     copy_assets_dir(&export_dir.join("locales"), &demo_out.join("locales"))?;
-    copy_file_checked(&root.join(spec.file), &demo_out.join("source.blot"))?;
+    copy_file_checked(&root.join(spec.file), &demo_out.join("source.sq"))?;
     let runtime_version = runtime_version_tag(&std::fs::read(shared.join("pen_web_bg.wasm"))?);
     std::fs::write(
         demo_out.join("index.html"),
@@ -1181,9 +1181,9 @@ fn build_pen_demo(
     Ok(())
 }
 
-fn try_build_docs(root: &Path, blot2: &Path, out_dir: &Path) -> Result<bool> {
+fn try_build_docs(root: &Path, squid_lang: &Path, out_dir: &Path) -> Result<bool> {
     let docs_out = out_dir.join("docs");
-    let cli_ts = blot2.join("host/cli.ts");
+    let cli_ts = squid_lang.join("host/cli.ts");
     if cli_ts.is_file() {
         let deno_candidates = [
             std::env::var("HOME")
@@ -1205,7 +1205,7 @@ fn try_build_docs(root: &Path, blot2: &Path, out_dir: &Path) -> Result<bool> {
             }
         }
     }
-    if let Ok(status) = Command::new("blot")
+    if let Ok(status) = Command::new("squid")
         .current_dir(root)
         .args(["doc", "ink", "--html", "--out"])
         .arg(&docs_out)
@@ -1242,8 +1242,8 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
     }
     std::fs::create_dir_all(out_dir)?;
 
-    let blot2 = find_blot2_root(&root)?;
-    let blotc = find_blotc(&blot2)?;
+    let squid_lang = find_squid_lang_root(&root)?;
+    let squidc = find_squidc(&squid_lang)?;
     let pen_bin = find_pen_bin();
     let staging_root = root.join(format!(".cache/site-staging-{}", std::process::id()));
     std::fs::create_dir_all(&staging_root)?;
@@ -1257,8 +1257,8 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
 
     // Docs come first so every detail page knows whether to link them.
     let has_docs = if include_docs {
-        eprintln!("Generating compiler-backed HTML API docs (blot doc ink --html)...");
-        try_build_docs(&root, &blot2, out_dir)?
+        eprintln!("Generating compiler-backed HTML API docs (squid doc ink --html)...");
+        try_build_docs(&root, &squid_lang, out_dir)?
     } else {
         false
     };
@@ -1271,8 +1271,8 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
         eprintln!("Building Pen WebGPU demo: {}...", spec.slug);
         build_pen_demo(
             &root,
-            &blot2,
-            &blotc,
+            &squid_lang,
+            &squidc,
             &pen_bin,
             spec,
             &staging_root,
@@ -1283,7 +1283,7 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
     std::fs::write(out_dir.join("demos/service-worker.js"), DEMOS_SW_JS)?;
 
     eprintln!(
-        "Compiling {} standalone Blot Wasm examples...",
+        "Compiling {} standalone Squid Wasm examples...",
         WASM_EXAMPLES.len()
     );
     let plugins = Plugins::load(
@@ -1291,7 +1291,7 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
         Arc::new(|level, text| eprintln!("{level:?}: {text}")),
     )?
     .context("site generation needs pen.json")?;
-    let engine = blot_host::dev_engine()?;
+    let engine = squid_host::dev_engine()?;
 
     for spec in WASM_EXAMPLES {
         let src_path = root.join(spec.file);
@@ -1324,12 +1324,12 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
             .with_context(|| format!("validating published {}", wasm_file.display()))?;
         ensure!(
             guest_mod.abi().data_stacks,
-            "{}: published standalone Wasm example must use Blot ABI 8",
+            "{}: published standalone Wasm example must use Squid ABI 8",
             spec.file
         );
         let mut entries = Vec::new();
         for f in &guest_mod.abi().functions {
-            if f.name.starts_with("blot:") || f.name.starts_with("test_") {
+            if f.name.starts_with("squid:") || f.name.starts_with("test_") {
                 continue;
             }
             let Parameter::Value(ref param_vt) = f.parameter else {
@@ -1355,7 +1355,7 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
             spec.file
         );
 
-        copy_file_checked(&src_path, &ex_dir.join("source.blot"))?;
+        copy_file_checked(&src_path, &ex_dir.join("source.sq"))?;
         std::fs::write(
             ex_dir.join("index.html"),
             render_wasm_example_html(spec, &entries, &site.asset_version, site.has_docs)?,
@@ -1368,7 +1368,7 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
     )?;
     std::fs::write(out_dir.join("style.css"), STYLE_CSS)?;
     std::fs::write(out_dir.join("app.js"), APP_JS)?;
-    std::fs::write(out_dir.join("blot-highlight.js"), BLOT_HIGHLIGHT_JS)?;
+    std::fs::write(out_dir.join("squid-highlight.js"), SQUID_HIGHLIGHT_JS)?;
     std::fs::write(out_dir.join("demo.js"), DEMO_JS)?;
     std::fs::write(out_dir.join("service-worker.js"), RETIRE_ROOT_SW_JS)?;
     std::fs::write(out_dir.join(".nojekyll"), "")?;
@@ -1450,7 +1450,7 @@ mod tests {
             for id in ["stage", "game", "loading", "status", "fullscreen-btn"] {
                 assert_eq!(html.matches(&format!("id=\"{id}\"")).count(), 1, "{id}");
             }
-            assert!(html.contains("<details class=\"source\" data-src=\"./source.blot\">"));
+            assert!(html.contains("<details class=\"source\" data-src=\"./source.sq\">"));
             assert!(html.contains("data-copy"));
             assert!(html.contains("../../demo.js?v=rt42"));
             let host = demo.host.directory();
@@ -1495,7 +1495,7 @@ mod tests {
             ] {
                 assert_eq!(html.matches(&format!("id=\"{id}\"")).count(), 1, "{id}");
             }
-            assert!(html.contains("<details class=\"source\" data-src=\"./source.blot\" open>"));
+            assert!(html.contains("<details class=\"source\" data-src=\"./source.sq\" open>"));
             assert!(html.contains("../../app.js?v=abc123"));
         }
     }

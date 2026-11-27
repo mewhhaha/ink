@@ -1,5 +1,5 @@
 // Independent references for ink/render/probes: analytic ray-box casts in f64 against
-// the closed room of tests/probes.blot, with the sky's SH from quadrature.
+// the closed room of tests/probes.sq, with the sky's SH from quadrature.
 use crate::render_math::{basis, dot, sky_radiance, sphere};
 use crate::*;
 use std::f64::consts::PI;
@@ -9,7 +9,7 @@ const AMBIENT: [f64; 3] = [0.3, 0.32, 0.4];
 const SUN: [f64; 3] = [1.0, 0.9, 0.8];
 const REACH: f64 = 60.0;
 
-// Box centres and full sizes with their ids, as tests/probes.blot's room.
+// Box centres and full sizes with their ids, as tests/probes.sq's room.
 const ROOM: [([f64; 3], [f64; 3], u32); 6] = [
     ([0., -3.5, 0.], [8., 1., 8.], 1),
     ([0., 3.5, 0.], [8., 1., 8.], 2),
@@ -205,7 +205,7 @@ fn input(mode: f64, rays: f64, bounces: f64, queries: &[[f64; 7]]) -> Vec<f64> {
 
 #[test]
 fn open_sky_probes_equal_the_sky_light_and_a_closed_room_never_sees_it() {
-    let mut f = Fixture::new("tests/probes.blot");
+    let mut f = Fixture::new("tests/probes.sq");
     let (_, sky) = sky_light();
     let terms = f.floats("sky_terms", vec![0.]);
     for i in 0..9 {
@@ -273,7 +273,7 @@ fn open_sky_probes_equal_the_sky_light_and_a_closed_room_never_sees_it() {
     }
 }
 
-// Trilinear light at `point` for the 3 x 3 x 3 room lattice, as the Blot sampler
+// Trilinear light at `point` for the 3 x 3 x 3 room lattice, as the Squid sampler
 // weighs it (validity, facing, a cell of fade), summed independently in f64.
 fn sample_ref(
     baked: &[(Option<[[f64; 3]; 9]>, usize)],
@@ -341,7 +341,7 @@ fn sample_ref(
 
 #[test]
 fn probes_inside_a_wall_are_invalid_and_leave_no_darkness() {
-    let mut f = Fixture::new("tests/probes.blot");
+    let mut f = Fixture::new("tests/probes.sq");
     // x = 1, 3.5 (inside the wall), 6 (outside).
     let q = |p: [f64; 3], n: [f64; 3], bias: f64| [p[0], p[1], p[2], n[0], n[1], n[2], bias];
     let r = f.floats(
@@ -382,7 +382,7 @@ fn probes_inside_a_wall_are_invalid_and_leave_no_darkness() {
 
 #[test]
 fn sampling_is_exact_at_probe_centres_and_follows_the_normal() {
-    let mut f = Fixture::new("tests/probes.blot");
+    let mut f = Fixture::new("tests/probes.sq");
     let points = lattice_points(1);
     let normals = [[0.2f64, 0.9, 0.3], [-1., 0., 0.], [0., -0.6, 0.8]];
     let mut queries = vec![];
@@ -423,7 +423,7 @@ fn sampling_is_exact_at_probe_centres_and_follows_the_normal() {
 
 #[test]
 fn the_probe_bench_entry_checks_itself() {
-    let mut f = Fixture::new("tools/library-bench.blot");
+    let mut f = Fixture::new("tools/library-bench.sq");
     for n in [8., 32.] {
         let v = f.floats("probes_batch", n);
         assert_eq!((v[0], v[1]), (n, n));
@@ -435,7 +435,7 @@ fn the_probe_bench_entry_checks_itself() {
 // pen-render's probe_room look test (the before/after pictures).
 #[test]
 fn the_gallery_bakes_red_light_onto_its_floor_and_can_be_dumped() {
-    let mut f = Fixture::new("tests/probes.blot");
+    let mut f = Fixture::new("tests/probes.sq");
     let r = f.floats("gallery_bake", vec![0.]);
     let values = &r[..r.len() - 27];
     assert_eq!(values.len(), 5 * 3 * 8 * 28);

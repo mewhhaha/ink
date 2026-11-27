@@ -1,4 +1,4 @@
-//! Freedoom E1M1 WAD baker, atlas/mesh/WAV emitter, and Blot map generator for
+//! Freedoom E1M1 WAD baker, atlas/mesh/WAV emitter, and Squid map generator for
 //! the 1:1 Mini Doom Pen WebGPU demo (matching Goose's `31_mini_doom.goose`).
 
 use anyhow::{Context, Result, bail, ensure};
@@ -1351,7 +1351,7 @@ fn srgb_encode(light: vec3f) -> vec3f {{
         ))
     }
 
-    pub fn generate_e1m1_blot(&self) -> Result<String> {
+    pub fn generate_e1m1_squid(&self) -> Result<String> {
         // Assign compact sequential picture IDs for all runtime HUD/weapon/monster/thing sprites.
         struct Interner<'a> {
             baked: &'a BakedDoom,
@@ -1884,7 +1884,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn freedoom_e1m1_bakes_atlas_mesh_sounds_and_blot_tables() {
+    fn freedoom_e1m1_bakes_atlas_mesh_sounds_and_squid_tables() {
         let root = crate::root();
         let baked = bake_e1m1(&root).unwrap();
         assert_eq!(baked.vertices.len(), 1196);
@@ -1906,21 +1906,21 @@ mod tests {
         assert!(pos_len > 15_000 && pos_len % 3 == 0);
         assert!(idx_len > 15_000 && idx_len % 3 == 0);
 
-        let blot_src = baked.generate_e1m1_blot().unwrap();
-        let target = root.join("examples/mini_doom_e1m1.blot");
+        let squid_src = baked.generate_e1m1_squid().unwrap();
+        let target = root.join("examples/mini_doom_e1m1.sq");
         if std::env::var_os("UPDATE_DOOM_E1M1").is_some() || !target.is_file() {
-            std::fs::write(&target, &blot_src).unwrap();
+            std::fs::write(&target, &squid_src).unwrap();
         }
         let on_disk = std::fs::read_to_string(&target).unwrap();
         assert_eq!(
-            on_disk, blot_src,
-            "examples/mini_doom_e1m1.blot is out of date; re-run with UPDATE_DOOM_E1M1=1"
+            on_disk, squid_src,
+            "examples/mini_doom_e1m1.sq is out of date; re-run with UPDATE_DOOM_E1M1=1"
         );
     }
 
     #[test]
-    fn mini_doom_blot_gameplay_suite_passes() {
-        let mut fx = crate::Fixture::new("examples/mini_doom.blot");
+    fn mini_doom_squid_gameplay_suite_passes() {
+        let mut fx = crate::Fixture::new("examples/mini_doom.sq");
         let out = fx.floats("test_mini_doom", ());
         assert_eq!(out, vec![1.0, 0.0], "mini_doom gameplay tests failed");
     }

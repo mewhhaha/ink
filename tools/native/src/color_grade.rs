@@ -1,4 +1,4 @@
-//! The color grade and exposure maths: Ink's Blot (`color.grade`, `color.lut_lookup`,
+//! The color grade and exposure maths: Ink's Squid (`color.grade`, `color.lut_lookup`,
 //! the metering and adaptation functions) against independent f64 references, and
 //! against Pen's present-pass WGSL (`grade.wgsl`) run on a real offscreen device.
 use crate::*;
@@ -29,7 +29,7 @@ fn cc_decode(v: f64) -> f64 {
     }
 }
 
-/// A grade's twenty lanes, as `tests/color_grade.blot` reads them.
+/// A grade's twenty lanes, as `tests/color_grade.sq` reads them.
 #[derive(Clone, Copy, Debug)]
 struct Grade {
     temperature: f64,
@@ -317,7 +317,7 @@ fn grade_input(g: &Grade, light: [f64; 3], uv: [f64; 2]) -> Vec<f64> {
 
 #[test]
 fn the_log_encoding_the_vignette_and_the_identity_grade() {
-    let mut f = Fixture::new("tests/color_grade.blot");
+    let mut f = Fixture::new("tests/color_grade.sq");
     for x in [
         0.0, 1e-9, 1e-5, 3e-5, 0.001, 0.18, 1.0, 16.0, 223.0, 65504.0,
     ] {
@@ -353,8 +353,8 @@ fn the_log_encoding_the_vignette_and_the_identity_grade() {
 }
 
 #[test]
-fn the_blot_grade_matches_the_f64_reference_for_every_setting() {
-    let mut f = Fixture::new("tests/color_grade.blot");
+fn the_squid_grade_matches_the_f64_reference_for_every_setting() {
+    let mut f = Fixture::new("tests/color_grade.sq");
     let samples = samples(120, 9);
     for g in settings() {
         for (light, uv) in &samples {
@@ -370,7 +370,7 @@ fn the_blot_grade_matches_the_f64_reference_for_every_setting() {
 
 #[test]
 fn table_lookups_blends_and_weights_match_the_reference() {
-    let mut f = Fixture::new("tests/color_grade.blot");
+    let mut f = Fixture::new("tests/color_grade.sq");
     for (size, seed) in [(2usize, 3u32), (5, 5), (9, 7), (16, 9)] {
         let table = scrambled(size, seed, false);
         let mut random = Random(seed * 77);
@@ -447,7 +447,7 @@ fn table_lookups_blends_and_weights_match_the_reference() {
 
 #[test]
 fn metering_and_adaptation_follow_the_reference() {
-    let mut f = Fixture::new("tests/color_grade.blot");
+    let mut f = Fixture::new("tests/color_grade.sq");
     let bin = |low: f64, high: f64, light: f64| {
         (((light.log2() - low) * 256.0 / (high - low)).clamp(0.0, 255.0)) as u32
     };
@@ -765,12 +765,12 @@ impl Gpu {
 }
 
 #[test]
-fn pens_grade_shader_matches_the_blot_grade() {
+fn pens_grade_shader_matches_the_squid_grade() {
     let Some(gpu) = Gpu::new() else {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut f = Fixture::new("tests/color_grade.blot");
+    let mut f = Fixture::new("tests/color_grade.sq");
     let samples = samples(150, 51);
     for g in settings() {
         let shaded = gpu.run(&g, [None, None], &samples);
@@ -778,7 +778,7 @@ fn pens_grade_shader_matches_the_blot_grade() {
             let r = f.floats("graded", grade_input(&g, *light, *uv));
             assert!(
                 close(&r[..3], shaded, 8e-4, 3e-6),
-                "{g:?} on {light:?}: Blot {r:?}, WGSL {shaded:?}"
+                "{g:?} on {light:?}: Squid {r:?}, WGSL {shaded:?}"
             );
         }
     }
@@ -800,7 +800,7 @@ fn pens_grade_shader_matches_the_blot_grade() {
             let r = f.floats("tabled", input);
             assert!(
                 close(&r[..3], shaded, 8e-4, 3e-6),
-                "blend {blend} weight {weight}: Blot {r:?}, WGSL {shaded:?}"
+                "blend {blend} weight {weight}: Squid {r:?}, WGSL {shaded:?}"
             );
         }
     }
@@ -922,7 +922,7 @@ fn tonemap_linear_ref(linear: [f64; 3], mode: u32, peak_linear: f64) -> [f64; 3]
 
 #[test]
 fn filmic_tonemap_operators_match_f64_reference_and_hdr_headroom() {
-    let mut f = Fixture::new("tests/color_grade.blot");
+    let mut f = Fixture::new("tests/color_grade.sq");
     let inputs = [
         [0.0, 0.0, 0.0],
         [0.02, 0.05, 0.09],

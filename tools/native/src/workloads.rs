@@ -42,7 +42,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
     let fixture = w.fixture.as_str();
     let eq = |expected: Vec<f64>| assert_eq!(v, expected, "{}({size})", w.name);
     match fixture {
-        "../tests/perf/queue_bulk.blot" => {
+        "../tests/perf/queue_bulk.sq" => {
             let n = size as u32;
             let mut words = vec![1, 1, n + 1, n, 1, 1, n];
             for i in 0..n {
@@ -51,7 +51,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             eq(words.into_iter().map(f64::from).collect());
             return;
         }
-        "../tests/perf/six_more.blot" => {
+        "../tests/perf/six_more.sq" => {
             let n = size as u32;
             let mut words = Vec::new();
             match entry {
@@ -94,7 +94,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             eq(words.into_iter().map(f64::from).collect());
             return;
         }
-        "../tests/perf/followup_six.blot" => {
+        "../tests/perf/followup_six.sq" => {
             let count = size as u32;
             let mut words = Vec::new();
             if entry.starts_with("decode_") {
@@ -159,7 +159,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             eq(words.into_iter().map(f64::from).collect());
             return;
         }
-        "../tests/perf/next_six.blot" => {
+        "../tests/perf/next_six.sq" => {
             match entry {
                 "decode_before" | "decode_after" => eq((0..size)
                     .map(|i| (i as u32).wrapping_mul(2654435761) as f64)
@@ -206,7 +206,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/simd_batches.blot" => {
+        "../tests/perf/simd_batches.sq" => {
             if entry.starts_with("field_") {
                 eq(vec![0.; size.div_ceil(16).pow(2)]);
             } else if entry.starts_with("pack_") {
@@ -267,7 +267,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             return;
         }
 
-        "../tests/perf/netcode.blot" => {
+        "../tests/perf/netcode.sq" => {
             match entry {
                 "rollback_session" => eq(vec![s, 1., 1.]),
                 "delta_codec" => eq(vec![s, 1.]),
@@ -277,7 +277,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/animation_rig.blot" => {
+        "../tests/perf/animation_rig.sq" => {
             assert_eq!(v[0], s, "{}({size})", w.name);
             match entry {
                 // Worst end error and bone-length error, in metres.
@@ -303,7 +303,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/physics_advanced.blot" => {
+        "../tests/perf/physics_advanced.sq" => {
             assert_eq!(v[0], s, "{}({size})", w.name);
             match entry {
                 "triggers_batch" => assert!(v[1] >= s, "{v:?}"),
@@ -315,7 +315,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/ai_nav_gameplay.blot" => {
+        "../tests/perf/ai_nav_gameplay.sq" => {
             assert_eq!(v[0], s, "{}({size})", w.name);
             match entry {
                 "links_batch" => assert_eq!(v[1], 2.0, "{v:?}"),
@@ -330,7 +330,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/systems_advanced.blot" => {
+        "../tests/perf/systems_advanced.sq" => {
             assert_eq!(v[0], s, "{}({size})", w.name);
             match entry {
                 "audio_mix_batch" => {
@@ -358,7 +358,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/audit_storage.blot" => {
+        "../tests/perf/audit_storage.sq" => {
             match entry {
                 "message_general" | "message_direct" => eq(vec![s, s * (3. * s - 1.) / 2., s * 2.]),
                 "query_universe" | "query_anchor" => {
@@ -384,7 +384,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/incremental_ecs.blot" => {
+        "../tests/perf/incremental_ecs.sq" => {
             match entry {
                 "query_cached" | "query_uncached" => eq(vec![s * 32., 31.]),
                 "command_batch" | "immediate_edits" => eq(vec![s * (s + 1.) / 2., s - 1.]),
@@ -397,7 +397,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             return;
         }
 
-        "../tests/perf/scaling_storage.blot" => {
+        "../tests/perf/scaling_storage.sq" => {
             match entry {
                 "lookup_indexed" | "lookup_linear" => eq(vec![s, sum * 4.]),
                 "point_grid" => eq(vec![s, s * 2., s * 2., s * (2. * s - 1.)]),
@@ -405,7 +405,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/maps.blot" => {
+        "../tests/perf/maps.sq" => {
             let original: std::collections::BTreeMap<_, _> =
                 (0..size).map(|i| (i, i * 3 + 1)).collect();
             let original_sum = original.values().sum::<usize>() as f64;
@@ -456,7 +456,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/working_sets.blot" => {
+        "../tests/perf/working_sets.sq" => {
             match entry {
                 "ecs_full" | "ecs_sparse" => {
                     eq(vec![s, sum + 16. * size.div_ceil(257) as f64, sum])
@@ -468,11 +468,11 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/worker_sessions.blot" => {
+        "../tests/perf/worker_sessions.sq" => {
             eq(vec![s, 0.]);
             return;
         }
-        "../tests/perf/extractions.blot" => {
+        "../tests/perf/extractions.sq" => {
             match entry {
                 "reconcile_original" | "reconcile_indexed" => eq(vec![s, sum]),
                 "trajectory_original" | "trajectory_prepared" => eq(vec![
@@ -528,7 +528,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/native_mechanisms.blot" => {
+        "../tests/perf/native_mechanisms.sq" => {
             match entry {
                 "profiling" => eq(vec![
                     s,
@@ -599,7 +599,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             return;
         }
 
-        "../tests/perf/mechanisms.blot" => {
+        "../tests/perf/mechanisms.sq" => {
             assert_eq!(v[0], s);
             match entry {
                 "field_batch" => eq(vec![s, (s / 16.).ceil()]),
@@ -640,7 +640,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             };
             return;
         }
-        "../tests/dialogs.blot" => {
+        "../tests/dialogs.sq" => {
             let mut expected = s;
             for i in 0..size {
                 if i % 3 == 2 {
@@ -656,7 +656,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             eq(vec![expected]);
             return;
         }
-        "../tests/motion-batch.blot" => {
+        "../tests/motion-batch.sq" => {
             assert_eq!(v.len(), size * 4);
             let dt = f32(0.016);
             let gain = f32(f32(-9.81) * dt);
@@ -675,7 +675,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/radial.blot" => {
+        "../tests/perf/radial.sq" => {
             assert_eq!(v.len(), 193);
             for (x, value) in v.iter().enumerate() {
                 let expected = (0..size)
@@ -687,7 +687,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/work_queue.blot" => {
+        "../tests/perf/work_queue.sq" => {
             eq(match entry {
                 "claims_workload" => (0..32)
                     .map(|i| if i < size { i as f64 } else { u32::MAX as f64 })
@@ -699,7 +699,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             });
             return;
         }
-        "../tests/render-cache.blot" => {
+        "../tests/render-cache.sq" => {
             let changing = if entry.starts_with("moving") {
                 size
             } else if entry.starts_with("sparse") {
@@ -722,7 +722,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             eq(vec![16. * s, sum, 0.]);
             return;
         }
-        "../tests/word-persist.blot" => {
+        "../tests/word-persist.sq" => {
             eq(if ["roundtrip", "bridge_roundtrip"].contains(&entry) {
                 vec![1., s, 9., 7., sum + 10. * s, 0., u32::MAX as f64]
             } else {
@@ -730,25 +730,25 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             });
             return;
         }
-        "../tests/prepared-physics.blot" => {
+        "../tests/prepared-physics.sq" => {
             assert_eq!(v.len(), 2);
             assert!(v[0] >= 50. && v[0] <= 70.);
             assert_eq!(v[1], 128.);
             return;
         }
-        "../tests/incremental.blot" => {
+        "../tests/incremental.sq" => {
             eq(vec![s - 1., s + 30., s / 2. + 31.]);
             return;
         }
-        "../tests/ecs-history.blot" => {
+        "../tests/ecs-history.sq" => {
             eq(vec![32. * (4096. - 65. - 127.), 32., 132., 0.]);
             return;
         }
-        "../tests/compiled-behavior.blot" => {
+        "../tests/compiled-behavior.sq" => {
             eq(vec![6. * s, 24. * s, 25. * s]);
             return;
         }
-        "../tests/pen-instances.blot" => {
+        "../tests/pen-instances.sq" => {
             if entry == "stream" {
                 eq(vec![s + 120., 0., s, sum + 420., 16.]);
             } else {
@@ -763,7 +763,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/nearest.blot" => {
+        "../tests/nearest.sq" => {
             eq((0..100)
                 .map(|q| {
                     let (mut best, mut distance) = (u32::MAX as f64, f64::INFINITY);
@@ -784,12 +784,12 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
                 .collect());
             return;
         }
-        "../tests/workers.blot" => {
+        "../tests/workers.sq" => {
             let n = s * 64.;
             eq(vec![n, n * (n - 1.) / 2.]);
             return;
         }
-        "../tests/app_lifetime.blot" => {
+        "../tests/app_lifetime.sq" => {
             let retained = size.min(32);
             let steps = retained.saturating_sub(1);
             let undone: f64 = ((size - retained)..size.saturating_sub(1))
@@ -804,7 +804,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             ]);
             return;
         }
-        "../tests/perf/composition.blot" => {
+        "../tests/perf/composition.sq" => {
             eq(match entry {
                 "cache_changes" => vec![4. * (s / 4.) * (s / 4. - 1.), s / 4.],
                 "path_preparation" => vec![s, sum, 0.],
@@ -812,23 +812,23 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             });
             return;
         }
-        "../tests/handles.blot"
-        | "../tests/codec.blot"
-        | "../tests/derived.blot"
-        | "../tests/behavior.blot" => {
+        "../tests/handles.sq"
+        | "../tests/codec.sq"
+        | "../tests/derived.sq"
+        | "../tests/behavior.sq" => {
             let alive = (s / 2.).ceil();
             eq(match fixture {
-                "../tests/handles.blot" => {
+                "../tests/handles.sq" => {
                     if ["workload", "dense_churn"].contains(&entry) {
                         vec![alive, alive * (alive - 1.), sum]
                     } else {
                         vec![sum, s]
                     }
                 }
-                "../tests/codec.blot" => {
+                "../tests/codec.sq" => {
                     vec![sum, s * if entry == "handwritten" { 7. } else { 66. }]
                 }
-                "../tests/derived.blot" => {
+                "../tests/derived.sq" => {
                     if entry.starts_with("staffing_") {
                         vec![
                             sum * 32.,
@@ -843,7 +843,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             });
             return;
         }
-        "../tests/perf/ui-text.blot" => {
+        "../tests/perf/ui-text.sq" => {
             if entry == "ui_deep_tree" {
                 eq(vec![
                     s,
@@ -870,7 +870,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/flock.blot" => {
+        "../tests/perf/flock.sq" => {
             if entry == "sparse" {
                 let rows = s / 32.;
                 eq(vec![2. * (31. * rows + (rows - 1.) * 32.), s, s, 0.]);
@@ -883,7 +883,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
-        "../tests/perf/adapters.blot" => {
+        "../tests/perf/adapters.sq" => {
             match entry {
                 "simulation_colliders" => eq(vec![s * 11., sum]),
                 "wire_tree" => eq(vec![s, sum, s * (s + 1.) / 2., s]),
@@ -905,7 +905,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             };
             return;
         }
-        "../tests/migrated_geometry.blot" => {
+        "../tests/migrated_geometry.sq" => {
             match entry {
                 "brushes" => eq(vec![8. * s, s * (s + 1.) / 2.]),
                 "lighting" => {
@@ -1326,25 +1326,25 @@ mod tests {
     #[test]
     fn migrated_and_scaled_workloads_keep_independent_witnesses() {
         let included = [
-            "../tests/perf/radial.blot",
-            "../tests/perf/work_queue.blot",
-            "../tests/perf/bubbles.blot",
-            "../tests/perf/composition.blot",
-            "../tests/ecs.blot",
-            "../tests/app-hooks.blot",
-            "../tests/clock.blot",
-            "../tests/persist.blot",
-            "../tests/ui_boundaries.blot",
-            "../tests/input.blot",
-            "../tests/migration-bench.blot",
-            "../tests/migrated_geometry.blot",
-            "../tests/perf/adapters.blot",
-            "../tests/perf/presentation.blot",
-            "../tests/director.blot",
-            "../tests/perf/netcode.blot",
-            "../tests/perf/animation_rig.blot",
-            "../tests/ragdoll.blot",
-            "../tests/mesh_collider.blot",
+            "../tests/perf/radial.sq",
+            "../tests/perf/work_queue.sq",
+            "../tests/perf/bubbles.sq",
+            "../tests/perf/composition.sq",
+            "../tests/ecs.sq",
+            "../tests/app-hooks.sq",
+            "../tests/clock.sq",
+            "../tests/persist.sq",
+            "../tests/ui_boundaries.sq",
+            "../tests/input.sq",
+            "../tests/migration-bench.sq",
+            "../tests/migrated_geometry.sq",
+            "../tests/perf/adapters.sq",
+            "../tests/perf/presentation.sq",
+            "../tests/director.sq",
+            "../tests/perf/netcode.sq",
+            "../tests/perf/animation_rig.sq",
+            "../tests/ragdoll.sq",
+            "../tests/mesh_collider.sq",
         ];
         for w in workloads()
             .into_iter()

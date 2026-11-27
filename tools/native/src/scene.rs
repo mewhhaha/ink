@@ -174,7 +174,7 @@ fn distributed(seed: u32, count: usize) -> Vec<Source> {
 }
 #[test]
 fn indexed_scene_queries_match_exhaustive_seeded_geometry() {
-    let mut f = Fixture::new("tests/scene.blot");
+    let mut f = Fixture::new("tests/scene.sq");
     for seed in [7, 19283, 0x12345678] {
         let s = distributed(seed, 54);
         let mut r = Random(seed + 1);
@@ -212,7 +212,7 @@ fn indexed_scene_queries_match_exhaustive_seeded_geometry() {
 }
 #[test]
 fn scene_degenerate_axes_order_ties_empty_and_filtering() {
-    let mut f = Fixture::new("tests/scene.blot");
+    let mut f = Fixture::new("tests/scene.sq");
     let mut s = vec![Source::new(800., 0., [0.; 3])];
     for id in [90., 10., 30.] {
         let mut v = Source::new(id, 2., [0.; 3]);
@@ -290,7 +290,7 @@ fn scene_degenerate_axes_order_ties_empty_and_filtering() {
 }
 #[test]
 fn updates_move_rotate_mutate_shapes_and_preserve_old_snapshots() {
-    let mut f = Fixture::new("tests/scene.blot");
+    let mut f = Fixture::new("tests/scene.sq");
     let mut a = Source::new(4., 1., [0.; 3]);
     a.size = [6., 0.5, 0.5];
     a.body = 2.;
@@ -369,7 +369,7 @@ fn updates_move_rotate_mutate_shapes_and_preserve_old_snapshots() {
 }
 #[test]
 fn scene_insert_remove_reorder_and_partition_refits() {
-    let mut f = Fixture::new("tests/scene.blot");
+    let mut f = Fixture::new("tests/scene.sq");
     let sphere = |id| {
         let mut v = Source::new(id, 2., [0.; 3]);
         v.radius = 1.;

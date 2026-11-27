@@ -1,7 +1,7 @@
 //! Native references for Ink. Compilation and guest execution use Pen's libraries.
 //! No game, display, JavaScript runtime, or alternate compiler driver is involved.
-use blot_host::{Guest, GuestModule, Parameter, Value, ValueType};
 use pen_plugins::{BuildResult, Overlay, Plugins};
+use squid_host::{Guest, GuestModule, Parameter, Value, ValueType};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -33,7 +33,7 @@ pub fn plugins() -> &'static Arc<Plugins> {
 }
 pub fn engine() -> &'static wasmtime::Engine {
     static ENGINE: OnceLock<wasmtime::Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| blot_host::dev_engine().unwrap())
+    ENGINE.get_or_init(|| squid_host::dev_engine().unwrap())
 }
 pub fn build(path: &str, overlays: &[Overlay]) -> BuildResult {
     let mut compiler = plugins().compiler(&root().join(path)).unwrap();

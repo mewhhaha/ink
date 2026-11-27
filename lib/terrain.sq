@@ -1,0 +1,311 @@
+//! Height and normal queries for a heightfield terrain: ask for the ground at a
+//! world position, keep a body standing on it, bound it over a region.
+//!
+//! The caller provides a grid of heights in metres: cells + 1 samples per side,
+//! row by row from the -z edge, column from the -x edge. Ground height is the
+//! bilinear grid height plus `amplitude * noise.fbm2`. Beyond the square the
+//! grid's border value continues (the detail does too).
+//!
+//! The terrain is centred on `origin`, so the ground at the centre sits at
+//! `origin.y` plus the grid height there. All queries take and return world
+//! positions.
+//!
+//! Build one `Terrain` per step with `make` and ask it as often as you like.
+//!
+//! Key items: [`Terrain`], [`Stand`], [`Stored`], [`make`], [`base`].
+//!
+//! ```squid
+//! import * as math from "ink/math"
+//! let heights = #[0.0, 2.0, 2.0, 4.0]
+//! let ground = make math.zero3 10.0 1 (&heights[0..heights.length]) 0.0 1.0 0 0
+//! height ground 0.0 0.0 // => 2.0
+//! ```
+
+import { Vec2, Vec3 } from "std/vector"
+import * as math from "./math"
+import * as noise from "./noise"
+import * as simd from "std/simd"
+
+// The terrain as game code sees it. `make` fills it; do not build one by hand.
+type Terrain is data = $Terrain {
+  origin: Vec3,
+  half: F32,
+  cells: U32,
+  stride: U32,
+  scale: F32,
+  grid: &[F32],
+  ready: Bool,
+  amplitude: F32,
+  frequency: F32,
+  octaves: U32,
+  seed: U32,
+}
+
+// The most the detail noise can reach, as a fraction of its amplitude. The 2D
+// slice of perlin3 that fbm2 samples stays below 1.037 whatever the hashes are
+// (it is near 1.0 in practice).
+const noise_bound = 1.04
+
+// A body this close above the ground counts as touching it.
+const contact = 0.001
+
+// A terrain from its origin, size, cell count, grid and procedural detail.
+// A grid shorter than (cells + 1)^2 is flat ground at the origin's height.
+func make (origin: Vec3) => func (size: F32) => func (cells: U32) => func (grid: &[F32]) => func (amplitude: F32) => func (wavelength: F32) => func (octaves: U32) => func (seed: U32) =>
+  let safe_origin = if math.finite3 origin then origin else math.zero3
+  let stride = if cells < 65535 then cells + 1 else 0
+  let side = if is_finite size and size > 0.0 then max size 0.001 else 0.001
+  let scale = if cells < 65535 then U32.to_f32 cells / side else 0.0
+  let amp = if is_finite amplitude then amplitude else 0.0
+  let wave = if is_finite wavelength and wavelength > 0.0 then max wavelength 0.001 else 0.001
+  let grid_ready = cells > 0 and cells < 65535 and is_finite scale and grid.length >= stride * stride
+  if grid_ready:
+    let sample_count = stride * stride
+    for i in 0 .. sample_count:
+      if not (is_finite grid[i]):
+        grid_ready := false
+        break
+  return $Terrain {
+    origin: safe_origin,
+    half: side * 0.5,
+    cells,
+    stride,
+    scale,
+    grid,
+    ready: grid_ready,
+    amplitude: amp,
+    frequency: 1.0 / wave,
+    octaves,
+    seed,
+  }
+
+// The grid's height at terrain-local x and z: bilinear, border clamped.
+func base (t: Terrain) => func (lx: F32) => func (lz: F32) =>
+  let $Terrain { half, cells, stride, scale, grid, ready } = t
+  if not ready or not (is_finite lx and is_finite lz):
+    return 0.0
+  let top = U32.to_f32 cells
+  let rx = (lx + half) * scale
+  let rz = (lz + half) * scale
+  let gx = if is_finite rx then clamp 0.0 top rx else if rx > 0.0 then top else 0.0
+  let gz = if is_finite rz then clamp 0.0 top rz else if rz > 0.0 then top else 0.0
+  let x0 = min (F32.to_u32 gx) (cells - 1)
+  let z0 = min (F32.to_u32 gz) (cells - 1)
+  let i = z0 * stride + x0
+  let fx = gx - U32.to_f32 x0
+  let fz = gz - U32.to_f32 z0
+  return lerp (lerp grid[i] grid[i + 1] fx) (lerp grid[i + stride] grid[i + stride + 1] fx) fz
+
+// Terrain refinement can amortize a small-grid check across many samples.
+func constant_grid (t: Terrain) : Maybe F32 =>
+  if not t.ready:
+    return $Some 0.0
+  let n = t.stride * t.stride
+  if n == 0 or n > 256 or n > t.grid.length:
+    return $Nothing
+  let sample = t.grid[0]
+  let (word, _, _, _) = simd.f32_bits (sample, 0.0, 0.0, 0.0)
+  for i in 1 .. n:
+    let (other, _, _, _) = simd.f32_bits (t.grid[i], 0.0, 0.0, 0.0)
+    if other != word:
+      return $Nothing
+  return $Some sample
+
+// The procedural detail at terrain-local x and z.
+func detail (t: Terrain) => func (lx: F32) => func (lz: F32) =>
+  let $Terrain { amplitude, frequency, octaves, seed } = t
+  if amplitude == 0.0 or octaves == 0:
+    return 0.0
+  return amplitude * noise.fbm2_at seed octaves (lx * frequency) (lz * frequency)
+
+// The ground height (world y) at world x and z.
+func height (t: Terrain) => func (x: F32) => func (z: F32) =>
+  return height_with_grid t $Nothing x z
+
+func height_with_grid (t: Terrain) -> (constant: Maybe F32) -> (x: F32) -> (z: F32) : F32 =>
+  let $Terrain { origin } = t
+  let lx = x - origin.x
+  let lz = z - origin.z
+  return finish_height origin.y (base_with_grid t constant lx lz) (detail t lx lz)
+
+private func base_with_grid (t: Terrain) -> (constant: Maybe F32) -> (lx: F32) -> (lz: F32) : F32 =>
+  return case constant of
+    $Some sample => if is_finite lx and is_finite lz then lerp sample sample 0.0 else 0.0
+    $Nothing => base t lx lz
+
+private func finish_height (origin_y: F32) -> (b: F32) -> (d: F32) : F32 =>
+  let h = origin_y + b + d
+  if is_finite h:
+    return h
+  if h > 0.0:
+    return 3.402823e38
+  if h < 0.0:
+    return (-3.402823e38)
+  return if is_finite origin_y then origin_y else 0.0
+
+// The point on the ground below or above `p`: `p` with y replaced.
+func ground (t: Terrain) => func (p: Vec3) => $Vec3 { x: p.x, y: height t p.x p.z, z: p.z }
+
+// How far `p` is above the ground (negative below it).
+func above (t: Terrain) => func (p: Vec3) => p.y - height t p.x p.z
+
+// Whether a world x and z lie over the terrain's square.
+func inside (t: Terrain) => func (x: F32) => func (z: F32) =>
+  let $Terrain { origin, half } = t
+  return abs (x - origin.x) <= half and abs (z - origin.z) <= half
+
+// How the ground rises per metre along x and z (y of the result is the
+// z slope), by central differences `step` metres either side.
+func gradient_by (t: Terrain) => func (step: F32) => func (x: F32) => func (z: F32) =>
+  return gradient_with_grid t $Nothing step x z
+
+private func gradient_with_grid (t: Terrain) -> (constant: Maybe F32) -> (step: F32) -> (x: F32) -> (z: F32) =>
+  if not (is_finite step) or step <= 0.0:
+    return $Vec2 { x: 0.0, y: 0.0 }
+  let k = 0.5 / step
+  if t.amplitude != 0.0 and t.octaves > 0:
+    let lx = x - t.origin.x
+    let lz = z - t.origin.z
+    let xp = (x + step) - t.origin.x
+    let xm = (x - step) - t.origin.x
+    let zp = (z + step) - t.origin.z
+    let zm = (z - step) - t.origin.z
+    let freq = t.frequency
+    let seed = t.seed
+    let octaves = t.octaves
+    let x_freq = lx * freq
+    let z_freq = lz * freq
+    let (d0, d1, d2, d3) = noise.fbm2_at4 seed octaves (xp * freq, xm * freq, x_freq, x_freq) (z_freq, z_freq, zp * freq, zm * freq)
+    let y = t.origin.y
+    let a = t.amplitude
+    let h0 = finish_height y (base_with_grid t constant xp lz) (a * d0)
+    let h1 = finish_height y (base_with_grid t constant xm lz) (a * d1)
+    let h2 = finish_height y (base_with_grid t constant lx zp) (a * d2)
+    let h3 = finish_height y (base_with_grid t constant lx zm) (a * d3)
+    return $Vec2 { x: (h0 - h1) * k, y: (h2 - h3) * k }
+  let dx = height_with_grid t constant (x + step) z - height_with_grid t constant (x - step) z
+  let dz = height_with_grid t constant x (z + step) - height_with_grid t constant x (z - step)
+  return $Vec2 { x: dx * k, y: dz * k }
+
+// `gradient_by` with a half metre step, fine enough to follow the detail.
+func gradient (t: Terrain) => func (x: F32) => func (z: F32) => gradient_by t 0.5 x z
+
+// The unit surface normal (up is +y), by central differences `step` metres
+// either side. A flat ground gives (0, 1, 0).
+func normal_by (t: Terrain) => func (step: F32) => func (x: F32) => func (z: F32) =>
+  return normal_with_grid t $Nothing step x z
+
+func normal_with_grid (t: Terrain) -> (constant: Maybe F32) -> (step: F32) -> (x: F32) -> (z: F32) =>
+  let g = gradient_with_grid t constant step x z
+  let n = $Vec3 { x: 0.0 - g.x, y: 1.0, z: 0.0 - g.y }
+  return Maybe.unwrap_or math.up (math.normalize3 n)
+
+// `normal_by` with a half metre step; its y is the cosine of the slope angle.
+func normal (t: Terrain) => func (x: F32) => func (z: F32) => normal_by t 0.5 x z
+
+// Collision seeds resolve every grid cell and the shortest noise octave.
+// Queries refine these seeds against `height`, rather than a triangle mesh.
+func collision_step (t: Terrain) =>
+  let step = t.half * 2.0
+  if t.ready:
+    step := self / U32.to_f32 t.cells * 0.5
+  if t.amplitude != 0.0 and t.octaves > 0 and is_finite t.frequency and t.frequency > 0.0:
+    let wavelength = 1.0 / t.frequency
+    for 1..(min t.octaves 160):
+      wavelength := self * 0.5
+    step := min self (wavelength * 0.25)
+  return max 0.0001 step
+
+func collision_normal (t: Terrain) => func (x: F32) => func (z: F32) => normal_by t (max 0.00001 (min 0.01 (collision_step t * 0.02))) x z
+
+// How steep the ground is: rise over run, 0 flat, 1 at 45 degrees.
+func slope (t: Terrain) => func (x: F32) => func (z: F32) =>
+  let g = gradient t x z
+  return g.length
+
+// A body resting on the ground: where it ended up, the ground's normal under
+// it (up while airborne) and whether it touches the ground.
+type Stand is data = $Stand { position: Vec3, normal: Vec3, grounded: Bool }
+
+// Keep a body from sinking into the ground. `lift` is how far its origin sits
+// above its lowest point (a capsule's half height, a sphere's radius). A body
+// at or below the ground is put on top of it and grounded; a body above it is
+// left alone. Nothing here is gravity: the game moves the body first.
+//
+// `reach` is how far above the ground a body still counts as standing on it:
+// it is brought down onto the ground, so a character walking down a slope
+// keeps its footing instead of hopping from step to step. A jump should
+// pass 0 (or skip the call) on the steps where it leaves the ground.
+func stick (t: Terrain) => func (position: Vec3) => func (lift: F32) => func (reach: F32) =>
+  let surface = height t position.x position.z
+  if position.y - lift > surface + max reach contact:
+    return $Stand { position, normal: $Vec3 { x: 0.0, y: 1.0, z: 0.0 }, grounded: false }
+  let on = $Vec3 { x: position.x, y: surface + lift, z: position.z }
+  return $Stand { position: on, normal: normal t position.x position.z, grounded: true }
+
+// `stick` with no reach: only a body touching or sunk into the ground stands.
+func stand (t: Terrain) => func (position: Vec3) => func (lift: F32) => stick t position lift 0.0
+
+// The lowest and highest the ground can be over the world rectangle from
+// (x0, z0) to (x1, z1) (x0 <= x1, z0 <= z1): a bound, never an underestimate,
+// from the grid samples under the rectangle and the detail's amplitude. For
+// broadphase tests against a body or a region. It reads every grid sample the
+// rectangle covers, so ask about bodies, not about the whole map.
+func range (t: Terrain) => func (x0: F32) => func (z0: F32) => func (x1: F32) => func (z1: F32) =>
+  return range_with_grid t $Nothing x0 z0 x1 z1
+
+func range_with_grid (t: Terrain) -> (constant: Maybe F32) -> (x0: F32) -> (z0: F32) -> (x1: F32) -> (z1: F32) =>
+  let $Terrain { origin, ready, amplitude, octaves } = t
+  let slack = if octaves == 0 then 0.0 else abs amplitude * noise_bound
+  if not ready or not (is_finite x0 and is_finite z0 and is_finite x1 and is_finite z1 and is_finite origin.x and is_finite origin.z):
+    return (origin.y - slack, origin.y + slack)
+  if let $Some sample = constant:
+    return (origin.y + sample - slack, origin.y + sample + slack)
+  let (a0, a1) = range_axis t origin.x x0 x1
+  let (b0, b1) = range_axis t origin.z z0 z1
+  return range_samples t a0 a1 b0 b1
+
+func range_axis (t: Terrain) -> (origin: F32) -> (low: F32) -> (high: F32) : (U32, U32) =>
+  let top = U32.to_f32 t.cells
+  let rx0 = (min low high - origin + t.half) * t.scale
+  let rx1 = (max low high - origin + t.half) * t.scale
+  let sx0 = if is_finite rx0 then clamp 0.0 top rx0 else if rx0 > 0.0 then top else 0.0
+  let sx1 = if is_finite rx1 then clamp 0.0 top rx1 else if rx1 > 0.0 then top else 0.0
+  return (min t.cells (F32.to_u32 (floor sx0)), min t.cells (F32.to_u32 (ceil sx1)))
+
+func range_samples (t: Terrain) -> (a0: U32) -> (a1: U32) -> (b0: U32) -> (b1: U32) : (F32, F32) =>
+  let $Terrain { origin, stride, grid, amplitude, octaves } = t
+  let slack = if octaves == 0 then 0.0 else abs amplitude * noise_bound
+  let low = grid[b0 * stride + a0]
+  let high = low
+  for row in b0..(b1 + 1):
+    for column in a0..(a1 + 1):
+      let v = grid[row * stride + column]
+      low := min self v
+      high := max self v
+  return (origin.y + low - slack, origin.y + high + slack)
+
+
+// Persistent terrain rows store only scalar metadata and a span into a named
+// height pool. Borrowed Terrain values exist only while that pool is live.
+type Stored is data = $Stored {
+  origin: Vec3, half: F32, cells: U32, stride: U32, scale: F32,
+  grid_start: U32, grid_count: U32, ready: Bool, amplitude: F32,
+  frequency: F32, octaves: U32, seed: U32,
+}
+func pack (pool: own #[F32]) -> (value: Terrain) : (Stored, #[F32]) =>
+  let start = pool.length
+  for height in value.grid:
+    @storage.push pool height
+  return ($Stored {
+    origin: value.origin, half: value.half, cells: value.cells, stride: value.stride,
+    scale: value.scale, grid_start: start, grid_count: value.grid.length,
+    ready: value.ready, amplitude: value.amplitude, frequency: value.frequency,
+    octaves: value.octaves, seed: value.seed,
+  }, pool)
+func unpack pool -> (value: Stored) => $Terrain {
+  origin: value.origin, half: value.half, cells: value.cells, stride: value.stride,
+  scale: value.scale, grid: pool.view value.grid_start (value.grid_start + value.grid_count),
+  ready: value.ready, amplitude: value.amplitude, frequency: value.frequency,
+  octaves: value.octaves, seed: value.seed,
+}

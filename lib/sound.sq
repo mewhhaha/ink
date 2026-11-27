@@ -1,0 +1,296 @@
+//! What the game plays this frame (protocol/schema.json's buses, voices and
+//! sounds), which every host mixes alike, with one shared reverb:
+//!
+//! - Buses: the frame's mix, the master first, then the game's own (`music`,
+//!   `effects`, `ambience` and `interface` here). Each has a gain, a lowpass
+//!   and a send to the reverb; on the master the send is how loud the reverb
+//!   comes back. host.sq puts the player's volumes on them.
+//! - Voices: loops and long sounds the game keeps playing, declared every frame
+//!   they play, whole, by an id that stays the same. Hosts start a new id, fade
+//!   out one the frames leave out, and glide what changes, so nothing is ever
+//!   stopped or put back in step: a reload, a rewind or frames run unseen just
+//!   declare what plays then.
+//! - Sounds: played once, from somewhere in the world (`at`), panned, quieted,
+//!   dulled and made wetter by where it is from the camera, or from the
+//!   interface (`ui`), in the middle.
+//!
+//! Clips index the asset catalog's sounds; `pitch` 1 plays a clip as recorded.
+//! Gains are linear, pans -1 left to 1 right, lowpass cutoffs Hz (`open` for
+//! none) and reverb sends linear.
+//!
+//! Key items: [`Bus`], [`Listener`], [`Panner`], [`ReverbZone`], [`empty_access`].
+
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+
+// The buses, in the order frames declare them.
+const master = 0
+const music = 1
+const effects = 2
+const ambience = 3
+const interface = 4
+
+// A lowpass cutoff that filters nothing (the protocol's AUDIO_OPEN), in Hz.
+const open = 20000.0
+// The shortest fade a host gives a voice (AUDIO_FADE_MS), in seconds: what
+// voices fade in and out over unless they say otherwise.
+const brief = 0.025
+
+// Distance attenuation models matching Pen's PannerNode wire contract.
+const distance_linear: U32 = 0
+const distance_inverse: U32 = 1
+const distance_exponential: U32 = 2
+
+// Procedural DSP synth waveforms matching Pen's SynthVoice wire contract.
+const synth_sine: U32 = 0
+const synth_saw: U32 = 1
+const synth_square: U32 = 2
+const synth_triangle: U32 = 3
+const synth_noise: U32 = 4
+const synth_granular: U32 = 5
+
+type Bus is data = $Bus {
+  gain: F32, lowpass: F32, reverb: F32,
+  comp_threshold: F32, comp_ratio: F32, duck_bus: U32, duck_amount: F32,
+  eq_low_db: F32, eq_mid_db: F32, eq_high_db: F32,
+}
+// Explicit 3D audio listener pose (world metres) and velocity (m/s). Optional;
+// at most 1 per frame (host falls back to the frame camera when omitted).
+type Listener is data = $Listener { position: Vec3, forward: Vec3, up: Vec3, velocity: Vec3 }
+// Explicit 3D spatial panner bound to a declared voice (`voice != 0`, 1..16777215)
+// or frame sound index (`voice == 0`), matching Pen's PannerNode contract.
+// Distances are metres, cones are degrees (`0..360`), `doppler >= 0`, `occlusion`
+// is `0..1`, `zone` is `0` or a `ReverbZone.id`; at most 512 per frame.
+type Panner is data = $Panner {
+  voice: U32, sound: U32, position: Vec3, orientation: Vec3,
+  distance_model: U32, ref_distance: F32, max_distance: F32, rolloff: F32,
+  cone_inner: F32, cone_outer: F32, cone_outer_gain: F32, hrtf: Bool,
+  velocity: Vec3, doppler: F32, occlusion: F32, zone: U32,
+}
+// Spatial acoustic reverb zone and portal attenuation box blended around the listener.
+// World `position`/`half_extents`/`blend` are metres (`half_extents > 0`), `decay` is
+// seconds, `damping`/`wet`/`portal_attenuation` are `0..1`; at most 32 per frame.
+type ReverbZone is data = $ReverbZone {
+  id: U32, position: Vec3, half_extents: Vec3, blend: F32,
+  decay: F32, damping: F32, wet: F32, portal_attenuation: F32,
+}
+// Real-time procedural or granular DSP synthesizer voice mixed alongside clip voices.
+// `id` is `1..16777215`, `mode` is `synth_*`, `bus` indexes frame buses, `frequency`
+// and `cutoff` are Hz, `gain`/`sustain`/`reverb` are linear (`0..1`), `pan` is `-1..1`,
+// `detune` is cents, ADSR/grain times are seconds; at most 64 per frame.
+type SynthVoice is data = $SynthVoice {
+  id: U32, mode: U32, bus: U32, frequency: F32, gain: F32, pan: F32, detune: F32,
+  attack: F32, decay: F32, sustain: F32, release: F32, cutoff: F32, resonance: F32,
+  grain_size: F32, grain_pitch: F32, reverb: F32,
+}
+// A sound played once on `bus`: from `position` in the world, or from
+// nowhere (the interface's), in the middle.
+type Sound is data = $Sound { clip: U32, bus: U32, volume: F32, pitch: F32, reverb: F32, position: Maybe Vec3 }
+// A voice: see `voice`. With a `position` it is heard from there, as sounds
+// are, on top of its own gain, pan, lowpass and reverb.
+type Voice is data = $Voice {
+  id: U32, clip: U32, bus: U32, gain: F32, pan: F32, pitch: F32, lowpass: F32, reverb: F32,
+  looping: Bool, start: F32, fade_in: F32, fade_out: F32, position: Maybe Vec3,
+}
+type Audio is data = $Audio {
+  sounds: &[Sound], voices: &[Voice], buses: &[Bus],
+  listener: &[Listener], panners: &[Panner],
+  reverb_zones: &[ReverbZone], synths: &[SynthVoice],
+}
+// Invocation access aliases caller-owned audio output pools.
+type Access is data = $Access {
+  sounds: #[Sound], voices: #[Voice], buses: #[Bus],
+  listener: #[Listener], panners: #[Panner],
+  reverb_zones: #[ReverbZone], synths: #[SynthVoice],
+}
+
+const flat = $Bus {
+  gain: 1.0, lowpass: open, reverb: 0.0,
+  comp_threshold: 0.0, comp_ratio: 1.0, duck_bus: 0, duck_amount: 0.0,
+  eq_low_db: 0.0, eq_mid_db: 0.0, eq_high_db: 0.0,
+}
+// The mix every frame starts from: everything open at full gain; the reverb
+// comes back whole, and the world's sounds send a little to it.
+const mix_start = #[
+  $Bus { gain: 1.0, lowpass: open, reverb: 1.0, comp_threshold: 0.0, comp_ratio: 1.0, duck_bus: 0, duck_amount: 0.0, eq_low_db: 0.0, eq_mid_db: 0.0, eq_high_db: 0.0 },
+  flat,
+  $Bus { gain: 1.0, lowpass: open, reverb: 0.12, comp_threshold: 0.0, comp_ratio: 1.0, duck_bus: 0, duck_amount: 0.0, eq_low_db: 0.0, eq_mid_db: 0.0, eq_high_db: 0.0 },
+  flat,
+  flat,
+]
+
+func empty_access () : Access =>
+  let sounds: #[Sound] = #[]
+  let voices: #[Voice] = #[]
+  let buses = copy mix_start
+  let listener: #[Listener] = #[]
+  let panners: #[Panner] = #[]
+  let reverb_zones: #[ReverbZone] = #[]
+  let synths: #[SynthVoice] = #[]
+  return $Access { sounds, voices, buses, listener, panners, reverb_zones, synths }
+
+// Clear only after the preceding audio output has been encoded.
+func begin_frame (access: own Access): Access =>
+  if access.buses.length != mix_start.length:
+    return panic "audio output requires the declared bus count"
+  @storage.truncate access.sounds 0
+  @storage.truncate access.voices 0
+  @storage.truncate access.listener 0
+  @storage.truncate access.panners 0
+  @storage.truncate access.reverb_zones 0
+  @storage.truncate access.synths 0
+  for index in 0 .. mix_start.length:
+    access.buses[index] := mix_start[index]
+  return access
+func read (access: Access) => $Audio {
+  sounds: &access.sounds[0..access.sounds.length], voices: &access.voices[0..access.voices.length],
+  buses: &access.buses[0..access.buses.length], listener: &access.listener[0..access.listener.length],
+  panners: &access.panners[0..access.panners.length],
+  reverb_zones: &access.reverb_zones[0..access.reverb_zones.length],
+  synths: &access.synths[0..access.synths.length],
+}
+func listener (position: Vec3) -> (forward: Vec3) -> (up: Vec3) : Listener =>
+  $Listener { position, forward, up, velocity: math.zero3 }
+func set_listener (access: own Access) -> (listener: Listener) : Access =>
+  @storage.truncate access.listener 0
+  @storage.push access.listener listener
+  return access
+func pan (access: own Access) -> (panner: Panner) : Access =>
+  @storage.push access.panners panner
+  return access
+func panner_for_voice (id: U32) -> (position: Vec3): Panner => $Panner {
+  voice: id, sound: 0, position, orientation: math.forward,
+  distance_model: distance_inverse, ref_distance: 1.0, max_distance: 10000.0, rolloff: 1.0,
+  cone_inner: 360.0, cone_outer: 360.0, cone_outer_gain: 0.0, hrtf: false,
+  velocity: math.zero3, doppler: 0.0, occlusion: 0.0, zone: 0,
+}
+func panner_for_sound (index: U32) -> (position: Vec3): Panner => $Panner {
+  voice: 0, sound: index, position, orientation: math.forward,
+  distance_model: distance_inverse, ref_distance: 1.0, max_distance: 10000.0, rolloff: 1.0,
+  cone_inner: 360.0, cone_outer: 360.0, cone_outer_gain: 0.0, hrtf: false,
+  velocity: math.zero3, doppler: 0.0, occlusion: 0.0, zone: 0,
+}
+func reverb_zone (id: U32) -> (position: Vec3) -> (half_extents: Vec3) : ReverbZone => $ReverbZone {
+  id, position, half_extents, blend: 1.0, decay: 1.5, damping: 0.35, wet: 0.3, portal_attenuation: 0.0,
+}
+func add_reverb_zone (access: own Access) -> (zone: ReverbZone) : Access =>
+  @storage.push access.reverb_zones zone
+  return access
+func synth_voice (id: U32) -> (mode: U32) -> (bus: U32) -> (frequency: F32) : SynthVoice => $SynthVoice {
+  id, mode, bus, frequency, gain: 0.5, pan: 0.0, detune: 0.0,
+  attack: 0.01, decay: 0.1, sustain: 0.8, release: 0.2,
+  cutoff: open, resonance: 0.707, grain_size: 0.05, grain_pitch: 1.0, reverb: 0.0,
+}
+func play_synth (access: own Access) -> (synth: SynthVoice) : Access =>
+  @storage.push access.synths synth
+  return access
+func play (access: own Access) -> (sound: Sound) : Access =>
+  @storage.push access.sounds sound
+  return access
+func play_many (access: own Access) -> sounds : Access =>
+  for sound in sounds:
+    @storage.push access.sounds sound
+  return access
+
+// Plays `clip` once on the effects bus, at `volume` and `pitch`, from
+// `position`.
+func at (access: own Access) -> (clip: U32) => func (volume: F32) => func (pitch: F32) => func (position: Vec3) : Access => return
+  play access $Sound { clip, bus: effects, volume, pitch, reverb: 0.0, position: $Some position }
+
+// Plays `clip` once on the interface bus, at `volume` and `pitch`: a click,
+// a blip, a menu opening.
+func ui (access: own Access) -> (clip: U32) => func (volume: F32) => func (pitch: F32) : Access => return
+  play access $Sound { clip, bus: interface, volume, pitch, reverb: 0.0, position: $Nothing }
+
+// A voice playing `clip` through `bus`, which `id` (1 to 0xFFFFFF, the same
+// every frame) names: looping from the clip's start, at full gain, in the
+// middle, as recorded, open and dry, fading in and out briefly. Change what
+// differs, then `keep` it each frame it plays. A voice that comes back while
+// it fades out returns where it is; one whose clip or bus changes starts
+// again, the old fading out as the new fades in; one that does not loop
+// plays once and is silent from then on, for as long as frames keep it.
+func voice (id: U32) => func (clip: U32) => func (bus: U32) => $Voice {
+  id, clip, bus, gain: 1.0, pan: 0.0, pitch: 1.0, lowpass: open, reverb: 0.0,
+  looping: true, start: 0.0, fade_in: brief, fade_out: brief, position: $Nothing,
+}
+
+// Keeps `voice` playing through this frame. Of two with the same id, hosts
+// play the first.
+func keep (access: own Access) -> (voice: Voice) : Access =>
+  @storage.push access.voices voice
+  return access
+func keep_many (access: own Access) -> voices : Access =>
+  for voice in voices:
+    @storage.push access.voices voice
+  return access
+
+// Music: `clip` looping on the music bus as `id`, at `volume`, from `start`
+// seconds into it, fading in and out over `fade` seconds. Two tracks that
+// take turns crossfade: the one frames leave out fades as the other comes in.
+func track (access: own Access) -> (id: U32) => func (clip: U32) => func (volume: F32) => func (fade: F32) => func (start: F32) : Access =>
+  let playing = voice id clip music
+  playing.gain := volume
+  playing.start := start
+  playing.fade_in := fade
+  playing.fade_out := fade
+  return keep access playing
+
+// Changes bus `index` for this frame: `change` gets it as the frame has it so
+// far and returns it changed.
+func mix (access: own Access) -> (index: U32) -> change: Access =>
+  if index < access.buses.length:
+    access.buses[index] := change access.buses[index]
+  return access
+
+// Quiets bus `index` to `gain` of itself and dulls it to `lowpass` Hz at
+// most, for this frame: under a pause menu, say.
+func muffle (access: own Access) -> (index: U32) => func (gain: F32) => func (lowpass: F32): Access => return
+  mix access index (func (bus: Bus) =>
+    let next = bus
+    if is_finite gain:
+      next.gain := bus.gain * max 0.0 gain
+    if is_finite lowpass:
+      next.lowpass := min bus.lowpass (max 0.0 lowpass)
+    return next)
+
+// How something is heard from the camera: what its gain is multiplied by,
+// its pan, the lowpass it is heard through and what it adds to its reverb.
+type Heard is data = $Heard { gain: F32, pan: F32, lowpass: F32, reverb: F32 }
+const nearby = $Heard { gain: 1.0, pan: 0.0, lowpass: open, reverb: 0.0 }
+
+// Something at `place` as heard through `view`: quieter past 12 units,
+// panned by how far across the view it is, duller past 30 units, as the air
+// takes its highs, and more of it reverberating the further it is. Nowhere
+// is in the middle, as it is.
+func hear (view: math.Mat4) => func (place: Maybe Vec3) => case place of
+  $Nothing => nearby
+  $Some p => do:
+    if not (math.finite3 p):
+      break nearby
+    let x = view.x
+    let y = view.y
+    let z = view.z
+    let w = view.w
+    let across = x.x * p.x + y.x * p.y + z.x * p.z + w.x
+    let up = x.y * p.x + y.y * p.y + z.y * p.z + w.y
+    let ahead = x.z * p.x + y.z * p.y + z.z * p.z + w.z
+    if not (is_finite across and is_finite up and is_finite ahead):
+      break nearby
+    let distance = sqrt (across * across + up * up + ahead * ahead)
+    if not (is_finite distance):
+      let m = max (abs across) (max (abs up) (abs ahead))
+      if not (is_finite m) or m == 0.0:
+        break nearby
+      let sa = across / m
+      let su = up / m
+      let sh = ahead / m
+      distance := m * sqrt (sa * sa + su * su + sh * sh)
+      if not (is_finite distance):
+        break $Heard { gain: 0.0, pan: clamp (-1.0) 1.0 (sa / sqrt (sa * sa + su * su + sh * sh)) * 0.8, lowpass: 0.0, reverb: 0.3 }
+    break $Heard {
+      gain: 1.0 / (1.0 + max 0.0 (distance - 12.0) / 25.0),
+      pan: clamp (-1.0) 1.0 (across / max distance 1.0) * 0.8,
+      lowpass: open / (1.0 + max 0.0 (distance - 30.0) / 12.0),
+      reverb: 0.3 * smoothstep 8.0 50.0 distance,
+    }

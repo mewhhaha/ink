@@ -184,7 +184,7 @@ fn bits(r: &Run) -> Vec<u64> {
 
 #[test]
 fn pose_read_back_round_trips_the_bind_pose_and_blends() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let bind = humanoid(1.3, 1.2);
     let animated: Vec<Q> = (0..12)
         .map(|i| axis([0.3, 1.0, 0.2], 0.1 * i as f64))
@@ -217,7 +217,7 @@ fn pose_read_back_round_trips_the_bind_pose_and_blends() {
 
 #[test]
 fn bodies_start_with_joint_anchors_coincident() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let bind = humanoid(1.3, 1.2);
     let r = run(
         &mut f,
@@ -242,7 +242,7 @@ fn bodies_start_with_joint_anchors_coincident() {
 
 #[test]
 fn dropped_ragdoll_stays_stable_bounded_and_comes_to_rest() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let mut bind = humanoid(1.6, 0.0);
     bind.rot[0] = axis([0.0, 0.0, 1.0], 0.9);
     let setup = Setup {
@@ -293,7 +293,7 @@ fn dropped_ragdoll_stays_stable_bounded_and_comes_to_rest() {
 
 #[test]
 fn powered_ragdoll_tracks_a_pose_and_relaxes_without_strength() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let mut bind = humanoid(1.3, 0.0);
     for q in &mut bind.rot {
         *q = [0.0, 0.0, 0.0, 1.0];
@@ -367,7 +367,7 @@ fn powered_ragdoll_tracks_a_pose_and_relaxes_without_strength() {
 
 #[test]
 fn skeleton_validation_rejects_bad_input() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     // [count, parents..., radius, strength]
     let ok = |f: &mut Fixture, parents: &[f64], radius: f64, strength: f64| {
         let mut a = vec![parents.len() as f64];
@@ -389,7 +389,7 @@ fn skeleton_validation_rejects_bad_input() {
 
 #[test]
 fn ragdoll_dropped_on_meshes_stays_stable_and_comes_to_rest() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let mut bind = humanoid(1.6, 0.0);
     bind.rot[0] = axis([0.0, 0.0, 1.0], 0.9);
     let animated = vec![[0.0, 0.0, 0.0, 1.0]; 12];

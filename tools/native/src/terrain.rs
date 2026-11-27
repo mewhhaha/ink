@@ -321,7 +321,7 @@ fn scenes() -> Vec<Scene> {
 }
 #[test]
 fn terrain_noise_and_hashes_match_double_precision_reference() {
-    let mut f = Fixture::new("tests/terrain.blot");
+    let mut f = Fixture::new("tests/terrain.sq");
     let mut rng = Random(5);
     for seed in [0, 1, 7, 4093] {
         let mut rows = Vec::new();
@@ -373,7 +373,7 @@ fn terrain_noise_and_hashes_match_double_precision_reference() {
 }
 #[test]
 fn terrain_heights_normals_and_footprints() {
-    let mut f = Fixture::new("tests/terrain.blot");
+    let mut f = Fixture::new("tests/terrain.sq");
     for s in scenes() {
         let queries: Vec<_> = s.locals(160).into_iter().map(|p| s.world(p)).collect();
         let rows: Vec<_> = queries
@@ -457,7 +457,7 @@ fn terrain_heights_normals_and_footprints() {
 }
 #[test]
 fn terrain_coarse_grid_follows_fine_field() {
-    let mut f = Fixture::new("tests/terrain.blot");
+    let mut f = Fixture::new("tests/terrain.sq");
     let mut s = Scene::new(
         [0.0; 3],
         64,
@@ -494,7 +494,7 @@ fn terrain_coarse_grid_follows_fine_field() {
 }
 #[test]
 fn terrain_stand_stick_and_moving_characters() {
-    let mut f = Fixture::new("tests/terrain.blot");
+    let mut f = Fixture::new("tests/terrain.sq");
     let s = &scenes()[1];
     let lift = 0.9;
     let spots: Vec<_> = s.locals(40).into_iter().map(|p| s.world(p)).collect();
@@ -579,7 +579,7 @@ fn terrain_stand_stick_and_moving_characters() {
 }
 #[test]
 fn terrain_range_contains_sampled_ground_and_missing_grids() {
-    let mut f = Fixture::new("tests/terrain.blot");
+    let mut f = Fixture::new("tests/terrain.sq");
     for s in scenes() {
         let half = s.size / 2.0;
         let mut rng = Random(s.cells as u32 + 11);

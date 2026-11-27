@@ -1,0 +1,112 @@
+//! Tweens animate any value whose type has `lerp: a -> a -> F32 -> a`: F32,
+//! Vec2, Vec3, math.Color and math.Quat (slerp) already do, and a game can give
+//! its own types one. A value with discrete states, such as a flag, a count or a
+//! variant, tweens inside `Discrete`, which holds its start until the eased
+//! progress reaches 1: at the end, or earlier where `Back` overshoots. Times are
+//! the caller's seconds; nothing here keeps a clock.
+//!
+//! Key items: [`Ease`], [`Tween`], [`Discrete`], [`eased`], [`under`].
+//!
+//! ```squid
+//! import * as tw from "ink/tween"
+//! let $Some anim = tw.make 0.0 100.0 0.0 2.0 $tw.Linear else:
+//!   return 0.0
+//! tw.at anim 0.5 // => 25.0
+//! ```
+
+import * as motion from "./motion"
+
+// Easings are data, so tweens and timelines can be saved and compared.
+// `Back` overshoots past 1 before settling. `Hold` stays at 0 until the end;
+// `Steps n` rises in n equal jumps, reaching 1 at the end.
+type Ease is data =
+  | $Linear
+  | $Smooth
+  | $Smoother
+  | $CubicIn
+  | $CubicOut
+  | $CubicInOut
+  | $Back
+  | $Hold
+  | $Steps U32
+
+type Tween a is data = $Tween { from: a, to: a, start: F32, duration: F32, ease: Ease }
+
+type Discrete a is data = $Discrete a
+
+func Discrete.lerp (a: Discrete p) => func (b: Discrete p) => func (t: F32) => if t >= 1.0 then b else a
+
+// Eased progress for linear progress `t`, clamped to [0, 1] first. Every ease
+// is exactly 0 at the start (and for NaN) and exactly 1 at the end. Before the
+// end, results that F32 rounding would carry up to 1 stay just below it, so a
+// `Discrete` value cannot switch early; only `Back` legitimately passes 1.
+func eased (ease: Ease) => func (t: F32) =>
+  let x = clamp 0.0 1.0 t
+  if not (x > 0.0):
+    return 0.0
+  if x >= 1.0:
+    return 1.0
+  return case ease of
+    $Linear => x
+    $Smooth => under (motion.smooth x)
+    $Smoother => under (motion.smoother x)
+    $CubicIn => motion.cubic_in x
+    $CubicOut => under (motion.cubic_out x)
+    $CubicInOut => under (motion.cubic_in_out x)
+    $Back => motion.cubic_out_back x
+    $Hold => 0.0
+    $Steps count => under (steps count x)
+
+// Caps a value at the largest F32 below 1.
+func under (value: F32) => min value 0.99999994
+
+// For progress in (0, 1): n equal jumps, none for zero steps.
+func steps (count: U32) => func (x: F32) =>
+  if count == 0:
+    return 0.0
+  let n = U32.to_f32 count
+  return floor (x * n) / n
+
+// Starts at `start` seconds and lasts `duration`; zero duration jumps at
+// `start`. Non-finite times or a negative duration are refused.
+func make from => func to => func (start: F32) => func (duration: F32) => func (ease: Ease) =>
+  if not (is_finite start):
+    return $Nothing
+  if not (is_finite duration):
+    return $Nothing
+  if not (is_finite (start + duration)):
+    return $Nothing
+  if duration < 0.0:
+    return $Nothing
+  return $Some ($Tween { from, to, start, duration, ease })
+
+// Linear progress in [0, 1] at `time`, before easing.
+func progress (tween: Tween a) => func (time: F32) =>
+  if not (is_finite time and is_finite tween.start and is_finite tween.duration):
+    return 0.0
+  if time <= tween.start:
+    return if tween.duration == 0.0 and time == tween.start then 1.0 else 0.0
+  if tween.duration == 0.0:
+    return 1.0
+  return clamp 0.0 1.0 ((time - tween.start) / tween.duration)
+
+func at (tween: Tween a) => func (time: F32) =>
+  let $Tween { from, to, ease } = tween
+  return lerp from to (eased ease (progress tween time))
+
+func ends (tween: Tween a) => tween.start + tween.duration
+
+func done (tween: Tween a) => func (time: F32) => time >= tween.start + tween.duration
+
+// Swaps the ends over the same span, keeping the ease. A symmetric ease
+// (Linear, Smooth, Smoother, CubicInOut) retraces the motion backwards; an
+// asymmetric one keeps its character, so a reversed CubicIn still starts
+// slowly.
+func reversed (tween: Tween a) =>
+  let $Tween { from, to, start, duration, ease } = tween
+  return $Tween { from: to, to: from, start, duration, ease }
+
+// Interrupts `tween` at `time`: a new tween from wherever it is now to `to`,
+// so redirecting never jumps.
+func toward (tween: Tween a) => func (time: F32) => func to => func (duration: F32) => func (ease: Ease) => return
+  make (at tween time) to time duration ease

@@ -1,0 +1,523 @@
+//! Flat postfix filters avoid recursive runtime ADTs. Operands name component
+//! keys; All/Any consume the preceding count terms. Zero All is true, zero Any
+//! false. Sources capture explicit membership copies, not mutable column views.
+//!
+//! Key items: [`Term`], [`Filter`], [`Source`], [`SourceMeta`], [`source_meta`].
+//!
+//! ```squid
+//! import * as test from "std/test"
+//! import * as ecs from "ink/ecs"
+//! import * as query from "ink/ecs/query"
+//!
+//! @[test.suite]
+//! test "cached query tracks membership revisions":
+//!   let alive = ecs.spawn_entity (ecs.entities ())
+//!   let emeta = ecs.bump_membership (ecs.metadata 1)
+//!   let pos: ecs.Pool U32 = ecs.put_row alive (ecs.pool ()) 0 10
+//!   let pmeta = ecs.bump_insert false (ecs.metadata 1)
+//!   let filter = #[$query.With 1]
+//!   let src = query.source 1 pos pmeta #[]
+//!   let (key, sel, qmeta) = query.select alive emeta filter #[src] #[] #[] #[0]
+//!   let matched = sel.length
+//!   use test.eq "matched count" 1 matched
+//!   use test.holds "cache current" (query.is_current emeta filter #[query.source_meta 1 pmeta] key qmeta)
+//!   return ()
+//! ```
+
+import * as array from "std/array"
+import * as ecs from "../ecs"
+
+type Term is data = $With U32 | $Without U32 | $Optional U32 | $All U32 | $Any U32
+type Filter = #[Term]
+type Source is data = $Source { key: U32, epoch: U32, structure: U32, present: #[Bool] }
+// Cache storage is three independently named caller owners: key words,
+// selected entity IDs, and one metadata word (the build count). Reset all three
+// explicitly on a lineage change. A prepared query is never an owning row.
+type SourceMeta is data = $SourceMeta { key: U32, epoch: U32, structure: U32 }
+func source_meta (key: U32) -> (meta: ecs.Metadata): SourceMeta => return
+  $SourceMeta { key, epoch: ecs.epoch meta, structure: ecs.membership_revision meta }
+func source (key: U32) -> (pool: ecs.Pool a) -> (meta: ecs.Metadata) -> (membership: own #[Bool]) : Source =>
+  let n = pool.extent
+  let epoch = ecs.epoch meta
+  let structure = ecs.membership_revision meta
+  if n == 0:
+    @storage.truncate membership 0
+    return $Source {key, epoch, structure, present: membership}
+  let flags = pool.flags
+  if flags == 0:
+    if membership.length < n:
+      return $Source {key, epoch, structure, present: @array.fill n true}
+    for id in 0 .. n:
+      membership[id] := true
+    if membership.length > n:
+      @storage.truncate membership n
+    return $Source {key, epoch, structure, present: membership}
+  let p_meta = pool.meta
+  if membership.length < n:
+    let fresh = @array.fill n false
+    if flags == 2:
+      let full = n >> 5
+      for wi in 0 .. full:
+        let w = p_meta[1 + wi]
+        let base = wi << 5
+        for 0 .. 32:
+          if w == 0:
+            break
+          fresh[base + ecs.ctz32 w] := true
+          w := self & (self - 1)
+      let rem = n & 31
+      if rem > 0:
+        let w = p_meta[1 + full] & ((1 << rem) - 1)
+        let base = full << 5
+        for 0 .. 32:
+          if w == 0:
+            break
+          fresh[base + ecs.ctz32 w] := true
+          w := self & (self - 1)
+    else:
+      let id_base = 3 + p_meta[1]
+      let live_n = p_meta[0]
+      for k in 0 .. live_n:
+        fresh[p_meta[id_base + k]] := true
+    return $Source {key, epoch, structure, present: fresh}
+  for id in 0 .. n:
+    membership[id] := false
+  if flags == 2:
+    let full = n >> 5
+    for wi in 0 .. full:
+      let w = p_meta[1 + wi]
+      let base = wi << 5
+      for 0 .. 32:
+        if w == 0:
+          break
+        membership[base + ecs.ctz32 w] := true
+        w := self & (self - 1)
+    let rem = n & 31
+    if rem > 0:
+      let w = p_meta[1 + full] & ((1 << rem) - 1)
+      let base = full << 5
+      for 0 .. 32:
+        if w == 0:
+          break
+        membership[base + ecs.ctz32 w] := true
+        w := self & (self - 1)
+  else:
+    let id_base = 3 + p_meta[1]
+    let live_n = p_meta[0]
+    for k in 0 .. live_n:
+      membership[p_meta[id_base + k]] := true
+  if membership.length > n:
+    @storage.truncate membership n
+  return $Source {key, epoch, structure, present: membership}
+// Prepared component membership is valid for this source's epoch and
+// structure revision. Liveness is always read from the current entity owner.
+func prepare_anchor (source: Source) -> (ids: own #[U32]) : #[U32] =>
+  @storage.truncate ids 0
+  let present = source.present
+  for id in 0 .. present.length:
+    if present[id]:
+      @storage.push ids id
+  return ids
+func select_anchor (alive: ecs.Entities) -> (ids: &[U32]) -> (selected: own #[U32]) : #[U32] =>
+  @storage.truncate selected 0
+  for id in ids:
+    if ecs.live alive id:
+      @storage.push selected id
+  return selected
+func locate (key: U32) -> (sources: #[Source]) =>
+  for i in 0 .. sources.length:
+    if sources[i].key == key:
+      return i
+  return panic "query references an unbound component key"
+private func locate_meta (key: U32) -> (sources: #[SourceMeta]) =>
+  for i in 0 .. sources.length:
+    if sources[i].key == key:
+      return i
+  return panic "query references an unbound component key"
+func has (source: Source) -> (id: U32) => id < source.present.length and source.present[id]
+private func matches_resolved (filter: Filter) -> (resolved: #[U32]) -> (sources: #[Source]) -> (stack: own #[Bool]) -> (id: U32): (Bool, #[Bool]) =>
+  let count = 0
+  for idx in 0 .. filter.length:
+    case filter[idx] of
+      $With _ => do:
+        stack[count] := has sources[resolved[idx]] id
+        count := self + 1
+      $Without _ => do:
+        stack[count] := not (has sources[resolved[idx]] id)
+        count := self + 1
+      $Optional _ => do:
+        stack[count] := true
+        count := self + 1
+      $All take => do:
+        if take > count:
+          return panic "query filter stack underflow"
+        let value = true
+        for i in count - take .. count:
+          value := self and stack[i]
+        count := self - take
+        stack[count] := value
+        count := self + 1
+      $Any take => do:
+        if take > count:
+          return panic "query filter stack underflow"
+        let value = false
+        for i in count - take .. count:
+          value := self or stack[i]
+        count := self - take
+        stack[count] := value
+        count := self + 1
+  if count != 1:
+    return panic "query filter must produce one result"
+  return (stack[0], stack)
+func matches (filter: Filter) -> (sources: #[Source]) -> (id: U32) =>
+  let resolved = array.generate filter.length (func idx => case filter[idx] of
+    $With key => locate key sources
+    $Without key => locate key sources
+    $Optional key => locate key sources
+    _ => 0)
+  let stack = array.fill filter.length false
+  let (matched, _) = matches_resolved filter resolved sources stack id
+  return matched
+func same a -> b =>
+  if a.length != b.length:
+    return false
+  for i in 0 .. a.length:
+    if a.at i != b.at i:
+      return false
+  return true
+func append_identity (filter: Filter) -> (words: own #[U32]) : #[U32] =>
+  for term in filter:
+    let (tag, value) = case term of
+      $With key => (0, key)
+      $Without key => (1, key)
+      $Optional key => (2, key)
+      $All count => (3, count)
+      $Any count => (4, count)
+    @storage.push words tag
+    @storage.push words value
+  return words
+// Check whether a cached query matches current entity and source metadata
+// before callers pay to materialize `query.source` membership pools.
+func is_current (entity_meta: ecs.Metadata) -> (filter: Filter) -> (sources: #[SourceMeta]) -> (key: #[U32]) -> (meta: #[U32]): Bool =>
+  if meta[0] == 0:
+    return false
+  let key_len = key.length
+  let expected_min = 2 + filter.length * 2
+  if key_len < expected_min:
+    return false
+  if key[0] != ecs.epoch entity_meta or key[1] != ecs.membership_revision entity_meta:
+    return false
+  let pos: U32 = 2
+  for idx in 0 .. filter.length:
+    let (tag, value) = case filter[idx] of
+      $With k => (0, k)
+      $Without k => (1, k)
+      $Optional k => (2, k)
+      $All count => (3, count)
+      $Any count => (4, count)
+    if key[pos] != tag or key[pos + 1] != value:
+      return false
+    pos := self + 2
+  for idx in 0 .. filter.length:
+    let selected = case filter[idx] of
+      $With k => $Some (locate_meta k sources)
+      $Without k => $Some (locate_meta k sources)
+      _ => $Nothing
+    if let $Some index = selected:
+      if pos + 3 > key_len:
+        return false
+      let s = sources[index]
+      if key[pos] != s.key or key[pos + 1] != s.epoch or key[pos + 2] != s.structure:
+        return false
+      pos := self + 3
+  return pos == key_len
+private func matches_bitmask (filter: Filter) -> (resolved: #[U32]) -> (sources: #[Source]) -> (id: U32) : Bool =>
+  let bits: U32 = 0
+  let count: U32 = 0
+  for idx in 0 .. filter.length:
+    case filter[idx] of
+      $With _ => do:
+        if has sources[resolved[idx]] id:
+          bits := self | (1 << count)
+        else:
+          bits := self & (4294967295 ^ (1 << count))
+        count := self + 1
+      $Without _ => do:
+        if not (has sources[resolved[idx]] id):
+          bits := self | (1 << count)
+        else:
+          bits := self & (4294967295 ^ (1 << count))
+        count := self + 1
+      $Optional _ => do:
+        bits := self | (1 << count)
+        count := self + 1
+      $All take => do:
+        if take > count:
+          return panic "query filter stack underflow"
+        let base = count - take
+        let mask = if take == 32 then 4294967295 else ((1 << take) - 1) << base
+        let value = (bits & mask) == mask
+        count := base
+        if value:
+          bits := self | (1 << count)
+        else:
+          bits := self & (4294967295 ^ (1 << count))
+        count := self + 1
+      $Any take => do:
+        if take > count:
+          return panic "query filter stack underflow"
+        let base = count - take
+        let mask = if take == 32 then 4294967295 else ((1 << take) - 1) << base
+        let value = (bits & mask) != 0
+        count := base
+        if value:
+          bits := self | (1 << count)
+        else:
+          bits := self & (4294967295 ^ (1 << count))
+        count := self + 1
+  if count != 1:
+    return panic "query filter must produce one result"
+  return (bits & 1) != 0
+func step_match (filter: Filter) -> (resolved: #[U32]) -> (sources: #[Source]) -> (id: U32) -> (pair: own (#[Bool], #[U32])) : (#[Bool], #[U32]) =>
+  let (s, out) = pair
+  let (matched, next_s) = matches_resolved filter resolved sources s id
+  if matched:
+    @storage.push out id
+  return (next_s, out)
+func prepare (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: Filter) -> (sources: #[Source]) -> (key: own #[U32]) -> (indices: own #[U32]) -> (meta: own #[U32]) : (#[U32], #[U32], #[U32]) =>
+  for i in 0 .. sources.length:
+    for j in 0 .. i:
+      if sources[i].key == sources[j].key:
+        return panic "duplicate query component key"
+  let flen = filter.length
+  let key_len = key.length
+  let ep = ecs.epoch entity_meta
+  let mr = ecs.membership_revision entity_meta
+  if flen == 1:
+    if let $With component = filter[0]:
+      let index = locate component sources
+      let s = sources[index]
+      let identity_hit = meta[0] != 0 and key_len == 7 and key[0] == ep and key[1] == mr
+      if identity_hit and key[2] == 0 and key[3] == component and key[4] == s.key and key[5] == s.epoch and key[6] == s.structure:
+        return (key, indices, meta)
+      let builds = ecs.bumped_revision meta[0]
+      @storage.truncate indices 0
+      let present = s.present
+      let a_words = alive.words
+      let limit = min alive.count present.length
+      let zero64: U64 = 0u64
+      let one64: U64 = 1u64
+      let all64: U64 = 0xFFFFFFFFFFFFFFFFu64
+      let full = limit >> 6
+      for wi in 0 .. full:
+        let w = a_words[wi]
+        if U64.eq w zero64:
+          continue
+        let base = wi << 6
+        if U64.eq w all64:
+          for b in 0 .. 64:
+            let id = base + b
+            if present[id]:
+              @storage.push indices id
+        else:
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            let id = base + ecs.ctz64 w
+            if present[id]:
+              @storage.push indices id
+            w := U64.bit_and self (U64.sub self one64)
+      let rem = limit & 63
+      if rem > 0:
+        let mask = U64.sub (U64.shl one64 (U32.to_u64 rem)) one64
+        let w = U64.bit_and a_words[full] mask
+        let base = full << 6
+        for 0 .. 64:
+          if U64.eq w zero64:
+            break
+          let id = base + ecs.ctz64 w
+          if present[id]:
+            @storage.push indices id
+          w := U64.bit_and self (U64.sub self one64)
+      @storage.truncate key 0
+      @storage.reserve key 7
+      @storage.push key ep
+      @storage.push key mr
+      @storage.push key 0
+      @storage.push key component
+      @storage.push key s.key
+      @storage.push key s.epoch
+      @storage.push key s.structure
+      meta[0] := builds
+      return (key, indices, meta)
+  let hit = meta[0] != 0 and key_len >= 2 + flen * 2 and key[0] == ep and key[1] == mr
+  let pos: U32 = 2
+  if hit:
+    for idx in 0 .. flen:
+      let (tag, value) = case filter[idx] of
+        $With k => (0, k)
+        $Without k => (1, k)
+        $Optional k => (2, k)
+        $All count => (3, count)
+        $Any count => (4, count)
+      if key[pos] != tag or key[pos + 1] != value:
+        hit := false
+        break
+      pos := self + 2
+  let resolved = array.fill flen 0
+  for idx in 0 .. flen:
+    case filter[idx] of
+      $With k => do:
+        let index = locate k sources
+        resolved[idx] := index
+        if hit:
+          let s = sources[index]
+          if pos + 3 > key_len or key[pos] != s.key or key[pos + 1] != s.epoch or key[pos + 2] != s.structure:
+            hit := false
+          else:
+            pos := self + 3
+      $Without k => do:
+        let index = locate k sources
+        resolved[idx] := index
+        if hit:
+          let s = sources[index]
+          if pos + 3 > key_len or key[pos] != s.key or key[pos + 1] != s.epoch or key[pos + 2] != s.structure:
+            hit := false
+          else:
+            pos := self + 3
+      $Optional k => do:
+        resolved[idx] := locate k sources
+      _ => ()
+  if hit and pos == key_len:
+    return (key, indices, meta)
+  let builds = ecs.bumped_revision meta[0]
+  @storage.truncate indices 0
+  let a_words = alive.words
+  let n_alive = alive.count
+  let zero64: U64 = 0u64
+  let one64: U64 = 1u64
+  let full_alive = n_alive >> 6
+  let rem_alive = n_alive & 63
+  if flen == 1:
+    case filter[0] of
+      $With _ => ()
+      $Without _ => do:
+        let present = sources[resolved[0]].present
+        let p_len = present.length
+        for wi in 0 .. full_alive:
+          let w = a_words[wi]
+          let base = wi << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            let id = base + ecs.ctz64 w
+            if not (id < p_len and present[id]):
+              @storage.push indices id
+            w := U64.bit_and self (U64.sub self one64)
+        if rem_alive > 0:
+          let mask = U64.sub (U64.shl one64 (U32.to_u64 rem_alive)) one64
+          let w = U64.bit_and a_words[full_alive] mask
+          let base = full_alive << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            let id = base + ecs.ctz64 w
+            if not (id < p_len and present[id]):
+              @storage.push indices id
+            w := U64.bit_and self (U64.sub self one64)
+      $Optional _ => do:
+        for wi in 0 .. full_alive:
+          let w = a_words[wi]
+          let base = wi << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            @storage.push indices (base + ecs.ctz64 w)
+            w := U64.bit_and self (U64.sub self one64)
+        if rem_alive > 0:
+          let mask = U64.sub (U64.shl one64 (U32.to_u64 rem_alive)) one64
+          let w = U64.bit_and a_words[full_alive] mask
+          let base = full_alive << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            @storage.push indices (base + ecs.ctz64 w)
+            w := U64.bit_and self (U64.sub self one64)
+      $All take => do:
+        if take != 0:
+          return panic "query filter stack underflow"
+        for wi in 0 .. full_alive:
+          let w = a_words[wi]
+          let base = wi << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            @storage.push indices (base + ecs.ctz64 w)
+            w := U64.bit_and self (U64.sub self one64)
+        if rem_alive > 0:
+          let mask = U64.sub (U64.shl one64 (U32.to_u64 rem_alive)) one64
+          let w = U64.bit_and a_words[full_alive] mask
+          let base = full_alive << 6
+          for 0 .. 64:
+            if U64.eq w zero64:
+              break
+            @storage.push indices (base + ecs.ctz64 w)
+            w := U64.bit_and self (U64.sub self one64)
+      $Any take => do:
+        if take != 0:
+          return panic "query filter stack underflow"
+  else:
+    if flen <= 32:
+      for wi in 0 .. full_alive:
+        let w = a_words[wi]
+        let base = wi << 6
+        for 0 .. 64:
+          if U64.eq w zero64:
+            break
+          let id = base + ecs.ctz64 w
+          if matches_bitmask filter resolved sources id:
+            @storage.push indices id
+          w := U64.bit_and self (U64.sub self one64)
+      if rem_alive > 0:
+        let mask = U64.sub (U64.shl one64 (U32.to_u64 rem_alive)) one64
+        let w = U64.bit_and a_words[full_alive] mask
+        let base = full_alive << 6
+        for 0 .. 64:
+          if U64.eq w zero64:
+            break
+          let id = base + ecs.ctz64 w
+          if matches_bitmask filter resolved sources id:
+            @storage.push indices id
+          w := U64.bit_and self (U64.sub self one64)
+    else:
+      let stack = array.fill flen false
+      let loop_state = (stack, indices)
+      for id in 0 .. n_alive:
+        if ecs.live alive id:
+          loop_state := step_match filter resolved sources id self
+      let (_, next_indices) = loop_state
+      indices := next_indices
+  @storage.truncate key 0
+  @storage.push key ep
+  @storage.push key mr
+  key := append_identity filter self
+  for idx in 0 .. flen:
+    case filter[idx] of
+      $With _ => do:
+        let s = sources[resolved[idx]]
+        @storage.push key s.key
+        @storage.push key s.epoch
+        @storage.push key s.structure
+      $Without _ => do:
+        let s = sources[resolved[idx]]
+        @storage.push key s.key
+        @storage.push key s.epoch
+        @storage.push key s.structure
+      _ => ()
+  meta[0] := builds
+  return (key, indices, meta)
+const select = prepare
+func each indices -> action =>
+  for i in 0 .. indices.length:
+    action (indices.at i)
+  return ()

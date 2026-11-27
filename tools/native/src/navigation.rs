@@ -84,7 +84,7 @@ fn check_path(
 }
 #[test]
 fn navigation_dijkstra_routes_and_budgets() {
-    let mut f = Fixture::new("tests/navigation.blot");
+    let mut f = Fixture::new("tests/navigation.sq");
     for seed in 1..=25 {
         let mut random = Random(seed);
         let mut costs: Vec<f64> = (0..117)
@@ -150,7 +150,7 @@ fn navigation_dijkstra_routes_and_budgets() {
 }
 #[test]
 fn navigation_units_match_general_heap() {
-    let file = root().join("lib/navigation.blot");
+    let file = root().join("lib/navigation.sq");
     let source = std::fs::read_to_string(&file).unwrap();
     let baseline = source.replace(
         "  if g.units:\n    return flow_units g goal",
@@ -161,14 +161,14 @@ fn navigation_units_match_general_heap() {
         "general flow oracle must actually replace the fast path"
     );
     let module = compiled(
-        "tests/navigation.blot",
+        "tests/navigation.sq",
         &[Overlay {
             path: file.to_string_lossy().into_owned(),
             contents: Some(baseline),
         }],
     );
     let mut reference = Fixture::from_module(&module);
-    let mut f = Fixture::new("tests/navigation.blot");
+    let mut f = Fixture::new("tests/navigation.sq");
     let mut random = Random(12345);
     for trial in 0..120 {
         let width = 1 + trial % 23;
@@ -200,7 +200,7 @@ fn navigation_units_match_general_heap() {
 }
 #[test]
 fn stress_bottlenecks_disconnected_and_expansion_budgets() {
-    let mut f = Fixture::new("tests/algorithm-stress.blot");
+    let mut f = Fixture::new("tests/algorithm-stress.sq");
     for size in [8, 16, 32] {
         for mode in 0..3 {
             let costs: Vec<f64> = (0..size * size)

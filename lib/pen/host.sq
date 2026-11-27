@@ -1,0 +1,856 @@
+//! Optional Pen adapter encoding [`ink/render/RenderFrame`] and decoding host frame inputs.
+
+import * as audio from "../sound"
+import * as color from "../color"
+import * as array from "std/array"
+import * as app from "../app"
+import * as graphics from "../graphics"
+import * as lanes from "../lanes"
+import * as math from "../math"
+import * as persist from "../persist"
+import * as preferences from "../preferences"
+import * as program from "./program"
+import * as protocol from "pen/protocol"
+import * as protocol_render from "pen/protocol_render"
+import * as render from "../render"
+import * as services from "../services"
+import * as shadows from "../render/shadow"
+import * as kernel_transport from "../kernel_transport"
+import * as time from "../clock"
+import * as tree from "../ui/tree"
+import * as window from "../events"
+import * as events from "./events"
+import * as wire from "pen/types"
+import * as frame_defaults from "pen/frame"
+import { Vec3 } from "std/vector"
+
+
+// Input events occupy a separately named owner; this local result is scalar.
+type FrameInput is data = $FrameInput {elapsed: F32, width: F32, height: F32}
+func decode_frame packet -> (packet_events: own #[protocol.Event]) -> (received: own #[window.Event]) : (FrameInput, #[protocol.Event], #[window.Event]) =>
+  let input = protocol.decode_input_into packet packet_events
+  lanes.require (input.state.length == 0)
+  @storage.truncate received 0
+  for event in input.events:
+    @storage.push received (events.from_packet event)
+  let $protocol.Input { elapsed, width, height, events: next_packet_events } = input
+  return ($FrameInput {elapsed, width, height}, next_packet_events, received)
+
+func wire_vec4 (v: math.Vec4) => $wire.Vec4 { x: v.x, y: v.y, z: v.z, w: v.w }
+func wire_vec3 (v: Vec3) => $wire.Vector { x: v.x, y: v.y, z: v.z }
+func wire_probe (values: &[F32]) -> (index: U32) =>
+  let at = index * protocol.probe_floats
+  let term = func (i: U32) => $wire.Vector { x: values[at + i * 3], y: values[at + i * 3 + 1], z: values[at + i * 3 + 2] }
+  return $wire.Probe { sh0: term 0, sh1: term 1, sh2: term 2, sh3: term 3, sh4: term 4, sh5: term 5, sh6: term 6, sh7: term 7, sh8: term 8, valid: values[at + 27] }
+func wire_reflection_probe (p: render.ReflectionProbe) => $wire.ReflectionProbe {
+  id: p.id, revision: p.revision, priority: p.priority, capture: p.capture,
+  position: wire_vec3 p.position, center: wire_vec3 p.centre, extent: wire_vec3 p.extent, blend: p.blend,
+  parallax_center: wire_vec3 p.parallax_centre, parallax_extent: wire_vec3 p.parallax_extent, far: p.far,
+}
+func wire_fog_volume (v: render.FogVolume) => $wire.FogVolume {
+  shape: v.shape, center: wire_vec3 v.centre, extent: wire_vec3 v.extent, density: v.density,
+  albedo: wire_vec3 v.albedo, emission: wire_vec3 v.emission, falloff: v.falloff,
+}
+func wire_fog (fog: render.Fog) => func (scale: F32) => $wire.Fog {
+  radius: fog.radius, density: fog.density * scale, height: fog.height, edge: fog.edge, distance: fog.distance,
+  albedo: wire_vec3 fog.albedo, anisotropy: fog.anisotropy, sun: fog.sun, ambient: fog.ambient, sky: fog.sky,
+  noise: fog.noise, noise_scale: fog.noise_scale, drift: wire_vec3 fog.drift,
+}
+func wire_rgb (c: math.Color) => $wire.Vector { x: c.r, y: c.g, z: c.b }
+func wire_matrix (m: math.Mat4) =>
+  let x = m.x
+  let y = m.y
+  let z = m.z
+  let w = m.w
+  return $wire.Mat4 { x: wire_vec4 x, y: wire_vec4 y, z: wire_vec4 z, w: wire_vec4 w }
+
+func wire_draw (draw: render.Draw) =>
+  let parameters = case draw.parameters of
+    $Some value => $Some (wire_vec4 value)
+    $Nothing => $Nothing
+  return { mesh: draw.mesh, material: draw.material, transform: wire_matrix draw.matrix,
+    parameters, extra: draw.extra }
+
+// Scalar projections keep the frame encoder independent of Ink's nominal
+// math types, without copying a matrix and its vectors into wire records.
+func draw_metadata (draw: render.Draw) => (draw.mesh, draw.material)
+func draw_transform (draw: render.Draw) =>
+  let m = draw.matrix
+  return (m.xx, m.xy, m.xz, m.xw, m.yx, m.yy, m.yz, m.yw, m.zx, m.zy, m.zz, m.zw, m.wx, m.wy, m.wz, m.ww)
+
+func draw_parameters (draw: render.Draw) => case draw.parameters of
+  $Some p => (4.0, p.x, p.y, p.z, p.w)
+  $Nothing => (0.0, 0.0, 0.0, 0.0, 0.0)
+func extra_count (draw: render.Draw) => min draw.extra.count protocol.max_draw_extra
+func append_extra context -> (draw: render.Draw) -> (encoded: own #[F32]) : #[F32] =>
+  let vectors: &[math.Vec4] = context.vectors
+  for i in 0 .. extra_count draw:
+    let value = vectors[draw.extra.start + i]
+    @storage.push encoded value.x
+    @storage.push encoded value.y
+    @storage.push encoded value.z
+    @storage.push encoded value.w
+  return encoded
+
+func wire_face (face: render.Face) => $wire.SolidFace {
+  normal: wire_vec3 face.normal, distance: face.distance, material: face.material,
+}
+func wire_solid context -> (solid: render.Solid) =>
+  let faces: &[render.Face] = context.faces
+  return {faces: &faces[solid.faces.start..solid.faces.start + solid.faces.count]}
+func wire_decal (decal: render.Decal) => $wire.Decal {
+  material: decal.material, transform: wire_matrix decal.matrix, opacity: decal.opacity,
+}
+func wire_sprite (sprite: render.Sprite) => $wire.Sprite {
+  x: sprite.x, y: sprite.y, width: sprite.width, height: sprite.height,
+  u0: sprite.u0, v0: sprite.v0, u1: sprite.u1, v1: sprite.v1,
+  color: wire_vec4 sprite.color, material: sprite.material, parameters: wire_vec4 sprite.parameters,
+}
+func wire_inset context -> (inset: render.Inset) =>
+  let inset_draws: &[render.Draw] = context.inset_draws
+  return {
+    x: inset.x, y: inset.y, width: inset.width, height: inset.height,
+    view: wire_matrix inset.view, projection: wire_matrix inset.projection,
+    ambient: wire_vec3 inset.light.ambient, light_direction: wire_vec3 inset.light.direction,
+    light_color: wire_vec3 inset.light.color, draws: &inset_draws[inset.draws.start..inset.draws.start + inset.draws.count],
+    pixel_size: inset.pixel_size, after_sprites: inset.after_sprites,
+  }
+
+// One sun shadow map's window; the header carries the settings they share.
+func wire_cascade (cascade: shadows.Cascade) => $wire.Cascade {
+  projection: wire_matrix cascade.projection, texel: cascade.texel, far: cascade.far,
+}
+
+func wire_pose (pose: render.Pose) => $wire.Pose {
+  draw: pose.draw, clip: pose.clip, time: pose.time, weight: pose.weight, inset: pose.inset,
+}
+func wire_bone_matrix (bone: render.BoneMatrix) => $wire.BoneMatrix {
+  inset: bone.inset, draw: bone.draw, joint: bone.joint, matrix: wire_matrix bone.matrix,
+}
+func wire_morph_weight (morph: render.MorphWeight) => $wire.MorphWeight {
+  inset: morph.inset, draw: morph.draw, target: morph.target, weight: morph.weight,
+}
+func wire_motion (m: render.Motion) => $wire.Motion {
+  draw: m.draw, previous: wire_matrix m.previous,
+}
+func wire_motion_blur (mb: render.MotionBlur) => $wire.MotionBlur {
+  strength: mb.strength, max_radius: mb.max_radius, samples: mb.samples,
+}
+func wire_dof (d: render.DepthOfField) => $wire.Dof {
+  focus_distance: d.focus_distance, focus_range: d.focus_range, aperture: d.aperture, max_blur: d.max_blur,
+}
+func wire_color (v: math.Vec4) => $wire.Color { r: v.x, g: v.y, b: v.z, a: v.w }
+func wire_emitter (emitter: render.Emitter) => $wire.Emitter {
+  material: emitter.material, transform: wire_matrix emitter.matrix, seed: emitter.seed,
+  time: emitter.time, duration: emitter.duration, rate: emitter.rate, lifetime: emitter.lifetime,
+  radius: emitter.radius, velocity: wire_vec3 emitter.velocity, spread: emitter.spread,
+  gravity: wire_vec3 emitter.gravity, drag: emitter.drag, size_start: emitter.size_start,
+  size_end: emitter.size_end, color_start: wire_color emitter.color_start,
+  color_end: wire_color emitter.color_end, additive: emitter.additive,
+  soft_depth: emitter.soft_depth, lit: emitter.lit,
+  flipbook_cols: emitter.flipbook_cols, flipbook_rows: emitter.flipbook_rows, flipbook_fps: emitter.flipbook_fps,
+}
+func wire_ribbon (r: render.RibbonPoint) => $wire.RibbonPoint {
+  ribbon: r.ribbon, material: r.material, additive: r.additive,
+  position: wire_vec3 r.position, width: r.width, color: wire_color r.color, soft_depth: r.soft_depth,
+}
+func wire_haptic (h: render.Haptic) => $wire.Haptic {
+  pad: h.pad, low: h.low, high: h.high, duration: h.duration,
+}
+func wire_reverb (r: render.ReverbRoom) => $wire.ReverbRoom {
+  decay: r.decay, damping: r.damping,
+}
+func wire_area_light (a: render.AreaLight) => $wire.AreaLightSpec {
+  kind: a.kind, position: wire_vec3 a.position, right: wire_vec3 a.right, up: wire_vec3 a.up,
+  color: wire_vec3 a.color, intensity: a.intensity, width: a.width, height: a.height,
+  range: a.range, cookie_material: a.cookie_material, two_sided: a.two_sided,
+}
+func wire_pbr_decal (d: render.PbrDecal) => $wire.PbrDecalSpec {
+  material: d.material, transform: wire_matrix d.matrix, albedo: wire_color d.albedo,
+  normal_strength: d.normal_strength, roughness: d.roughness, metallic: d.metallic,
+  emissive_strength: d.emissive_strength, fade: d.fade,
+}
+func wire_camera_target (c: render.CameraTarget) => $wire.CameraTargetSpec {
+  material: c.material, width: c.width, height: c.height,
+  viewport_x: c.viewport_x, viewport_y: c.viewport_y, viewport_w: c.viewport_w, viewport_h: c.viewport_h,
+  split_screen: c.split_screen, view: wire_matrix c.view, projection: wire_matrix c.projection,
+}
+func wire_video_stream (v: render.VideoStream) => $wire.VideoStreamSpec {
+  material: v.material, time: v.time, playing: v.playing, looping: v.looping, speed: v.speed,
+}
+
+func wire_sound (view: math.Mat4) => func (sound: audio.Sound) =>
+  let heard = audio.hear view sound.position
+  return $wire.Sound { clip: sound.clip, bus: sound.bus, gain: sound.volume * heard.gain,
+    pan: heard.pan, pitch: sound.pitch, lowpass: heard.lowpass, reverb: sound.reverb + heard.reverb }
+
+func wire_voice (view: math.Mat4) => func (voice: audio.Voice) =>
+  let heard = audio.hear view voice.position
+  return $wire.Voice { id: voice.id, clip: voice.clip, bus: voice.bus, gain: voice.gain * heard.gain,
+    pan: clamp (-1.0) 1.0 (voice.pan + heard.pan), pitch: voice.pitch,
+    lowpass: min voice.lowpass heard.lowpass, reverb: voice.reverb + heard.reverb,
+    looping: voice.looping, start: voice.start, fade_in: voice.fade_in, fade_out: voice.fade_out }
+
+func wire_bus (volumes: preferences.Volumes) => func (index: U32) => func (bus: audio.Bus) =>
+  let volume = volumes.effects
+  if index == audio.master:
+    volume := volumes.master
+  if index == audio.music:
+    volume := volumes.music
+  return $wire.Bus {
+    gain: bus.gain * volume, lowpass: bus.lowpass, reverb: bus.reverb,
+    comp_threshold: bus.comp_threshold, comp_ratio: bus.comp_ratio,
+    duck_bus: bus.duck_bus, duck_amount: bus.duck_amount,
+    eq_low_db: bus.eq_low_db, eq_mid_db: bus.eq_mid_db, eq_high_db: bus.eq_high_db,
+  }
+
+func wire_listener (l: audio.Listener) => $wire.Listener {
+  position: wire_vec3 l.position, forward: wire_vec3 l.forward, up: wire_vec3 l.up,
+  velocity: wire_vec3 l.velocity,
+}
+
+func wire_panner (p: audio.Panner) => $wire.Panner {
+  voice: p.voice, sound: p.sound, position: wire_vec3 p.position, orientation: wire_vec3 p.orientation,
+  distance_model: p.distance_model, ref_distance: p.ref_distance, max_distance: p.max_distance,
+  rolloff: p.rolloff, cone_inner: p.cone_inner, cone_outer: p.cone_outer, cone_outer_gain: p.cone_outer_gain,
+  hrtf: p.hrtf, velocity: wire_vec3 p.velocity, doppler: p.doppler, occlusion: p.occlusion, zone: p.zone,
+}
+
+func wire_reverb_zone (z: audio.ReverbZone) => $wire.ReverbZone {
+  id: z.id, position: wire_vec3 z.position, half_extents: wire_vec3 z.half_extents,
+  blend: z.blend, decay: z.decay, damping: z.damping, wet: z.wet, portal_attenuation: z.portal_attenuation,
+}
+
+func wire_synth_voice (s: audio.SynthVoice) => $wire.SynthVoice {
+  id: s.id, mode: s.mode, bus: s.bus, frequency: s.frequency, gain: s.gain, pan: s.pan, detune: s.detune,
+  attack: s.attack, decay: s.decay, sustain: s.sustain, release: s.release,
+  cutoff: s.cutoff, resonance: s.resonance, grain_size: s.grain_size, grain_pitch: s.grain_pitch, reverb: s.reverb,
+}
+
+func field_patch context -> (field: render.Field) =>
+  let field_values: &[F32] = context.field_values
+  let values = &field_values[field.values.start..field.values.start + field.values.count]
+  let rows = 0
+  if field.columns > 0:
+    rows := values.length / field.columns
+  return { material: field.material, width: field.width, height: field.height,
+    x: field.x, z: field.z, columns: field.columns, rows, values }
+
+func wire_service state -> (request: services.Request) => {
+  request: request.id, service: request.service, operation: request.operation,
+  a: request.a, b: request.b, c: request.c, d: request.d,
+  value_count: request.values.count, values: services.values state request.values,
+}
+
+// Explicit source lanes: canonical requests ALWAYS read `services.payload` (even for
+// legacy Save-26 high IDs like 0x800000); kernel requests ALWAYS read `kernel_payload`.
+type OutgoingService is data =
+  | $Canonical services.Request
+  | $Kernel services.Request
+
+func kernel_span_values (payload: &[F32]) -> (span: services.Span) =>
+  lanes.require (span.start <= payload.length and span.count <= payload.length - span.start)
+  return &payload[span.start..span.start + span.count]
+
+func wire_outgoing_service context -> (tagged: OutgoingService) => case tagged of
+  $Canonical request => wire_service context.services request
+  $Kernel request => {
+    request: request.id, service: request.service, operation: request.operation,
+    a: request.a, b: request.b, c: request.c, d: request.d,
+    value_count: request.values.count, values: kernel_span_values context.kernel_payload request.values,
+  }
+func clipped (values: &[U32]) -> (room: U32) => &values[0..min values.length room]
+// Per-node text scratch is reused only after the preceding projected row has
+// been written. Source UI rows/text stay borrowed through the whole encode.
+func wire_node context -> index =>
+  let node: tree.StoredNode = context.nodes.at index
+  let labels: &[U32] = context.ui_labels
+  let parent = if node.parent != 0 and (context.parents.at index) < index then (context.parents.at index) + 1 else 0
+  let name = clipped (tree.text labels node.name) protocol.max_ui_text
+  let description = clipped (tree.text labels node.description) (protocol.max_ui_text - name.length)
+  let value_text = clipped (tree.text labels node.value_text) (protocol.max_ui_text - name.length - description.length)
+  let total_text = name.length + description.length + value_text.length
+  let text = array.fill total_text 0.0
+  let offset: U32 = 0
+  for i in 0 .. name.length:
+    text[offset + i] := U32.to_f32 name[i]
+  offset := self + name.length
+  for i in 0 .. description.length:
+    text[offset + i] := U32.to_f32 description[i]
+  offset := self + description.length
+  for i in 0 .. value_text.length:
+    text[offset + i] := U32.to_f32 value_text[i]
+  return {
+    id: min node.id protocol.max_ui_id, parent, role: node.role,
+    x: node.x, y: node.y, width: node.width, height: node.height,
+    focusable: node.focusable, focused: node.focused, disabled: node.disabled, hidden: node.hidden, modal: node.modal,
+    checked: node.checked, expanded: node.expanded, selected: node.selected, live: node.live,
+    value: node.value, minimum: node.minimum, maximum: node.maximum, step: node.step,
+    actions: node.actions, text_length: text.length, name_length: name.length, description_length: description.length,
+    text,
+  }
+
+// Flat pre-packed UI text avoids allocating a per-node #[F32] on every frame.
+func wire_node_packed context -> index =>
+  let node: tree.StoredNode = context.nodes.at index
+  let parent = if node.parent != 0 and (context.parents.at index) < index then (context.parents.at index) + 1 else 0
+  let span_base = index * 4
+  let start = context.ui_text_spans.at span_base
+  let name_length = context.ui_text_spans.at (span_base + 1)
+  let description_length = context.ui_text_spans.at (span_base + 2)
+  let total_text = context.ui_text_spans.at (span_base + 3)
+  let ui_text: &[F32] = context.ui_text
+  let text = &ui_text[start..start + total_text]
+  return {
+    id: min node.id protocol.max_ui_id, parent, role: node.role,
+    x: node.x, y: node.y, width: node.width, height: node.height,
+    focusable: node.focusable, focused: node.focused, disabled: node.disabled, hidden: node.hidden, modal: node.modal,
+    checked: node.checked, expanded: node.expanded, selected: node.selected, live: node.live,
+    value: node.value, minimum: node.minimum, maximum: node.maximum, step: node.step,
+    actions: node.actions, text_length: total_text, name_length, description_length,
+    text,
+  }
+
+// Exposure and the grade as the host's present pass reads them.
+func wire_exposure (e: render.Exposure) => $wire.Exposure {
+  auto: e.auto, compensation: e.compensation, min: e.min, max: e.max, brighten: e.brighten, darken: e.darken,
+  low: e.low, high: e.high, centre: e.centre, range_low: e.range_low, range_high: e.range_high,
+  target: e.target, dt: e.dt, cut: e.cut,
+}
+func wire_grade (g: color.Grade) => func (cdl: color.Cdl) => func (look: render.PostLook) => $wire.Grade {
+  temperature: g.temperature, tint: g.tint, exposure: g.exposure, contrast: g.contrast, pivot: g.pivot,
+  saturation: g.saturation, vibrance: g.vibrance, lift: wire_vec3 cdl.lift, gamma: wire_vec3 cdl.gamma, gain: wire_vec3 cdl.gain,
+  lut_a: g.lut_a, lut_b: g.lut_b, lut_blend: g.lut_blend, lut_weight: g.lut_weight,
+  vignette: g.vignette, vignette_radius: g.vignette_radius,
+  tonemap: look.tonemap, sharpness: look.sharpness, grain: look.grain, flare: look.flare, outline_strength: look.outline_strength,
+}
+
+func wire_header (schema: U32) -> (requests: #[U32]) -> (kept: preferences.Preferences) -> (shadow: graphics.Shadow) -> (frame: render.RenderFrame) =>
+  let quality = kept.quality
+  let frame_scale = if is_finite frame.render_scale then clamp 0.5 2.0 frame.render_scale else 1.0
+  let render_scale = min quality.scale frame_scale
+  let lighting = frame.lighting
+  let sky = graphics.sky lighting
+  let diffuse = graphics.ambient_from_sky sky lighting.ambient
+  let sh = diffuse.coefficients
+  let packet = frame_defaults.header schema
+  packet.save_requested := persist.has requests $persist.Save
+  packet.load_requested := persist.has requests $persist.Load
+  packet.scene_save_requested := persist.has requests $persist.SaveScene
+  packet.scene_load_requested := persist.has requests $persist.LoadScene
+  packet.checkpoint_requested := persist.has requests $persist.Checkpoint
+  packet.undo_requested := persist.has requests $persist.Undo
+  packet.redo_requested := persist.has requests $persist.Redo
+  packet.exit_requested := persist.has requests $persist.Exit
+  packet.view := wire_matrix frame.view
+  packet.projection := wire_matrix frame.projection
+  packet.clear := $wire.Color { r: lighting.clear.x, g: lighting.clear.y, b: lighting.clear.z, a: lighting.clear.w }
+  packet.ambient := wire_vec3 lighting.ambient
+  packet.light_direction := wire_vec3 lighting.direction
+  packet.light_color := wire_vec3 lighting.color
+  packet.aberration := $wire.Aberration { x: frame.aberration.x, y: frame.aberration.y }
+  packet.quality := $wire.Quality { msaa: quality.msaa, fxaa: quality.fxaa, scale: render_scale, filtering: quality.filtering,
+      occlusion: quality.occlusion and frame.occlusion, sky: quality.sky, effects: quality.effects, bloom: quality.bloom, taa: frame.taa,
+      ssr: min quality.reflections frame.screen_reflections, volumetrics: min quality.volumetrics frame.volumetrics, ssgi: frame.ssgi,
+      oit: frame.features.oit, physical_sky: frame.features.physical_sky, upscale: frame.features.upscale,
+      ray_tracing: frame.features.ray_tracing, ddgi: frame.features.ddgi }
+  packet.reflection := $wire.Reflection { budget: min frame.reflection_budget 6 }
+  packet.sky := $wire.Sky { zenith: wire_vec3 sky.zenith, horizon: wire_vec3 sky.horizon,
+      ground: wire_vec3 sky.ground, sun: wire_vec3 sky.sun, night: sky.night, tint: wire_rgb diffuse.tint,
+      sh0: wire_rgb sh[0], sh1: wire_rgb sh[1], sh2: wire_rgb sh[2], sh3: wire_rgb sh[3], sh4: wire_rgb sh[4],
+      sh5: wire_rgb sh[5], sh6: wire_rgb sh[6], sh7: wire_rgb sh[7], sh8: wire_rgb sh[8] }
+  if let $Some set = frame.probes:
+    packet.probe_volume := $wire.ProbeVolume { revision: set.revision, nx: set.nx, ny: set.ny, nz: set.nz, spacing: set.spacing, origin: wire_vec3 set.origin }
+  packet.fog := wire_fog frame.fog quality.fog
+  packet.shadow := $wire.Shadow { view: wire_matrix shadow.view, texels: shadow.texels, filter: shadow.filter,
+      softness: shadow.softness, contact: shadow.contact, contact_length: shadow.contact_length,
+      local: shadow.local, local_texels: shadow.local_texels }
+  packet.blur := frame.blur
+  packet.motion_blur := wire_motion_blur frame.motion_blur
+  packet.dof := wire_dof frame.dof
+  packet.reverb := wire_reverb frame.reverb
+  packet.clouds := $wire.Clouds { cover: frame.clouds.cover, drift: $wire.Drift { x: frame.clouds.drift.x, z: frame.clouds.drift.y } }
+  packet.exposure := wire_exposure frame.exposure
+  packet.grade := wire_grade frame.grade frame.cdl frame.post_look
+  packet.hide_cursor := frame.hide_cursor
+  packet.loading := frame.loading
+  packet.show_captions := frame.show_captions
+  if let $Some delta = frame.retained:
+    if delta.updates.length > protocol.max_instances or delta.removed.length > protocol.max_instance_removals:
+      return panic "retained instance count exceeds host limits"
+    packet.retained_enabled := true
+    packet.retained_reset := delta.reset
+    packet.retained_after := frame.retained_after
+  return packet
+
+func sprite_rect (sprite: render.Sprite) => return
+  (sprite.x, sprite.y, sprite.width, sprite.height, sprite.u0, sprite.v0, sprite.u1, sprite.v1, sprite.material)
+func sprite_color (sprite: render.Sprite) =>
+  let c = sprite.color
+  return (c.x, c.y, c.z, c.w)
+func sprite_parameters (sprite: render.Sprite) =>
+  let p = sprite.parameters
+  return (p.x, p.y, p.z, p.w)
+func instance_metadata (value: render.Instance) =>
+  lanes.require (value.draw.extra.count == 0 and value.order <= lanes.max_integer)
+  return (value.id & 65535, value.id >> 16, value.order, value.draw.mesh, value.draw.material)
+func instance_transform (value: render.Instance) => draw_transform value.draw
+func instance_parameters (value: render.Instance) => draw_parameters value.draw
+func measure_node context -> (node: tree.StoredNode) =>
+  let name_len = min node.name.count protocol.max_ui_text
+  let desc_len = min node.description.count (protocol.max_ui_text - name_len)
+  let val_len = min node.value_text.count (protocol.max_ui_text - name_len - desc_len)
+  return { text: { length: name_len + desc_len + val_len } }
+func inset_draws_of context -> (inset: render.Inset) : &[render.Draw] =>
+  let all: &[render.Draw] = context.inset_draws
+  return &all[inset.draws.start..inset.draws.start + inset.draws.count]
+// Plain mesh rows use the generated draw offsets. Parameter and extra lanes
+// are zero; all other packet sections still come from the generated encoder.
+private const draw_padding: #[F32] = @array.fill (256 * protocol.draw_floats) 0.0
+private func write_plain_meshes (draws: &[render.Draw]) -> (base: U32) -> (rows: own #[F32]) : #[F32] =>
+  for i in 0 .. draws.length:
+    let d = draws[i]
+    let at = base + i * protocol.draw_floats
+    rows[at + protocol.draw_mesh_lane] := U32.to_f32 d.mesh
+    rows[at + protocol.draw_material_lane] := U32.to_f32 d.material
+    let first = at + protocol.draw_transform_lane
+    let m = d.matrix
+    @simd.store rows first (m.xx, m.xy, m.xz, m.xw)
+    @simd.store rows (first + 4) (m.yx, m.yy, m.yz, m.yw)
+    @simd.store rows (first + 8) (m.zx, m.zy, m.zz, m.zw)
+    @simd.store rows (first + 12) (m.wx, m.wy, m.wz, m.ww)
+  return rows
+
+// Known projections produce one fixed row at a time. Only borrowed views enter
+// variable rows; no owning nominal RenderFrame or nested row arrays are built.
+const projections = {
+  draw_metadata: func context -> draw => draw_metadata draw,
+  draw_transform: func context -> draw => draw_transform draw,
+  draw_parameters: func context -> draw => draw_parameters draw,
+  extra_count: func context -> draw => extra_count draw,
+  append_extra,
+  inset_draws: inset_draws_of,
+  sprite_rect: func context -> value => sprite_rect value,
+  sprite_color: func context -> value => sprite_color value,
+  sprite_parameters: func context -> value => sprite_parameters value,
+  instance_metadata: func context -> value => instance_metadata value,
+  instance_transform: func context -> value => instance_transform value,
+  instance_parameters: func context -> value => instance_parameters value,
+  solid: func context -> value => wire_solid context value,
+  decal: func context -> value => wire_decal value,
+  sound: func context -> value => wire_sound context.view value,
+  inset: func context -> value => wire_inset context value,
+  field: func context -> value => field_patch context value,
+  ui: wire_node_packed,
+  service: wire_outgoing_service,
+  buse: func context -> value => wire_bus context.volumes value.index value.bus,
+  voice: func context -> value => wire_voice context.view value,
+  pose: func context -> value => wire_pose value,
+  emitter: func context -> value => wire_emitter value,
+  light: func context -> (value: render.PointLight) => $wire.Light {position: wire_vec3 value.position,
+    color: wire_vec3 value.intensity, radius: value.radius, direction: wire_vec3 value.direction,
+    inner: value.inner, outer: value.outer, shadow: value.shadow, id: value.id},
+  cascade: func context -> value => wire_cascade value,
+  probe: func context -> (index: U32) => wire_probe context.probe_values index,
+  reflection_probe: func context -> value => wire_reflection_probe value,
+  fog_volume: func context -> value => wire_fog_volume value,
+  listener: func context -> value => wire_listener value,
+  panner: func context -> value => wire_panner value,
+  instance_removal: func context -> id => $wire.InstanceRemoval {id_low: id & 65535, id_high: id >> 16},
+  bone_matrice: func context -> value => wire_bone_matrix value,
+  morph_weight: func context -> value => wire_morph_weight value,
+  motion: func context -> value => wire_motion value,
+  ribbon: func context -> value => wire_ribbon value,
+  haptic: func context -> value => wire_haptic value,
+  reverb_zone: func context -> value => wire_reverb_zone value,
+  synth: func context -> value => wire_synth_voice value,
+  area_light: func context -> value => wire_area_light value,
+  pbr_decal: func context -> value => wire_pbr_decal value,
+  camera_target: func context -> value => wire_camera_target value,
+  video_stream: func context -> value => wire_video_stream value,
+}
+const measure_projections = {
+  extra_count: func context -> draw => extra_count draw,
+  inset_draws: inset_draws_of,
+  solid: func context -> value => wire_solid context value,
+  field: func context -> value => field_patch context value,
+  ui: measure_node,
+  service: wire_outgoing_service,
+}
+// Shared render-packet sizing including the 1-float Session-2 response op lane
+// (`program.sq:50`), generated `protocol_render.measure_render_floats`, and
+// post-encoder extension sections (`append_frame`).
+func extensions_floats (frame: render.RenderFrame): U32 =>
+  if frame.extensions.length == 0:
+    return 0
+  let total: U32 = 2
+  for extension in frame.extensions:
+    total := self + 2 + extension.values.count
+  return total
+
+private func probe_values_of (frame: render.RenderFrame) -> (fallback: &[F32]) : &[F32] => case frame.probes of
+  $Some set => set.values
+  $Nothing => fallback
+
+private func reflection_probes_of (frame: render.RenderFrame) -> (fallback: &[render.ReflectionProbe]) : &[render.ReflectionProbe] => case frame.reflection_probes of
+  $Some set => set.list
+  $Nothing => fallback
+
+private func fog_volumes_of (frame: render.RenderFrame) -> (fallback: &[render.FogVolume]) : &[render.FogVolume] => case frame.fog_volumes of
+  $Some set => set.list
+  $Nothing => fallback
+
+private func retained_of (frame: render.RenderFrame) -> (empty_updates: &[render.Instance]) -> (empty_removed: &[U32]) : render.Instances => case frame.retained of
+  $Some values => values
+  $Nothing => $render.Instances { reset: false, updates: empty_updates, removed: empty_removed }
+
+func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.StoredNode]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services): U32 =>
+  let stored_preferences = if kept.changed then preferences.encode kept else #[]
+  let ui_count = min nodes.length protocol.max_ui_nodes
+  let visible_nodes = &nodes[0..ui_count]
+  let state: #[F32] = #[]
+  let empty_instances: #[render.Instance] = #[]
+  let empty_removed: #[U32] = #[]
+  let empty_floats: #[F32] = #[]
+  let combined: #[OutgoingService] = #[]
+  for i in 0 .. requested.length:
+    @storage.push combined ($Canonical requested[i])
+  let probe_values = probe_values_of frame (&empty_floats[0..0])
+  let probe_rows = array.generate (probe_values.length / protocol.probe_floats) identity
+  let empty_reflection_probes: #[render.ReflectionProbe] = #[]
+  let reflection_probes = reflection_probes_of frame (&empty_reflection_probes[0..0])
+  let empty_fog_volumes: #[render.FogVolume] = #[]
+  let fog_volumes = fog_volumes_of frame (&empty_fog_volumes[0..0])
+  let shadow = graphics.shadow frame kept.quality.shadows
+  let retained = retained_of frame (&empty_instances[0..0]) (&empty_removed[0..0])
+  let collections = {
+    state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
+    sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
+    preferences: &stored_preferences[0..stored_preferences.length], fields: frame.fields,
+    ui: visible_nodes, services: &combined[0..combined.length],
+    buses: sound.buses, voices: sound.voices, poses: frame.poses, emitters: frame.emitters,
+    lights: frame.lights, cascades: &shadow.cascades[0..shadow.cascades.length],
+    probes: &probe_rows[0..probe_rows.length], reflection_probes, fog_volumes, listener: sound.listener, panners: sound.panners,
+    instances: retained.updates, instance_removals: retained.removed,
+    bone_matrices: frame.bone_matrices, morph_weights: frame.morph_weights, motions: frame.motions, ribbons: frame.ribbons,
+    haptics: frame.haptics, reverb_zones: sound.reverb_zones, synths: sound.synths,
+    area_lights: frame.area_lights, pbr_decals: frame.pbr_decals,
+    camera_targets: frame.camera_targets, video_streams: frame.video_streams,
+  }
+  let context = {view: frame.view, volumes: kept.volumes, services: service_state,
+    kernel_payload: &empty_floats[0..0], probe_values,
+    vectors: frame.vectors, faces: frame.faces, inset_draws: frame.inset_draws, field_values: frame.field_values}
+  return 1 + protocol_render.measure_render_floats collections measure_projections context + extensions_floats frame
+
+func measure_access access: U32 =>
+  let drawn = render.finish access.frame
+  let sound = audio.read access.audio
+  let marked: #[tree.StoredNode] = access.ui_marked
+  let requested: #[services.Request] = access.service_output
+  let kept: #[preferences.Preferences] = access.preferences
+  return measure_frame_floats sound kept[0] (&marked[0..marked.length]) drawn (&requested[0..requested.length]) access.services
+
+func encode_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.StoredNode]) -> (ui_labels: &[U32]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (destination: own #[F32]) : #[F32] =>
+  @storage.truncate destination 0
+  return append_frame schema requests sound kept nodes ui_labels frame requested service_state destination
+func append_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.StoredNode]) -> (ui_labels: &[U32]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (destination: own #[F32]) : #[F32] =>
+  let empty_kernel_reqs: #[services.Request] = #[]
+  let empty_kernel_payload: #[F32] = #[]
+  return append_frame_with_kernels schema requests sound kept nodes ui_labels frame requested service_state
+    (&empty_kernel_reqs[0..0]) (&empty_kernel_payload[0..0]) destination
+
+func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.StoredNode]) -> (ui_labels: &[U32]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (kernel_requested: &[services.Request]) -> (kernel_payload: &[F32]) -> (destination: own #[F32]) : #[F32] =>
+  lanes.require (sound.sounds.length <= protocol.max_sounds)
+  lanes.require (sound.voices.length <= protocol.max_voices)
+  lanes.require (sound.buses.length <= protocol.max_buses)
+  lanes.require (sound.listener.length <= 1)
+  lanes.require (sound.panners.length <= protocol.max_panners)
+  lanes.require (sound.reverb_zones.length <= protocol.max_reverb_zones)
+  lanes.require (sound.synths.length <= protocol.max_synths)
+  let shadow = graphics.shadow frame kept.quality.shadows
+  let header = wire_header schema requests kept shadow frame
+  let stored_preferences = if kept.changed then preferences.encode kept else #[]
+  let ui_count = min nodes.length protocol.max_ui_nodes
+  let visible_nodes = &nodes[0..ui_count]
+  let parents = tree.parents_of visible_nodes
+  let ui_indices = array.generate ui_count identity
+  let ui_text: #[F32] = #[]
+  let ui_text_spans = @array.fill (ui_count * 4) 0
+  for idx in 0 .. ui_count:
+    let node = visible_nodes[idx]
+    let name = clipped (tree.text ui_labels node.name) protocol.max_ui_text
+    let description = clipped (tree.text ui_labels node.description) (protocol.max_ui_text - name.length)
+    let value_text = clipped (tree.text ui_labels node.value_text) (protocol.max_ui_text - name.length - description.length)
+    let start = ui_text.length
+    for i in 0 .. name.length:
+      @storage.push ui_text (U32.to_f32 name[i])
+    for i in 0 .. description.length:
+      @storage.push ui_text (U32.to_f32 description[i])
+    for i in 0 .. value_text.length:
+      @storage.push ui_text (U32.to_f32 value_text[i])
+    let sb = idx * 4
+    ui_text_spans[sb] := start
+    ui_text_spans[sb + 1] := name.length
+    ui_text_spans[sb + 2] := description.length
+    ui_text_spans[sb + 3] := name.length + description.length + value_text.length
+  let buses = array.generate sound.buses.length (func index => {index, bus: (sound.buses.at index)})
+  let state: #[F32] = #[]
+  let empty_instances: #[render.Instance] = #[]
+  let empty_removed: #[U32] = #[]
+  let combined: #[OutgoingService] = #[]
+  for i in 0 .. requested.length:
+    @storage.push combined ($Canonical requested[i])
+  for i in 0 .. kernel_requested.length:
+    @storage.push combined ($Kernel kernel_requested[i])
+  let empty_probe_values: #[F32] = #[]
+  let probe_values = probe_values_of frame (&empty_probe_values[0..0])
+  let probe_rows = array.generate (probe_values.length / protocol.probe_floats) identity
+  let empty_reflection_probes: #[render.ReflectionProbe] = #[]
+  let reflection_probes = reflection_probes_of frame (&empty_reflection_probes[0..0])
+  let empty_fog_volumes: #[render.FogVolume] = #[]
+  let fog_volumes = fog_volumes_of frame (&empty_fog_volumes[0..0])
+  let retained = retained_of frame (&empty_instances[0..0]) (&empty_removed[0..0])
+  let collections = {
+    state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
+    sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
+    preferences: &stored_preferences[0..stored_preferences.length], fields: frame.fields,
+    ui: &ui_indices[0..ui_indices.length], services: &combined[0..combined.length],
+    buses: &buses[0..buses.length], voices: sound.voices, poses: frame.poses, emitters: frame.emitters,
+    lights: frame.lights, cascades: &shadow.cascades[0..shadow.cascades.length],
+    probes: &probe_rows[0..probe_rows.length], reflection_probes, fog_volumes, listener: sound.listener, panners: sound.panners,
+    instances: retained.updates, instance_removals: retained.removed,
+    bone_matrices: frame.bone_matrices, morph_weights: frame.morph_weights, motions: frame.motions, ribbons: frame.ribbons,
+    haptics: frame.haptics, reverb_zones: sound.reverb_zones, synths: sound.synths,
+    area_lights: frame.area_lights, pbr_decals: frame.pbr_decals,
+    camera_targets: frame.camera_targets, video_streams: frame.video_streams,
+  }
+  let context = {view: frame.view, volumes: kept.volumes, services: service_state,
+    kernel_payload, probe_values,
+    vectors: frame.vectors, faces: frame.faces, inset_draws: frame.inset_draws, field_values: frame.field_values,
+    nodes: visible_nodes, parents: &parents[0..parents.length],
+    ui_text: &ui_text[0..ui_text.length], ui_text_spans: &ui_text_spans[0..ui_text_spans.length]}
+  lanes.require (frame.extensions.length <= protocol.max_extensions)
+  for extension in frame.extensions:
+    lanes.require (extension.tag <= protocol.max_extension_tag and extension.values.count <= protocol.max_extension_lanes and extension.values.start <= frame.extension_values.length and extension.values.count <= frame.extension_values.length - extension.values.start)
+  let plain = frame.draws.length >= 32 and frame.draws.length <= 4294967295 / protocol.draw_floats
+  for draw in frame.draws:
+    let c = extra_count draw
+    lanes.require (draw.extra.start <= frame.vectors.length and c <= frame.vectors.length - draw.extra.start)
+    if c != 0 or Maybe.is_some draw.parameters:
+      plain := false
+  for solid in frame.solids:
+    lanes.require (solid.faces.start <= frame.faces.length and solid.faces.count <= frame.faces.length - solid.faces.start)
+  for inset in frame.insets:
+    lanes.require (inset.draws.start <= frame.inset_draws.length and inset.draws.count <= frame.inset_draws.length - inset.draws.start)
+    for i in 0 .. inset.draws.count:
+      let d = frame.inset_draws[inset.draws.start + i]
+      let c = extra_count d
+      lanes.require (d.extra.start <= frame.vectors.length and c <= frame.vectors.length - d.extra.start)
+  for field in frame.fields:
+    lanes.require (field.values.start <= frame.field_values.length and field.values.count <= frame.field_values.length - field.values.start)
+  if plain:
+    collections.draws := &frame.draws[0..0]
+    let base = destination.length
+    let count = frame.draws.length
+    let padding = draw_padding
+    for group in 0 .. (count - 1) / 256 + 1:
+      let lanes = min 256 (count - group * 256) * protocol.draw_floats
+      for lane in &padding[0..lanes]:
+        @storage.push destination lane
+    let header_at = destination.length
+    destination := protocol_render.append_render_views header collections projections context self
+    // Move only the fixed header. Clear its former location before writing
+    // the mesh rows so absent parameter and extra fields retain their zeros.
+    for lane in 0 .. protocol.packet_header_floats:
+      destination[base + lane] := destination[header_at + lane]
+      destination[header_at + lane] := 0.0
+    destination[base + protocol.header_draw_count_lane] := U32.to_f32 count
+    destination := write_plain_meshes frame.draws (base + protocol.packet_header_floats) self
+  else:
+    destination := protocol_render.append_render_views header collections projections context self
+  if frame.extensions.length > 0:
+    @storage.push destination protocol.extensions_marker
+    @storage.push destination (U32.to_f32 frame.extensions.length)
+    let ext_values = frame.extension_values
+    for extension in frame.extensions:
+      @storage.push destination (U32.to_f32 extension.tag)
+      @storage.push destination (U32.to_f32 extension.values.count)
+      destination := program.append (&ext_values[extension.values.start..extension.values.start + extension.values.count]) self
+  return destination
+
+// Admits queued `KernelTransport` requests into `admitted` while enforcing ALL
+// packet & service bounds via the shared `measure_frame_floats` helper:
+// - canonical_count + admitted_kernel_count <= 256 (max_service_requests)
+// - admitted_kernel_count <= 16
+// - kernel_record_floats <= 32,768 (one full CTX_CHUNK/frame)
+// - base_frame_floats (incl. 1-float op lane + extensions) + kernel_record_floats <= render_transport_floats - 4,096
+func admit_kernel_requests (base_frame_floats: U32) -> (canonical_count: U32) -> (transport: own kernel_transport.Access) -> (admitted: own #[services.Request]): (kernel_transport.Access, #[services.Request]) =>
+  @storage.truncate admitted 0
+  let max_total_floats = kernel_transport.render_transport_floats - kernel_transport.render_headroom_floats
+  let kernel_record_floats: U32 = 0
+  let admitted_count: U32 = 0
+  let req_count = transport.requests.length
+  for i in 0 .. req_count:
+    let req = transport.requests[i]
+    let valid_record = req.values.count <= 4294967295 - protocol.service_request_floats
+    let record_floats = if valid_record then protocol.service_request_floats + req.values.count else 4294967295
+    let fits_count = canonical_count <= protocol.max_service_requests and admitted_count < protocol.max_service_requests - canonical_count and admitted_count < kernel_transport.max_kernel_requests
+    let fits_kernel_cap = valid_record and record_floats <= kernel_transport.max_kernel_record_floats - kernel_record_floats
+    let fits_packet = valid_record and base_frame_floats <= max_total_floats and kernel_record_floats <= max_total_floats - base_frame_floats and record_floats <= max_total_floats - base_frame_floats - kernel_record_floats
+    if fits_count and fits_kernel_cap and fits_packet:
+      @storage.push admitted req
+      admitted_count := self + 1
+      kernel_record_floats := self + record_floats
+    else:
+      transport := kernel_transport.cancel_unadmitted transport req.id
+  return (transport, admitted)
+// No-op kernel hooks for applications without `#kernel` declarations.
+func no_receive_kernels (own access) -> (events: &[window.Event]) => access
+func no_emit_kernels (own access) -> (canonical_count: U32) -> (admitted: own #[services.Request]) -> (payload_out: own #[F32]) => (access, admitted, payload_out)
+
+// The frame's buffers. A world holds one set: `empty_frame` empties it
+// where a frame starts, so what a frame wrote is gone before the next.
+func frame_owners () =>
+  let ui_labels: #[U32] = #[]
+  let ui_options: #[tree.Span] = #[]
+  let frame_floats: #[F32] = #[]
+  let semantic_text: #[U32] = #[]
+  let frame = render.empty_frame ()
+  let ui_nodes: #[tree.StoredNode] = #[]
+  let ui_marked: #[tree.StoredNode] = #[]
+  let events: #[window.Event] = #[]
+  let audio_access = audio.empty_access ()
+  let service_output: #[services.Request] = #[]
+  return {frame, audio: audio_access, events, ui_nodes, ui_marked, ui_labels, ui_options,
+    frame_floats, semantic_text, service_output}
+func clear_items (items: own #[a]) : #[a] =>
+  @storage.truncate items 0
+  return items
+func empty_frame (own access) =>
+  access.frame := render.begin_frame self
+  access.audio := audio.begin_frame self
+  access.events := clear_items self
+  access.ui_nodes := clear_items self
+  access.ui_marked := clear_items self
+  access.ui_labels := clear_items self
+  access.ui_options := clear_items self
+  access.frame_floats := clear_items self
+  access.semantic_text := clear_items self
+  access.service_output := clear_items self
+  return access
+// A frame bound over fresh buffers, for a caller that keeps its own base
+// record apart from them.
+func with_frame application -> base -> consume =>
+  let owners = frame_owners ()
+  return consume (application.bind_frame base (own owners))
+func frame application -> (own access) -> payload -> (outgoing: own #[F32]) =>
+  access := empty_frame access
+  access := app.begin_frame application.stages access
+  let packet_events: #[protocol.Event] = #[]
+  let (input, _, decoded_events) = decode_frame payload packet_events access.events
+  access.events := decoded_events
+  // Route `request == 0` kernel events exclusively to `receive_kernels` and strip
+  // them before `app.advance` so ephemeral CAP/CTL/BATCH_* events can never wipe
+  // `input.just_pressed` / `pointer.dx` or perturb any gameplay/UI event handler.
+  let all_events: #[window.Event] = copy access.events
+  access := application.set_viewport (own access) input.width input.height
+  access := application.receive_kernels (own access) (&all_events[0..all_events.length])
+  let has_kernel_event = false
+  for event in all_events:
+    let is_kernel_event = case event of
+      $window.ServiceAnswer { request } => request == 0
+      $window.ServiceData { request } => request == 0
+      _ => false
+    if is_kernel_event:
+      has_kernel_event := true
+      break
+  let events: #[window.Event] = if not has_kernel_event then all_events else do:
+    let copied_canonical: #[window.Event] = #[]
+    for event in all_events:
+      let is_kernel_event = case event of
+        $window.ServiceAnswer { request } => request == 0
+        $window.ServiceData { request } => request == 0
+        _ => false
+      if not is_kernel_event:
+        @storage.push copied_canonical event
+    break copied_canonical
+  let (step, advanced) = app.advance application.stages access application.policy input.elapsed events input.width input.height
+  access := advanced
+  access := application.keep (own access)
+  let clock: #[time.Clock] = access.clock
+  let alpha = clock[0].remainder / application.policy.step_seconds
+  access := app.render application.stages access alpha input.width input.height
+  let tick = access.clock[0].tick
+  let (next_services, next_service_output) = services.send access.services application.service_policy tick access.service_output
+  access.services := next_services
+  access.service_output := next_service_output
+  let requested_count = access.service_output.length
+  let kernel_out_in: #[services.Request] = #[]
+  let kernel_payload_in: #[F32] = #[]
+  let (next_access, next_kernel_out, next_kernel_payload) = application.emit_kernels (own access) requested_count (own kernel_out_in) (own kernel_payload_in)
+  let kernel_out: #[services.Request] = next_kernel_out
+  let kernel_payload: #[F32] = next_kernel_payload
+  access := next_access
+  // The game's time since the last frame is what auto exposure adapts by (none while
+  // paused), and a restored game's first frame is a cut: the exposure of the moment
+  // it replaced is not carried over.
+  let seconds = if app.paused access.control then 0.0 else access.wall[0].seconds
+  let restored = app.cut access.control
+  access.frame.settings[0].exposure.dt := seconds
+  if restored:
+    access.frame.settings[0].exposure.cut := true
+    access.control := app.clear_cut self
+  let drawn = render.finish access.frame
+  let sound = audio.read access.audio
+  let marked: #[tree.StoredNode] = access.ui_marked
+  let labels: #[U32] = access.ui_labels
+  let requested: #[services.Request] = access.service_output
+  let kept_preferences: #[preferences.Preferences] = access.preferences
+  let marked_view = &marked[0..marked.length]
+  let labels_view = &labels[0..labels.length]
+  let requested_view = &requested[0..requested.length]
+  outgoing := append_frame_with_kernels application.schema access.requests sound kept_preferences[0] marked_view labels_view drawn
+    requested_view access.services (&kernel_out[0..kernel_out.length]) (&kernel_payload[0..kernel_payload.length]) self
+  access.preferences[0].changed := false
+  return (access, outgoing)
+func execute application -> (own access) -> operation -> (payload: &[F32]) -> (outgoing: own #[F32]) =>
+  case operation of
+    1 => do:
+      access := application.initialize (own access)
+      access := empty_frame access
+      access := app.start application.stages access
+      access.response := application.encode_state access self
+      outgoing := program.append access.response self
+    2 => do:
+      let (next_access, next_outgoing) = frame application access payload outgoing
+      access := next_access
+      outgoing := next_outgoing
+    3 => do:
+      access.response := application.encode_state access self
+      outgoing := program.append access.response self
+    4 => do:
+      let packet: #[F32] = array.generate payload.length (func index => payload.at index)
+      let (report, restored) = application.decode_state (own access) packet
+      access := restored
+      access.control := app.invalidate self
+      outgoing := program.append report self
+    5 => do:
+      access.response := application.encode_scene access self
+      outgoing := program.append access.response self
+    6 => do:
+      let packet: #[F32] = array.generate payload.length (func index => payload.at index)
+      let (report, restored) = application.decode_scene (own access) packet
+      access := restored
+      access.control := app.invalidate self
+      outgoing := program.append report self
+    _ => panic "invalid session operation"
+  return (access, outgoing)
+// The session owns the world it is given, and its own packet buffers.
+func run application -> (own access) -> host =>
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
+  use _ <- program.run (execute application) application.acknowledge access application.schema application.scenes incoming outgoing host
+  return ()
+// Tracing is an explicit known stage wrapper, never an effect handler chain.
+// Callers supply their traced stage policy through the same live session path.
+const run_traced = run

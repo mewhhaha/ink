@@ -157,7 +157,7 @@ fn generate_sources(project: &Path, config: &Path, write: bool, validate: bool) 
         code = job.prefix + &code + &job.suffix;
         let mut overlays: Vec<_> = outputs
             .iter()
-            .filter(|(p, _)| p.extension().is_some_and(|x| x == "blot"))
+            .filter(|(p, _)| p.extension().is_some_and(|x| x == "sq"))
             .map(|(p, s): (&PathBuf, &String)| Overlay {
                 path: p.display().to_string(),
                 contents: Some(s.clone()),
@@ -291,8 +291,8 @@ mod tests {
             }
         }
         let _cleanup = Cleanup(directory.clone());
-        let model = directory.join("model.blot");
-        let output = directory.join("derived.blot");
+        let model = directory.join("model.sq");
+        let output = directory.join("derived.sq");
         let schema = directory.join("schema.json");
         let config = directory.join("jobs.json");
         std::fs::write(

@@ -1,7 +1,7 @@
 use crate::*;
 #[test]
 fn seek_separate_perceive_and_local_crowds() {
-    let mut f = Fixture::new("tests/steering.blot");
+    let mut f = Fixture::new("tests/steering.sq");
     let r = f.floats("motion", [0., 0., 0., 3., 0., 4., 10., 10., 0.]);
     for (i, v) in [(0, 6.), (2, 8.), (3, 3.), (5, 4.), (6, 3.)] {
         near(r[i], v, 1e-5)
@@ -49,7 +49,7 @@ fn seek_separate_perceive_and_local_crowds() {
 }
 #[test]
 fn flock_rules_limits_and_replay() {
-    let mut f = Fixture::new("tests/steering.blot");
+    let mut f = Fixture::new("tests/steering.sq");
     near_all(
         &f.floats("rules", 0),
         &[1.5, 0., 0., 3. / 2f64.sqrt(), 3. / 2f64.sqrt(), 0.],
@@ -84,7 +84,7 @@ fn flock_rules_limits_and_replay() {
 }
 #[test]
 fn obstacle_avoidance_slides_filters_and_stays_finite() {
-    let mut f = Fixture::new("tests/steering.blot");
+    let mut f = Fixture::new("tests/steering.sq");
     for x in [
         [0., 0., 0., 0., 0., 1., 0.5, 1., 0.],
         [0., 0., 0., 1., 0., 0., 0.3, 0.5, 0.],

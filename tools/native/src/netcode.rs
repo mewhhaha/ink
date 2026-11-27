@@ -1,6 +1,6 @@
 //! Independent references for Ink's netcode: the replication delta codec and
 //! the arena game used by the rollback tests. Nothing here shares code with
-//! the Blot library; agreement is checked through Pen's guest host.
+//! the Squid library; agreement is checked through Pen's guest host.
 use super::*;
 
 const PACKET_MAGIC: u32 = 0x5250_4C31;
@@ -196,7 +196,7 @@ fn decode_args(packet: &[u32], base: &[u32]) -> Vec<u32> {
 
 #[test]
 fn delta_packets_match_the_independent_codec_bit_for_bit() {
-    let mut f = Fixture::new("tests/netcode.blot");
+    let mut f = Fixture::new("tests/netcode.sq");
     for lanes in [1usize, 2, 31, 32, 33, 64, 65, 100] {
         for seed in 1..25u32 {
             let base = lanes_from(seed * 7 + lanes as u32, lanes);
@@ -225,7 +225,7 @@ fn delta_packets_match_the_independent_codec_bit_for_bit() {
 
 #[test]
 fn delta_decoders_agree_on_every_truncation_and_corruption() {
-    let mut f = Fixture::new("tests/netcode.blot");
+    let mut f = Fixture::new("tests/netcode.sq");
     let base = lanes_from(11, 37);
     let mut current = base.clone();
     current[3] ^= 0x8000_0001;
@@ -258,7 +258,7 @@ fn delta_decoders_agree_on_every_truncation_and_corruption() {
 
 #[test]
 fn the_arena_matches_an_independent_lockstep_reference() {
-    let mut f = Fixture::new("tests/netcode.blot");
+    let mut f = Fixture::new("tests/netcode.sq");
     for (players, frames, delay, seed) in [
         (2, 90, 2, 7),
         (2, 90, 0, 3),

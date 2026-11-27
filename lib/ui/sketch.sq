@@ -1,0 +1,1394 @@
+//! Rudimentary, Drawful-inspired immediate-mode ("egui-style") UI built purely
+//! on Ink's SDF overlay (65008) and 2D antialiased polyline (65006) extensions.
+//! Zero font atlases, textures, or external assets required.
+//!
+//! Key items: [`Theme`], [`State`], [`Ui`], [`init_state`], [`feed_event`].
+//!
+//! ```squid
+//! import * as math from "ink/math"
+//! import * as render from "ink/render"
+//! let ui = begin (init_state ()) (math.vec2 640.0 480.0) 0.5 paper_theme
+//! ui := panel "SKETCH" (math.vec4 16.0 16.0 240.0 200.0) self
+//! let (_, ui) = button "PLAY!" ui
+//! ui := end_panel self
+//! let (_, frame) = finish_into ui (render.empty_frame ())
+//! frame.extensions.length // => 2
+//! ```
+
+import { Vec2 } from "std/vector"
+import * as math from "../math"
+import * as events from "../events"
+import * as keys from "../input/keys"
+import * as render from "../render"
+import * as d2 from "../render/d2"
+import * as lines from "../render/lines"
+import * as tree from "./tree"
+import * as vocabulary from "./vocabulary"
+
+type Theme is data = $Theme {
+  paper: math.Vec4,
+  panel_header: math.Vec4,
+  ink: math.Vec4,
+  muted_ink: math.Vec4,
+  accent: math.Vec4,
+  highlight: math.Vec4,
+  secondary: math.Vec4,
+  shadow: math.Vec4,
+  widget_fill: math.Vec4,
+  wobble_px: F32,
+  overshoot_px: F32,
+  stroke_px: F32,
+  boil_fps: F32,
+  font_px: F32,
+  padding_px: F32,
+  spacing_px: F32,
+}
+
+// Warm cream sketchbook paper + black Sharpie marker + sunny mustard & coral accents.
+const paper_theme = $Theme {
+  paper: math.vec4 0.98 0.96 0.90 0.97,
+  panel_header: math.vec4 0.96 0.84 0.32 0.98,
+  ink: math.vec4 0.11 0.10 0.09 1.0,
+  muted_ink: math.vec4 0.36 0.33 0.29 0.92,
+  accent: math.vec4 0.91 0.35 0.28 0.95,
+  highlight: math.vec4 0.98 0.83 0.27 0.92,
+  secondary: math.vec4 0.18 0.65 0.67 0.92,
+  shadow: math.vec4 0.10 0.09 0.08 0.24,
+  widget_fill: math.vec4 1.0 0.99 0.95 0.96,
+  wobble_px: 1.5,
+  overshoot_px: 2.2,
+  stroke_px: 2.4,
+  boil_fps: 5.0,
+  font_px: 13.0,
+  padding_px: 14.0,
+  spacing_px: 9.0,
+}
+
+// Classic Jackbox/Drawful dark chalkboard + dusty chalk-white, yellow & pink strokes.
+const chalkboard_theme = $Theme {
+  paper: math.vec4 0.12 0.15 0.18 0.96,
+  panel_header: math.vec4 0.20 0.25 0.30 0.98,
+  ink: math.vec4 0.95 0.94 0.90 1.0,
+  muted_ink: math.vec4 0.68 0.72 0.75 0.90,
+  accent: math.vec4 0.98 0.42 0.55 0.95,
+  highlight: math.vec4 0.99 0.87 0.34 0.92,
+  secondary: math.vec4 0.35 0.86 0.89 0.92,
+  shadow: math.vec4 0.02 0.03 0.04 0.48,
+  widget_fill: math.vec4 0.16 0.20 0.24 0.96,
+  wobble_px: 1.7,
+  overshoot_px: 2.4,
+  stroke_px: 2.3,
+  boil_fps: 5.0,
+  font_px: 13.0,
+  padding_px: 14.0,
+  spacing_px: 9.0,
+}
+
+// Yellow sticky note + blue ballpoint pen + red marker accent.
+const sticky_note_theme = $Theme {
+  paper: math.vec4 0.99 0.94 0.52 0.97,
+  panel_header: math.vec4 0.98 0.85 0.32 0.98,
+  ink: math.vec4 0.11 0.20 0.47 1.0,
+  muted_ink: math.vec4 0.27 0.36 0.58 0.90,
+  accent: math.vec4 0.89 0.24 0.28 0.95,
+  highlight: math.vec4 0.99 0.76 0.22 0.92,
+  secondary: math.vec4 0.22 0.62 0.44 0.92,
+  shadow: math.vec4 0.14 0.12 0.06 0.26,
+  widget_fill: math.vec4 1.0 0.97 0.69 0.96,
+  wobble_px: 1.6,
+  overshoot_px: 2.2,
+  stroke_px: 2.2,
+  boil_fps: 5.0,
+  font_px: 13.0,
+  padding_px: 14.0,
+  spacing_px: 9.0,
+}
+
+// Flat persistent state carried by the caller across frames (no nested arrays).
+type State is data = $State {
+  pointer: Vec2,
+  pointer_down: Bool,
+  just_pressed: Bool,
+  just_released: Bool,
+  hot_id: U32,
+  active_id: U32,
+  focused_id: U32,
+  first_focusable: U32,
+  last_focusable: U32,
+  next_focusable: U32,
+  prev_focusable: U32,
+  pending_tab: U32,
+  shift_down: Bool,
+  key_left: Bool,
+  key_right: Bool,
+  key_up: Bool,
+  key_down: Bool,
+  key_enter: Bool,
+  key_backspace: Bool,
+  key_escape: Bool,
+  action_node: U32,
+  action_kind: U32,
+  action_value: F32,
+  typed_char: U32,
+  scroll_delta: F32,
+  frame_count: U32,
+}
+
+func init_state () : State =>
+  return $State {
+    pointer: math.vec2 (-1000.0) (-1000.0),
+    pointer_down: false,
+    just_pressed: false,
+    just_released: false,
+    hot_id: 0,
+    active_id: 0,
+    focused_id: 0,
+    first_focusable: 0,
+    last_focusable: 0,
+    next_focusable: 0,
+    prev_focusable: 0,
+    pending_tab: 0,
+    shift_down: false,
+    key_left: false,
+    key_right: false,
+    key_up: false,
+    key_down: false,
+    key_enter: false,
+    key_backspace: false,
+    key_escape: false,
+    action_node: 0,
+    action_kind: 0,
+    action_value: 0.0,
+    typed_char: 0,
+    scroll_delta: 0.0,
+    frame_count: 0,
+  }
+
+func feed_event (ev: events.Event) -> (state: State) : State =>
+  let s = state
+  case ev of
+    $events.PointerMove { x, y } => do:
+      s.pointer := math.vec2 x y
+      break ()
+    $events.PointerDown { button, x, y } => do:
+      s.pointer := math.vec2 x y
+      if button == 0:
+        s.pointer_down := true
+        s.just_pressed := true
+      break ()
+    $events.PointerUp { button, x, y } => do:
+      s.pointer := math.vec2 x y
+      if button == 0:
+        s.pointer_down := false
+        s.just_released := true
+      break ()
+    $events.Wheel { delta, x, y } => do:
+      s.pointer := math.vec2 x y
+      s.scroll_delta := s.scroll_delta + delta
+      break ()
+    $events.KeyDown code => do:
+      if code == keys.shift:
+        s.shift_down := true
+      if code == keys.tab:
+        if s.first_focusable == 0 or s.pending_tab == 3:
+          s.pending_tab := if s.shift_down then 2 else 1
+        else:
+          if s.shift_down:
+            s.focused_id := if s.focused_id == 0 then s.last_focusable else s.prev_focusable
+          else:
+            s.focused_id := if s.focused_id == 0 then s.first_focusable else s.next_focusable
+          s.pending_tab := 3
+      if code == keys.f10:
+        if s.focused_id != 0:
+          s.focused_id := 0
+        else:
+          if s.first_focusable != 0:
+            s.focused_id := s.first_focusable
+          else:
+            s.pending_tab := 1
+      if code == keys.left:
+        s.key_left := true
+      if code == keys.right:
+        s.key_right := true
+      if code == keys.up:
+        s.key_up := true
+      if code == keys.down:
+        s.key_down := true
+      if code == keys.enter or code == keys.space:
+        s.key_enter := true
+      if code == keys.backspace:
+        s.key_backspace := true
+      if code == keys.escape:
+        s.key_escape := true
+        s.focused_id := 0
+      break ()
+    $events.KeyUp code => do:
+      if code == keys.shift:
+        s.shift_down := false
+      break ()
+    $events.UiAction { node, action, value } => do:
+      if action == vocabulary.action_focus:
+        s.focused_id := node
+      else:
+        if action == vocabulary.action_blur:
+          if s.focused_id == node:
+            s.focused_id := 0
+        else:
+          s.focused_id := node
+          s.action_node := node
+          s.action_kind := action
+          s.action_value := value
+      break ()
+    $events.TextInput { character, composing } => do:
+      if composing == 0 and character >= 32 and character <= 126:
+        s.typed_char := character
+      break ()
+    $events.FocusLost => do:
+      s.pointer_down := false
+      s.active_id := 0
+      s.shift_down := false
+      break ()
+    _ => ()
+  return s
+
+func feed_events (evs: &[events.Event]) -> (state: State) : State =>
+  let s = state
+  for ev in evs:
+    s := feed_event ev self
+  return s
+
+// Per-frame immediate-mode UI builder carrying layout cursor + GPU draw lists + a11y nodes.
+type Ui is data = $Ui {
+  state: State,
+  theme: Theme,
+  viewport: Vec2,
+  time: F32,
+  boil: U32,
+  next_id: U32,
+  cursor: Vec2,
+  panel_rect: math.Vec4,
+  panel_id: U32,
+  content_x: F32,
+  content_w: F32,
+  row_active: Bool,
+  row_cols: U32,
+  row_col: U32,
+  row_x: F32,
+  row_y: F32,
+  row_w: F32,
+  row_max_h: F32,
+  shapes: #[d2.SdfShape],
+  segments: #[lines.Segment],
+  nodes: #[tree.StoredNode],
+  labels: #[U32],
+}
+
+private func compute_boil (time: F32) -> (fps: F32) : U32 =>
+  if fps <= 0.0 or time <= 0.0:
+    return 0
+  return F32.to_u32 (floor (time * fps))
+
+func begin (state: State) -> (viewport: Vec2) -> (time: F32) -> (theme: Theme) : Ui =>
+  let s = state
+  s.hot_id := 0
+  let boil = compute_boil time theme.boil_fps
+  return $Ui {
+    state: s,
+    theme,
+    viewport,
+    time,
+    boil,
+    next_id: 1,
+    cursor: math.vec2 theme.padding_px theme.padding_px,
+    panel_rect: math.vec4 0.0 0.0 viewport.x viewport.y,
+    panel_id: 0,
+    content_x: theme.padding_px,
+    content_w: max 40.0 (viewport.x - theme.padding_px * 2.0),
+    row_active: false,
+    row_cols: 1,
+    row_col: 0,
+    row_x: theme.padding_px,
+    row_y: theme.padding_px,
+    row_w: max 40.0 (viewport.x - theme.padding_px * 2.0),
+    row_max_h: 0.0,
+    shapes: #[],
+    segments: #[],
+    nodes: #[],
+    labels: #[],
+  }
+
+// Reuse existing GPU/accessibility arrays across frames without reallocating.
+func reuse_into (ui: own Ui) -> (state: State) -> (viewport: Vec2) -> (time: F32) -> (theme: Theme) : Ui =>
+  let s = state
+  s.hot_id := 0
+  @storage.truncate ui.shapes 0
+  @storage.truncate ui.segments 0
+  @storage.truncate ui.nodes 0
+  @storage.truncate ui.labels 0
+  ui.state := s
+  ui.theme := theme
+  ui.viewport := viewport
+  ui.time := time
+  ui.boil := compute_boil time theme.boil_fps
+  ui.next_id := 1
+  ui.cursor := math.vec2 theme.padding_px theme.padding_px
+  ui.panel_rect := math.vec4 0.0 0.0 viewport.x viewport.y
+  ui.panel_id := 0
+  ui.content_x := theme.padding_px
+  ui.content_w := max 40.0 (viewport.x - theme.padding_px * 2.0)
+  ui.row_active := false
+  ui.row_cols := 1
+  ui.row_col := 0
+  ui.row_x := theme.padding_px
+  ui.row_y := theme.padding_px
+  ui.row_w := ui.content_w
+  ui.row_max_h := 0.0
+  return ui
+
+// --- Deterministic hand-drawn wobble hash & sketchy primitive builders ---
+
+private func mix_u32 (x: U32) : U32 =>
+  let h = (x ^ (x >> 16)) * 0x7feb352d
+  let h2 = (h ^ (h >> 15)) * 0x846ca68b
+  return h2 ^ (h2 >> 16)
+
+// Deterministic float in [-1.0, 1.0].
+private func jitter (seed: U32) -> (boil: U32) -> (idx: U32) : F32 =>
+  let h = mix_u32 (seed * 2654435761 ^ (boil * 2246822519) ^ (idx * 3266489917))
+  let unit = U32.to_f32 (h & 65535) / 32767.5
+  return unit - 1.0
+
+private func marker_style (width: F32) : lines.LineStyle =>
+  return $lines.LineStyle {
+    width_px: width,
+    dash_len_px: 0.0,
+    gap_len_px: 0.0,
+    feather_px: 0.85,
+    layer: $lines.OnTop,
+  }
+
+private func dashed_style (width: F32) -> (dash: F32) -> (gap: F32) : lines.LineStyle =>
+  return $lines.LineStyle {
+    width_px: width,
+    dash_len_px: dash,
+    gap_len_px: gap,
+    feather_px: 0.85,
+    layer: $lines.OnTop,
+  }
+
+// Hand-drawn wobbly line with subtle felt-tip corner overshoots and midpoint bow.
+private func push_sketch_line (p0: Vec2) -> (p1: Vec2) -> (color: math.Vec4) -> (width: F32) -> (wobble: F32) -> (overshoot: F32) -> (seed: U32) -> (boil: U32) -> (segments: own #[lines.Segment]) : #[lines.Segment] =>
+  let dx = p1.x - p0.x
+  let dy = p1.y - p0.y
+  let len = sqrt (dx * dx + dy * dy)
+  if len < 0.25:
+    return segments
+  let inv_len = 1.0 / len
+  let ux = dx * inv_len
+  let uy = dy * inv_len
+  let nx = -uy
+  let ny = ux
+  let ov0 = overshoot * (0.55 + 0.45 * jitter seed boil 1)
+  let ov1 = overshoot * (0.55 + 0.45 * jitter seed boil 2)
+  let sx = p0.x - ux * ov0
+  let sy = p0.y - uy * ov0
+  let ex = p1.x + ux * ov1
+  let ey = p1.y + uy * ov1
+  let span_x = ex - sx
+  let span_y = ey - sy
+  let steps = max 2 (min 14 (F32.to_u32 (ceil (len / 26.0))))
+  let inv_steps = 1.0 / U32.to_f32 steps
+  let style = marker_style width
+  let prev = math.vec2 0.0 0.0
+  for i in 0 .. (steps + 1):
+    let t = U32.to_f32 i * inv_steps
+    let bx = sx + span_x * t
+    let by = sy + span_y * t
+    let end_fade = if i == 0 or i == steps then 0.55 else 1.0
+    let jn = jitter seed boil (10 + i * 2) * wobble * end_fade
+    let jt = jitter seed boil (11 + i * 2) * wobble * 0.25
+    let pt = math.vec2 (bx + nx * jn + ux * jt) (by + ny * jn + uy * jt)
+    if i > 0:
+      segments := lines.push_line_2d prev pt (i > 1) color style self
+    prev := pt
+  return segments
+
+// Four independent hand-ruled strokes with crooked joints + corner overshoots.
+private func push_sketch_rect (r: math.Vec4) -> (color: math.Vec4) -> (width: F32) -> (wobble: F32) -> (overshoot: F32) -> (seed: U32) -> (boil: U32) -> (double_ink: Bool) -> (segments: own #[lines.Segment]) : #[lines.Segment] =>
+  let x0 = r.x
+  let y0 = r.y
+  let x1 = r.x + r.z
+  let y1 = r.y + r.w
+  let tl = math.vec2 x0 y0
+  let tr = math.vec2 x1 y0
+  let br = math.vec2 x1 y1
+  let bl = math.vec2 x0 y1
+  segments := push_sketch_line tl tr color width wobble overshoot (seed * 17 + 1) boil self
+  segments := push_sketch_line tr br color width wobble overshoot (seed * 17 + 2) boil self
+  segments := push_sketch_line br bl color width wobble overshoot (seed * 17 + 3) boil self
+  segments := push_sketch_line bl tl color width wobble overshoot (seed * 17 + 4) boil self
+  if double_ink:
+    let thin = max 1.1 (width * 0.62)
+    let j = 1.2
+    let tl2 = math.vec2 (x0 + j) (y0 - j * 0.6)
+    let tr2 = math.vec2 (x1 - j * 0.5) (y0 + j * 0.7)
+    let br2 = math.vec2 (x1 + j * 0.6) (y1 + j * 0.5)
+    let bl2 = math.vec2 (x0 - j * 0.6) (y1 - j * 0.5)
+    segments := push_sketch_line tl2 tr2 color thin (wobble * 1.15) (overshoot * 1.2) (seed * 31 + 5) boil self
+    segments := push_sketch_line tr2 br2 color thin (wobble * 1.15) (overshoot * 1.2) (seed * 31 + 6) boil self
+    segments := push_sketch_line br2 bl2 color thin (wobble * 1.15) (overshoot * 1.2) (seed * 31 + 7) boil self
+    segments := push_sketch_line bl2 tl2 color thin (wobble * 1.15) (overshoot * 1.2) (seed * 31 + 8) boil self
+  return segments
+
+// Quick diagonal Drawful crayon/marker hatching across a rectangle.
+private func push_sketch_hatch (r: math.Vec4) -> (color: math.Vec4) -> (spacing: F32) -> (width: F32) -> (wobble: F32) -> (seed: U32) -> (boil: U32) -> (segments: own #[lines.Segment]) : #[lines.Segment] =>
+  let w = r.z
+  let h = r.w
+  if w < 3.0 or h < 3.0 or spacing < 2.0:
+    return segments
+  let total = w + h
+  let count = min 64 (F32.to_u32 (total / spacing))
+  let inset = 2.0
+  for i in 1 .. count:
+    let d = U32.to_f32 i * spacing
+    let ax = r.x + max inset (d - h + inset)
+    let ay = r.y + min (h - inset) (d - inset)
+    let bx = r.x + min (w - inset) (d - inset)
+    let by = r.y + max inset (d - w + inset)
+    if bx > ax + 1.0 and ay > by + 1.0:
+      segments := push_sketch_line (math.vec2 ax ay) (math.vec2 bx by) color width (wobble * 0.7) 0.5 (seed * 53 + i) boil self
+  return segments
+
+private const circle_cos: #[F32] = #[
+  0.9838437, 0.8087345, 0.4734456, 0.0443849, -0.3934667, -0.7533875, -0.9640906, -0.9838437,
+  -0.8087345, -0.4734456, -0.0443849, 0.3934667, 0.7533875, 0.9640906, 0.9838437, 0.8087345,
+]
+private const circle_sin: #[F32] = #[
+  0.1790296, 0.5881739, 0.8808231, 0.9990145, 0.9193389, 0.6575769, 0.2655737, -0.1790296,
+  -0.5881738, -0.8808231, -0.9990145, -0.9193389, -0.6575769, -0.2655737, 0.1790296, 0.5881738,
+]
+
+// Crooked hand-drawn marker loop with slight closure overlap.
+private func push_sketch_circle (center: Vec2) -> (radius: F32) -> (color: math.Vec4) -> (width: F32) -> (wobble: F32) -> (seed: U32) -> (boil: U32) -> (segments: own #[lines.Segment]) : #[lines.Segment] =>
+  if radius < 1.0:
+    return segments
+  let style = marker_style width
+  let j_scale = min (wobble * 0.75) (radius * 0.18)
+  let prev = math.vec2 0.0 0.0
+  for i in 0 .. 16:
+    let rj = radius + jitter seed boil (i * 3 + 1) * j_scale
+    let pt = math.vec2 (center.x + circle_cos[i] * rj) (center.y + circle_sin[i] * rj)
+    if i > 0:
+      segments := lines.push_line_2d prev pt (i > 1) color style self
+    prev := pt
+  return segments
+
+// Offset flat paper/crayon fill (SDF overlay, slightly misregistered for hand-colored charm).
+private func push_paper_fill (r: math.Vec4) -> (radius: F32) -> (color: math.Vec4) -> (shapes: own #[d2.SdfShape]) : #[d2.SdfShape] =>
+  if r.z <= 0.5 or r.w <= 0.5 or color.w <= 0.001:
+    return shapes
+  let s = d2.rounded_rect r (math.vec4 radius radius radius radius) color
+  s.overlay := true
+  @storage.push shapes s
+  return shapes
+
+private func push_circle_fill (center: Vec2) -> (radius: F32) -> (color: math.Vec4) -> (shapes: own #[d2.SdfShape]) : #[d2.SdfShape] =>
+  if radius <= 0.5 or color.w <= 0.001:
+    return shapes
+  let s = d2.circle center radius color
+  s.overlay := true
+  @storage.push shapes s
+  return shapes
+
+// --- Asset-free rudimentary Drawful marker stroke font (printable ASCII 33..126) ---
+// Each byte encodes (X << 4) | Y on an 8x10 cap-height grid (Y=13 descender); 0xFF = pen up.
+// Flattened into two static const arrays for O(1) direct indexing and zero per-glyph allocations.
+
+private const glyph_starts: #[U32] = #[
+  0, 5, 10, 21, 36, 50, 62, 64, 69, 74, 82, 87, 89, 91, 96, 98,
+  110, 116, 123, 134, 138, 147, 157, 160, 176, 186, 191, 196, 199, 204, 207, 217,
+  231, 237, 250, 258, 265, 272, 278, 288, 296, 304, 312, 318, 321, 326, 330, 339,
+  346, 358, 368, 379, 384, 390, 393, 398, 403, 409, 413, 417, 419, 423, 426, 428,
+  430, 441, 452, 460, 471, 480, 487, 500, 508, 513, 520, 526, 530, 542, 550, 559,
+  570, 581, 587, 597, 604, 611, 614, 619, 624, 630, 634, 641, 643, 650, 654,
+]
+
+private const glyph_data: #[U32] = #[
+  0x40, 0x46, 0xFF, 0x49, 0x4A, 0x20, 0x23, 0xFF, 0x60, 0x63, 0x21, 0x19, 0xFF, 0x61, 0x59, 0xFF,
+  0x03, 0x83, 0xFF, 0x07, 0x87, 0x72, 0x51, 0x21, 0x12, 0x14, 0x35, 0x66, 0x77, 0x79, 0x5A, 0x2A,
+  0x19, 0xFF, 0x40, 0x4B, 0x1A, 0x70, 0xFF, 0x11, 0x31, 0x33, 0x13, 0x11, 0xFF, 0x57, 0x77, 0x79,
+  0x59, 0x57, 0x8A, 0x24, 0x12, 0x30, 0x50, 0x62, 0x54, 0x16, 0x19, 0x3A, 0x5A, 0x86, 0x40, 0x33,
+  0x60, 0x32, 0x25, 0x38, 0x6A, 0x20, 0x52, 0x65, 0x58, 0x2A, 0x41, 0x47, 0xFF, 0x12, 0x76, 0xFF,
+  0x72, 0x16, 0x42, 0x48, 0xFF, 0x15, 0x75, 0x49, 0x3B, 0x15, 0x75, 0x39, 0x49, 0x4A, 0x3A, 0x39,
+  0x1A, 0x70, 0x20, 0x60, 0x72, 0x78, 0x6A, 0x2A, 0x18, 0x12, 0x20, 0xFF, 0x28, 0x62, 0x22, 0x40,
+  0x4A, 0xFF, 0x2A, 0x6A, 0x12, 0x20, 0x60, 0x72, 0x74, 0x1A, 0x8A, 0x11, 0x30, 0x60, 0x72, 0x64,
+  0x35, 0x66, 0x78, 0x6A, 0x3A, 0x19, 0x6A, 0x60, 0x16, 0x86, 0x70, 0x10, 0x14, 0x54, 0x76, 0x78,
+  0x5A, 0x2A, 0x19, 0x60, 0x30, 0x13, 0x18, 0x3A, 0x6A, 0x78, 0x76, 0x55, 0x15, 0x10, 0x80, 0x3A,
+  0x35, 0x13, 0x11, 0x30, 0x50, 0x71, 0x73, 0x55, 0x35, 0x17, 0x19, 0x3A, 0x5A, 0x79, 0x77, 0x55,
+  0x75, 0x35, 0x14, 0x12, 0x30, 0x60, 0x72, 0x77, 0x5A, 0x2A, 0x43, 0x44, 0xFF, 0x48, 0x49, 0x43,
+  0x44, 0xFF, 0x48, 0x3B, 0x72, 0x15, 0x78, 0x13, 0x73, 0xFF, 0x17, 0x77, 0x12, 0x75, 0x18, 0x12,
+  0x30, 0x60, 0x72, 0x64, 0x45, 0x47, 0xFF, 0x49, 0x4A, 0x7A, 0x3A, 0x18, 0x12, 0x30, 0x60, 0x82,
+  0x86, 0x68, 0x48, 0x36, 0x44, 0x64, 0x68, 0x0A, 0x40, 0x8A, 0xFF, 0x26, 0x66, 0x1A, 0x10, 0x50,
+  0x71, 0x73, 0x55, 0x15, 0xFF, 0x55, 0x86, 0x89, 0x6A, 0x1A, 0x82, 0x60, 0x30, 0x12, 0x18, 0x3A,
+  0x6A, 0x88, 0x1A, 0x10, 0x50, 0x82, 0x88, 0x5A, 0x1A, 0x70, 0x10, 0x1A, 0x7A, 0xFF, 0x15, 0x65,
+  0x70, 0x10, 0x1A, 0xFF, 0x15, 0x65, 0x82, 0x60, 0x30, 0x12, 0x18, 0x3A, 0x7A, 0x88, 0x85, 0x55,
+  0x10, 0x1A, 0xFF, 0x70, 0x7A, 0xFF, 0x15, 0x75, 0x20, 0x60, 0xFF, 0x40, 0x4A, 0xFF, 0x2A, 0x6A,
+  0x20, 0x70, 0xFF, 0x60, 0x68, 0x4A, 0x2A, 0x18, 0x10, 0x1A, 0xFF, 0x70, 0x15, 0x8A, 0x10, 0x1A,
+  0x7A, 0x0A, 0x10, 0x46, 0x70, 0x8A, 0x1A, 0x10, 0x7A, 0x70, 0x20, 0x60, 0x82, 0x88, 0x6A, 0x2A,
+  0x08, 0x02, 0x20, 0x1A, 0x10, 0x60, 0x82, 0x84, 0x65, 0x15, 0x20, 0x60, 0x82, 0x88, 0x6A, 0x2A,
+  0x08, 0x02, 0x20, 0xFF, 0x57, 0x8B, 0x1A, 0x10, 0x60, 0x82, 0x84, 0x65, 0x15, 0xFF, 0x45, 0x8A,
+  0x72, 0x60, 0x20, 0x12, 0x14, 0x35, 0x66, 0x88, 0x6A, 0x2A, 0x18, 0x00, 0x80, 0xFF, 0x40, 0x4A,
+  0x10, 0x18, 0x3A, 0x6A, 0x88, 0x80, 0x00, 0x4A, 0x80, 0x00, 0x2A, 0x44, 0x6A, 0x80, 0x10, 0x7A,
+  0xFF, 0x70, 0x1A, 0x00, 0x45, 0x80, 0xFF, 0x45, 0x4A, 0x10, 0x80, 0x1A, 0x8A, 0x60, 0x20, 0x2A,
+  0x6A, 0x10, 0x7A, 0x20, 0x60, 0x6A, 0x2A, 0x14, 0x40, 0x74, 0x0A, 0x8A, 0x30, 0x52, 0x24, 0x64,
+  0x75, 0x7A, 0xFF, 0x77, 0x27, 0x18, 0x2A, 0x6A, 0x79, 0x10, 0x1A, 0xFF, 0x16, 0x34, 0x64, 0x76,
+  0x78, 0x6A, 0x3A, 0x19, 0x75, 0x54, 0x24, 0x16, 0x18, 0x3A, 0x6A, 0x79, 0x70, 0x7A, 0xFF, 0x76,
+  0x54, 0x24, 0x16, 0x18, 0x2A, 0x5A, 0x79, 0x17, 0x77, 0x75, 0x54, 0x24, 0x16, 0x18, 0x3A, 0x7A,
+  0x71, 0x50, 0x31, 0x3A, 0xFF, 0x15, 0x65, 0x75, 0x54, 0x24, 0x16, 0x18, 0x3A, 0x6A, 0x78, 0xFF,
+  0x74, 0x7C, 0x5D, 0x2D, 0x10, 0x1A, 0xFF, 0x16, 0x34, 0x64, 0x76, 0x7A, 0x44, 0x4A, 0xFF, 0x40,
+  0x41, 0x54, 0x5C, 0x3D, 0x1C, 0xFF, 0x50, 0x51, 0x10, 0x1A, 0xFF, 0x74, 0x17, 0x7A, 0x30, 0x40,
+  0x4A, 0x6A, 0x04, 0x0A, 0xFF, 0x06, 0x24, 0x46, 0x4A, 0xFF, 0x46, 0x64, 0x86, 0x8A, 0x14, 0x1A,
+  0xFF, 0x16, 0x34, 0x64, 0x76, 0x7A, 0x24, 0x64, 0x76, 0x78, 0x6A, 0x2A, 0x18, 0x16, 0x24, 0x14,
+  0x1D, 0xFF, 0x16, 0x34, 0x64, 0x76, 0x78, 0x6A, 0x3A, 0x19, 0x74, 0x7D, 0xFF, 0x76, 0x54, 0x24,
+  0x16, 0x18, 0x2A, 0x5A, 0x79, 0x24, 0x2A, 0xFF, 0x26, 0x44, 0x74, 0x75, 0x54, 0x24, 0x15, 0x26,
+  0x67, 0x78, 0x6A, 0x2A, 0x19, 0x41, 0x49, 0x5A, 0x7A, 0xFF, 0x24, 0x64, 0x14, 0x18, 0x3A, 0x6A,
+  0x78, 0x74, 0x7A, 0x14, 0x4A, 0x74, 0x04, 0x2A, 0x46, 0x6A, 0x84, 0x14, 0x7A, 0xFF, 0x74, 0x1A,
+  0x14, 0x4A, 0xFF, 0x74, 0x3D, 0x1D, 0x14, 0x74, 0x1A, 0x7A, 0x60, 0x41, 0x44, 0x25, 0x46, 0x49,
+  0x6A, 0x40, 0x4A, 0x20, 0x41, 0x44, 0x65, 0x46, 0x49, 0x2A, 0x15, 0x34, 0x56, 0x75,
+]
+
+func measure_text (text: Text) -> (size_px: F32) : F32 =>
+  if text.length == 0:
+    return 0.0
+  let advance = size_px * 0.72
+  return U32.to_f32 text.length * advance
+
+private func push_sketch_text (text: Text) -> (pos: Vec2) -> (size_px: F32) -> (color: math.Vec4) -> (bold: Bool) -> (wobble: F32) -> (seed: U32) -> (boil: U32) -> (segments: own #[lines.Segment]) : #[lines.Segment] =>
+  let scale_x = size_px * 0.068
+  let scale_y = size_px * 0.095
+  let advance = size_px * 0.72
+  let stroke_w = max 1.35 (size_px * (if bold then 0.165 else 0.125))
+  let style = marker_style stroke_w
+  let tw = min (wobble * 0.35) (size_px * 0.05)
+  for idx in 0 .. text.length:
+    let ch = text[idx]
+    if ch > 32 and ch <= 126:
+      let g_idx = ch - 33
+      let g_start = glyph_starts[g_idx]
+      let g_end = glyph_starts[g_idx + 1]
+      let base_x = pos.x + U32.to_f32 idx * advance
+      let base_y = pos.y + jitter (seed * 97 + idx) boil 1 * (tw * 0.85)
+      let prev = math.vec2 0.0 0.0
+      let run_len: U32 = 0
+      for k in 0 .. (g_end - g_start):
+        let code = glyph_data[g_start + k]
+        if code == 255:
+          run_len := 0
+        else:
+          let gx = U32.to_f32 ((code >> 4) & 15)
+          let gy = U32.to_f32 (code & 15)
+          let jx = jitter (seed * 131 + idx * 17 + k) boil 2 * tw
+          let jy = jitter (seed * 131 + idx * 17 + k) boil 3 * tw
+          let pt = math.vec2 (base_x + gx * scale_x + jx) (base_y + gy * scale_y + jy)
+          if run_len > 0:
+            segments := lines.push_line_2d prev pt (run_len > 1) color style self
+          prev := pt
+          run_len := self + 1
+  return segments
+
+// --- Minimal decimal formatter (no reverse scratch allocation) ---
+
+private func format_percent (fraction: F32) : Text =>
+  let pct = F32.to_u32 (floor ((clamp 0.0 1.0 fraction) * 100.0 + 0.5))
+  let out: #[U32] = #[]
+  if pct >= 100:
+    @storage.push out 49
+    @storage.push out 48
+    @storage.push out 48
+  else:
+    if pct >= 10:
+      @storage.push out (48 + pct / 10)
+    @storage.push out (48 + pct % 10)
+  @storage.push out 37 // %
+  return out
+
+private func format_f32_2 (val: F32) : Text =>
+  let out: #[U32] = #[]
+  let neg = val < 0.0
+  let mag = abs val
+  let scaled = F32.to_u32 (floor ((min mag 99999.0) * 100.0 + 0.5))
+  let whole = scaled / 100
+  let frac = scaled % 100
+  if neg and scaled > 0:
+    @storage.push out 45 // -
+  if whole == 0:
+    @storage.push out 48
+  else:
+    let started = false
+    if whole >= 10000:
+      @storage.push out (48 + (whole / 10000) % 10)
+      started := true
+    if started or whole >= 1000:
+      @storage.push out (48 + (whole / 1000) % 10)
+      started := true
+    if started or whole >= 100:
+      @storage.push out (48 + (whole / 100) % 10)
+      started := true
+    if started or whole >= 10:
+      @storage.push out (48 + (whole / 10) % 10)
+    @storage.push out (48 + whole % 10)
+  @storage.push out 46 // .
+  @storage.push out (48 + frac / 10)
+  @storage.push out (48 + frac % 10)
+  return out
+
+// --- Internal layout, hit-testing, and accessibility helpers ---
+
+private func alloc_id (ui: own Ui) : (U32, Ui) =>
+  let id = ui.next_id
+  ui.next_id := id + 1
+  return (id, ui)
+
+private func next_rect (height: F32) -> (ui: own Ui) : (math.Vec4, Ui) =>
+  let gap = ui.theme.spacing_px
+  if ui.row_active:
+    let cols = max 1 ui.row_cols
+    let col = min ui.row_col (cols - 1)
+    let cell_w = max 16.0 ((ui.row_w - gap * U32.to_f32 (cols - 1)) / U32.to_f32 cols)
+    let rx = ui.row_x + U32.to_f32 col * (cell_w + gap)
+    let ry = ui.row_y
+    ui.row_max_h := max ui.row_max_h height
+    ui.row_col := ui.row_col + 1
+    if ui.row_col >= cols:
+      ui.row_col := 0
+      ui.row_y := ui.row_y + ui.row_max_h + gap
+      ui.row_max_h := 0.0
+      ui.cursor := math.vec2 ui.content_x ui.row_y
+    return (math.vec4 rx ry cell_w height, ui)
+  let r = math.vec4 ui.cursor.x ui.cursor.y ui.content_w height
+  ui.cursor := math.vec2 ui.cursor.x (ui.cursor.y + height + gap)
+  return (r, ui)
+
+private func point_in (p: Vec2) -> (r: math.Vec4) : Bool =>
+  return p.x >= r.x and p.x <= r.x + r.z and p.y >= r.y and p.y <= r.y + r.w
+
+private func push_a11y (id: U32) -> (role: U32) -> (name: Text) -> (r: math.Vec4) -> (focusable: Bool) -> (checked: U32) -> (selected: U32) -> (val: F32) -> (lo: F32) -> (hi: F32) -> (actions: U32) -> (ui: own Ui) : Ui =>
+  let start = ui.labels.length
+  for ch in name:
+    @storage.push ui.labels ch
+  let name_span = $tree.Span { start, count: name.length }
+  let node = $tree.StoredNode {
+    id,
+    parent: ui.panel_id,
+    role,
+    name: name_span,
+    description: tree.no_span,
+    value_text: tree.no_span,
+    x: r.x,
+    y: r.y,
+    width: r.z,
+    height: r.w,
+    focusable,
+    focused: ui.state.focused_id == id,
+    disabled: false,
+    hidden: false,
+    modal: false,
+    checked,
+    expanded: vocabulary.state_none,
+    selected,
+    live: vocabulary.live_off,
+    value: val,
+    minimum: lo,
+    maximum: hi,
+    step: 0.0,
+    actions,
+  }
+  @storage.push ui.nodes node
+  return ui
+
+// --- Immediate-mode egui-style layout containers ---
+
+// Starts a floating hand-drawn sketchbook panel with title bar and auto vertical layout.
+func panel (title: Text) -> (rect: math.Vec4) -> (ui: own Ui) : Ui =>
+  let (id, ui) = alloc_id ui
+  let th = ui.theme
+  let header_h = if title.length > 0 then th.font_px + 18.0 else 0.0
+  // Cardboard drop shadow + slightly offset paper card fill + header tint strip
+  let shadow_r = math.vec4 (rect.x + 5.0) (rect.y + 6.0) rect.z rect.w
+  ui.shapes := push_paper_fill shadow_r 4.0 th.shadow self
+  ui.shapes := push_paper_fill (math.vec4 (rect.x + 1.0) (rect.y + 1.0) (rect.z - 1.5) (rect.w - 1.5)) 3.0 th.paper self
+  if header_h > 0.0:
+    let hdr_r = math.vec4 (rect.x + 2.0) (rect.y + 2.0) (rect.z - 4.0) (header_h - 2.0)
+    ui.shapes := push_paper_fill hdr_r 2.0 th.panel_header self
+    ui.segments := push_sketch_line (math.vec2 rect.x (rect.y + header_h)) (math.vec2 (rect.x + rect.z) (rect.y + header_h)) th.ink th.stroke_px th.wobble_px th.overshoot_px (id * 29 + 1) ui.boil self
+    let title_pos = math.vec2 (rect.x + th.padding_px) (rect.y + 8.0)
+    ui.segments := push_sketch_text title title_pos (th.font_px + 2.0) th.ink true th.wobble_px (id * 29 + 2) ui.boil self
+  // Outer crooked Sharpie frame (double-inked for bold panel outline)
+  ui.segments := push_sketch_rect rect th.ink (th.stroke_px + 0.5) (th.wobble_px * 1.1) (th.overshoot_px * 1.2) id ui.boil true self
+  // Register semantic group container node
+  ui.panel_id := 0
+  ui := push_a11y id vocabulary.role_group title rect false vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 0 self
+  ui.panel_id := id
+  ui.panel_rect := rect
+  ui.content_x := rect.x + th.padding_px
+  ui.content_w := max 32.0 (rect.z - th.padding_px * 2.0)
+  ui.cursor := math.vec2 ui.content_x (rect.y + header_h + th.padding_px)
+  ui.row_active := false
+  ui.row_col := 0
+  ui.row_max_h := 0.0
+  return ui
+
+func end_panel (ui: own Ui) : Ui =>
+  if ui.row_active:
+    ui := row_end self
+  ui.panel_id := 0
+  return ui
+
+func row_begin (columns: U32) -> (ui: own Ui) : Ui =>
+  ui.row_active := true
+  ui.row_cols := max 1 columns
+  ui.row_col := 0
+  ui.row_x := ui.content_x
+  ui.row_y := ui.cursor.y
+  ui.row_w := ui.content_w
+  ui.row_max_h := 0.0
+  return ui
+
+func row_end (ui: own Ui) : Ui =>
+  if ui.row_active:
+    if ui.row_col > 0:
+      ui.cursor := math.vec2 ui.content_x (ui.row_y + ui.row_max_h + ui.theme.spacing_px)
+    else:
+      ui.cursor := math.vec2 ui.content_x ui.row_y
+    ui.row_active := false
+    ui.row_col := 0
+    ui.row_max_h := 0.0
+  return ui
+
+func spacer (height: F32) -> (ui: own Ui) : Ui =>
+  let (_, ui) = next_rect height ui
+  return ui
+
+// --- Immediate-mode egui-style sketchy widgets ---
+
+func heading (text: Text) -> (ui: own Ui) : Ui =>
+  let (id, ui) = alloc_id ui
+  let sz = ui.theme.font_px + 5.0
+  let (r, ui) = next_rect (sz + 9.0) ui
+  ui.segments := push_sketch_text text (math.vec2 r.x (r.y + 1.0)) sz ui.theme.ink true ui.theme.wobble_px id ui.boil self
+  let ul_w = min r.z (measure_text text sz + 6.0)
+  let ul_y = r.y + sz + 4.0
+  ui.segments := push_sketch_line (math.vec2 r.x ul_y) (math.vec2 (r.x + ul_w) ul_y) ui.theme.accent (ui.theme.stroke_px * 0.9) ui.theme.wobble_px ui.theme.overshoot_px (id * 19 + 3) ui.boil self
+  return push_a11y id vocabulary.role_heading text r false vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 0 ui
+
+func label (text: Text) -> (ui: own Ui) : Ui =>
+  let (id, ui) = alloc_id ui
+  let sz = ui.theme.font_px
+  let (r, ui) = next_rect (sz + 4.0) ui
+  ui.segments := push_sketch_text text (math.vec2 r.x (r.y + 1.0)) sz ui.theme.ink false ui.theme.wobble_px id ui.boil self
+  return push_a11y id vocabulary.role_text text r false vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 0 ui
+
+func muted_label (text: Text) -> (ui: own Ui) : Ui =>
+  let (id, ui) = alloc_id ui
+  let sz = max 10.0 (ui.theme.font_px - 1.5)
+  let (r, ui) = next_rect (sz + 3.0) ui
+  ui.segments := push_sketch_text text (math.vec2 r.x (r.y + 1.0)) sz ui.theme.muted_ink false ui.theme.wobble_px id ui.boil self
+  return push_a11y id vocabulary.role_text text r false vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 0 ui
+
+func separator (ui: own Ui) : Ui =>
+  let (id, ui) = alloc_id ui
+  let (r, ui) = next_rect 8.0 ui
+  let y = r.y + 4.0
+  ui.segments := push_sketch_line (math.vec2 r.x y) (math.vec2 (r.x + r.z) y) ui.theme.muted_ink 1.7 (ui.theme.wobble_px * 1.35) ui.theme.overshoot_px id ui.boil self
+  return ui
+
+// Clickable sketchy button. Returns (clicked, next_ui).
+private func push_focus_ring (r: math.Vec4) -> (th: Theme) -> (segments: own #[lines.Segment]) : #[lines.Segment] =>
+  let pad = 3.5
+  let x0 = r.x - pad
+  let y0 = r.y - pad
+  let x1 = r.x + r.z + pad
+  let y1 = r.y + r.w + pad
+  let style = dashed_style (max 1.8 (th.stroke_px * 0.95)) 7.0 4.0
+  let tl = math.vec2 x0 y0
+  let tr = math.vec2 x1 y0
+  let br = math.vec2 x1 y1
+  let bl = math.vec2 x0 y1
+  segments := lines.push_segment_2d tl tr th.accent style self
+  segments := lines.push_segment_2d tr br th.accent style self
+  segments := lines.push_segment_2d br bl th.accent style self
+  return lines.push_segment_2d bl tl th.accent style segments
+
+private func ui_activated (state: State) -> (id: U32) : Bool =>
+  return (state.focused_id == id and state.key_enter)
+    or (state.action_node == id and state.action_kind == vocabulary.action_activate)
+
+func button (text: Text) -> (ui: own Ui) : (Bool, Ui) =>
+  let (id, ui) = alloc_id ui
+  let th = ui.theme
+  let h = th.font_px + 18.0
+  let (r, ui) = next_rect h ui
+  let hovered = point_in ui.state.pointer r
+  if hovered:
+    ui.state.hot_id := id
+    if ui.state.just_pressed:
+      ui.state.active_id := id
+      ui.state.focused_id := id
+  let focused = ui.state.focused_id == id
+  let pressed = ui.state.active_id == id and ui.state.pointer_down
+  let clicked = (ui.state.active_id == id and ui.state.just_released and hovered) or ui_activated ui.state id
+  if ui.state.active_id == id and ui.state.just_released:
+    ui.state.active_id := 0
+  let shift = if pressed then 2.0 else 0.0
+  let draw_r = math.vec4 (r.x + shift) (r.y + shift) r.z r.w
+  if not pressed:
+    ui.shapes := push_paper_fill (math.vec4 (r.x + 3.0) (r.y + 3.5) r.z r.w) 3.0 th.shadow self
+  let fill = if pressed then th.accent else (if hovered or focused then th.highlight else th.widget_fill)
+  ui.shapes := push_paper_fill (math.vec4 (draw_r.x + 1.0) (draw_r.y + 1.0) (draw_r.z - 2.0) (draw_r.w - 2.0)) 3.0 fill self
+  if hovered or pressed:
+    let hatch_col = math.vec4 th.ink.x th.ink.y th.ink.z 0.14
+    ui.segments := push_sketch_hatch draw_r hatch_col 9.0 1.2 th.wobble_px (id * 41) ui.boil self
+  ui.segments := push_sketch_rect draw_r th.ink th.stroke_px th.wobble_px th.overshoot_px id ui.boil (hovered or pressed or focused) self
+  if focused:
+    ui.segments := push_focus_ring draw_r th self
+  let tw = measure_text text th.font_px
+  let tx = draw_r.x + max 8.0 ((draw_r.z - tw) * 0.5)
+  let ty = draw_r.y + (draw_r.w - th.font_px) * 0.5
+  let text_col = if pressed then th.paper else th.ink
+  ui.segments := push_sketch_text text (math.vec2 tx ty) th.font_px text_col (hovered or pressed or focused) th.wobble_px (id * 17 + 9) ui.boil self
+  let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_activate)
+  ui := push_a11y id vocabulary.role_button text r true vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 acts self
+  return (clicked, ui)
+
+// Hand-drawn checkbox with chunky marker checkmark. Returns (new_checked, next_ui).
+func checkbox (text: Text) -> (checked: Bool) -> (ui: own Ui) : (Bool, Ui) =>
+  let (id, ui) = alloc_id ui
+  let th = ui.theme
+  let h = max 24.0 (th.font_px + 10.0)
+  let (r, ui) = next_rect h ui
+  let hovered = point_in ui.state.pointer r
+  if hovered:
+    ui.state.hot_id := id
+    if ui.state.just_pressed:
+      ui.state.active_id := id
+      ui.state.focused_id := id
+  let focused = ui.state.focused_id == id
+  let toggled = (ui.state.active_id == id and ui.state.just_released and hovered) or ui_activated ui.state id
+  if ui.state.active_id == id and ui.state.just_released:
+    ui.state.active_id := 0
+  let next_checked = if toggled then not checked else checked
+  let box_s = 19.0
+  let box_r = math.vec4 r.x (r.y + (h - box_s) * 0.5) box_s box_s
+  let fill = if next_checked then th.highlight else (if hovered or focused then th.panel_header else th.widget_fill)
+  ui.shapes := push_paper_fill box_r 2.0 fill self
+  ui.segments := push_sketch_rect box_r th.ink th.stroke_px th.wobble_px (th.overshoot_px * 0.8) id ui.boil (hovered or focused) self
+  if focused:
+    ui.segments := push_focus_ring r th self
+  if next_checked:
+    let c0 = math.vec2 (box_r.x + 3.5) (box_r.y + box_s * 0.55)
+    let c1 = math.vec2 (box_r.x + box_s * 0.42) (box_r.y + box_s - 3.5)
+    let c2 = math.vec2 (box_r.x + box_s + 2.0) (box_r.y + 1.5)
+    ui.segments := push_sketch_line c0 c1 th.accent (th.stroke_px + 0.9) (th.wobble_px * 0.6) 0.5 (id * 23 + 1) ui.boil self
+    ui.segments := push_sketch_line c1 c2 th.accent (th.stroke_px + 0.9) (th.wobble_px * 0.6) 1.0 (id * 23 + 2) ui.boil self
+  let tx = box_r.x + box_s + 10.0
+  let ty = r.y + (h - th.font_px) * 0.5
+  ui.segments := push_sketch_text text (math.vec2 tx ty) th.font_px th.ink (hovered or focused) th.wobble_px (id * 23 + 3) ui.boil self
+  let cstate = if next_checked then vocabulary.state_true else vocabulary.state_false
+  let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_activate)
+  ui := push_a11y id vocabulary.role_checkbox text r true cstate vocabulary.state_none 0.0 0.0 0.0 acts self
+  return (next_checked, ui)
+
+// Sketchy pill toggle switch with hand-drawn marker knob. Returns (new_on, next_ui).
+func toggle (text: Text) -> (on: Bool) -> (ui: own Ui) : (Bool, Ui) =>
+  let (id, ui) = alloc_id ui
+  let th = ui.theme
+  let h = max 24.0 (th.font_px + 10.0)
+  let (r, ui) = next_rect h ui
+  let hovered = point_in ui.state.pointer r
+  if hovered:
+    ui.state.hot_id := id
+    if ui.state.just_pressed:
+      ui.state.active_id := id
+      ui.state.focused_id := id
+  let focused = ui.state.focused_id == id
+  let flipped = (ui.state.active_id == id and ui.state.just_released and hovered) or ui_activated ui.state id
+  if ui.state.active_id == id and ui.state.just_released:
+    ui.state.active_id := 0
+  let next_on = if flipped then not on else on
+  let pw = 38.0
+  let ph = 20.0
+  let pr = math.vec4 r.x (r.y + (h - ph) * 0.5) pw ph
+  let track_fill = if next_on then th.secondary else th.widget_fill
+  ui.shapes := push_paper_fill pr 3.5 track_fill self
+  ui.segments := push_sketch_rect pr th.ink (th.stroke_px * 0.95) (th.wobble_px * 0.9) 1.4 id ui.boil (hovered or focused) self
+  if focused:
+    ui.segments := push_focus_ring r th self
+  let kx = if next_on then pr.x + pw - 10.0 else pr.x + 10.0
+  let ky = pr.y + ph * 0.5
+  ui.shapes := push_circle_fill (math.vec2 kx ky) 7.5 (if next_on then th.highlight else th.paper) self
+  ui.segments := push_sketch_circle (math.vec2 kx ky) 7.5 th.ink th.stroke_px th.wobble_px (id * 37) ui.boil self
+  let tx = pr.x + pw + 10.0
+  let ty = r.y + (h - th.font_px) * 0.5
+  ui.segments := push_sketch_text text (math.vec2 tx ty) th.font_px th.ink (hovered or focused) th.wobble_px (id * 37 + 1) ui.boil self
+  let cstate = if next_on then vocabulary.state_true else vocabulary.state_false
+  let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_activate)
+  ui := push_a11y id vocabulary.role_switch text r true cstate vocabulary.state_none 0.0 0.0 0.0 acts self
+  return (next_on, ui)
+
+// Draggable sketchy slider with crayon hatch fill & numeric readout. Returns (new_value, next_ui).
+func slider (text: Text) -> (value: F32) -> (lo: F32) -> (hi: F32) -> (ui: own Ui) : (F32, Ui) =>
+  let (id, ui) = alloc_id ui
+  let th = ui.theme
+  let lo_c = min lo hi
+  let hi_c = max lo hi
+  let span = max 0.0001 (hi_c - lo_c)
+  let h = th.font_px + 28.0
+  let (r, ui) = next_rect h ui
+  let track_y = r.y + th.font_px + 10.0
+  let track_h = 12.0
+  let track_r = math.vec4 r.x track_y r.z track_h
+  let hit_r = math.vec4 (r.x - 4.0) (track_y - 6.0) (r.z + 8.0) (track_h + 12.0)
+  let hovered = point_in ui.state.pointer hit_r
+  if hovered:
+    ui.state.hot_id := id
+    if ui.state.just_pressed:
+      ui.state.active_id := id
+      ui.state.focused_id := id
+  let focused = ui.state.focused_id == id
+  let next_val = clamp lo_c hi_c value
+  if ui.state.active_id == id and ui.state.pointer_down:
+    let t = clamp 0.0 1.0 ((ui.state.pointer.x - track_r.x) / max 1.0 track_r.z)
+    next_val := lo_c + t * span
+  if ui.state.active_id == id and ui.state.just_released:
+    ui.state.active_id := 0
+  if focused:
+    let step = span * 0.05
+    if ui.state.key_left or ui.state.key_down or (ui.state.action_node == id and ui.state.action_kind == vocabulary.action_decrement):
+      next_val := clamp lo_c hi_c (next_val - step)
+    if ui.state.key_right or ui.state.key_up or (ui.state.action_node == id and ui.state.action_kind == vocabulary.action_increment):
+      next_val := clamp lo_c hi_c (next_val + step)
+    if ui.state.action_node == id and ui.state.action_kind == vocabulary.action_set_value:
+      next_val := clamp lo_c hi_c ui.state.action_value
+  let frac = clamp 0.0 1.0 ((next_val - lo_c) / span)
+  let val_txt = format_f32_2 next_val
+  let val_w = measure_text val_txt (th.font_px - 1.0)
+  ui.segments := push_sketch_text text (math.vec2 r.x r.y) th.font_px th.ink focused th.wobble_px (id * 13 + 1) ui.boil self
+  ui.segments := push_sketch_text val_txt (math.vec2 (r.x + r.z - val_w) (r.y + 1.0)) (th.font_px - 1.0) th.muted_ink false th.wobble_px (id * 13 + 2) ui.boil self
+  ui.shapes := push_paper_fill track_r 3.0 th.widget_fill self
+  let fill_w = track_r.z * frac
+  if fill_w > 2.0:
+    let fill_r = math.vec4 (track_r.x + 1.0) (track_r.y + 1.0) (max 1.0 (fill_w - 2.0)) (track_r.w - 2.0)
+    ui.shapes := push_paper_fill fill_r 2.0 th.secondary self
+    ui.segments := push_sketch_hatch fill_r (math.vec4 th.ink.x th.ink.y th.ink.z 0.22) 7.0 1.2 th.wobble_px (id * 13 + 3) ui.boil self
+  ui.segments := push_sketch_rect track_r th.ink (th.stroke_px * 0.9) th.wobble_px 1.6 (id * 13 + 4) ui.boil focused self
+  if focused:
+    ui.segments := push_focus_ring r th self
+  let knob_x = track_r.x + fill_w
+  let knob_y = track_r.y + track_h * 0.5
+  let dragging = ui.state.active_id == id and ui.state.pointer_down
+  let knob_r = if dragging then 9.5 else (if hovered or focused then 8.5 else 7.5)
+  let knob_col = if dragging or focused then th.accent else th.highlight
+  ui.shapes := push_circle_fill (math.vec2 knob_x knob_y) knob_r knob_col self
+  ui.segments := push_sketch_circle (math.vec2 knob_x knob_y) knob_r th.ink (th.stroke_px + 0.3) th.wobble_px (id * 13 + 5) ui.boil self
+  let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_increment) | (1 << vocabulary.action_decrement) | (1 << vocabulary.action_set_value)
+  ui := push_a11y id vocabulary.role_slider text r true vocabulary.state_none vocabulary.state_none next_val lo_c hi_c acts self
+  return (next_val, ui)
+
+// Horizontal sketchy segmented radio choices. Returns (new_selected_index, next_ui).
+func radio (text: Text) -> (options: &[Text]) -> (selected: U32) -> (ui: own Ui) : (U32, Ui) =>
+  let (group_id, ui) = alloc_id ui
+  let th = ui.theme
+  if text.length > 0:
+    let (lr, ui2) = next_rect (th.font_px + 3.0) ui
+    ui := ui2
+    ui.segments := push_sketch_text text (math.vec2 lr.x lr.y) th.font_px th.ink false th.wobble_px (group_id * 11) ui.boil self
+  if options.length == 0:
+    return (0, ui)
+  let bh = th.font_px + 14.0
+  let (r, ui) = next_rect bh ui
+  let gap = 6.0
+  let n = options.length
+  let cell_w = max 24.0 ((r.z - gap * U32.to_f32 (n - 1)) / U32.to_f32 n)
+  let cur = min selected (n - 1)
+  // Arrow keys cycle the selected option and roving focus within this radio group.
+  let base_oid = ui.next_id
+  if ui.state.focused_id >= base_oid and ui.state.focused_id < base_oid + n:
+    let fidx = ui.state.focused_id - base_oid
+    if ui.state.key_right or ui.state.key_down:
+      cur := (fidx + 1) % n
+      ui.state.focused_id := base_oid + cur
+    if ui.state.key_left or ui.state.key_up:
+      cur := (fidx + n - 1) % n
+      ui.state.focused_id := base_oid + cur
+  ui := push_a11y group_id vocabulary.role_radiogroup text r false vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 0 self
+  let saved_parent = ui.panel_id
+  ui.panel_id := group_id
+  for i in 0 .. n:
+    let (oid, ui2) = alloc_id ui
+    ui := ui2
+    let cr = math.vec4 (r.x + U32.to_f32 i * (cell_w + gap)) r.y cell_w bh
+    let hovered = point_in ui.state.pointer cr
+    if hovered:
+      ui.state.hot_id := oid
+      if ui.state.just_pressed:
+        ui.state.active_id := oid
+        ui.state.focused_id := oid
+    let focused = ui.state.focused_id == oid
+    if (ui.state.active_id == oid and ui.state.just_released and hovered) or ui_activated ui.state oid:
+      cur := i
+    if ui.state.active_id == oid and ui.state.just_released:
+      ui.state.active_id := 0
+    let is_sel = cur == i
+    let fill = if is_sel then th.highlight else (if hovered then th.panel_header else th.widget_fill)
+    ui.shapes := push_paper_fill cr 3.0 fill self
+    if is_sel:
+      ui.segments := push_sketch_hatch cr (math.vec4 th.accent.x th.accent.y th.accent.z 0.22) 8.0 1.2 th.wobble_px (oid * 29) ui.boil self
+    ui.segments := push_sketch_rect cr (if is_sel or focused then th.accent else th.ink) (if is_sel then th.stroke_px + 0.4 else th.stroke_px * 0.85) th.wobble_px 1.6 oid ui.boil (is_sel or focused) self
+    if focused:
+      ui.segments := push_focus_ring cr th self
+    let opt = options[i]
+    let tw = measure_text opt (th.font_px - 1.0)
+    let tx = cr.x + max 4.0 ((cr.z - tw) * 0.5)
+    let ty = cr.y + (cr.w - (th.font_px - 1.0)) * 0.5
+    ui.segments := push_sketch_text opt (math.vec2 tx ty) (th.font_px - 1.0) th.ink is_sel th.wobble_px (oid * 29 + 1) ui.boil self
+    let sstate = if is_sel then vocabulary.state_true else vocabulary.state_false
+    let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_activate)
+    ui := push_a11y oid vocabulary.role_radio opt cr true sstate sstate 0.0 0.0 0.0 acts self
+  ui.panel_id := saved_parent
+  return (cur, ui)
+
+// Sketchy progress bar with diagonal crayon fill and percent text.
+func progress (text: Text) -> (fraction: F32) -> (ui: own Ui) : Ui =>
+  let (id, ui) = alloc_id ui
+  let th = ui.theme
+  let frac = clamp 0.0 1.0 fraction
+  let h = th.font_px + 24.0
+  let (r, ui) = next_rect h ui
+  let pct_txt = format_percent frac
+  let pct_w = measure_text pct_txt (th.font_px - 1.0)
+  ui.segments := push_sketch_text text (math.vec2 r.x r.y) th.font_px th.ink false th.wobble_px (id * 7 + 1) ui.boil self
+  ui.segments := push_sketch_text pct_txt (math.vec2 (r.x + r.z - pct_w) (r.y + 1.0)) (th.font_px - 1.0) th.muted_ink false th.wobble_px (id * 7 + 2) ui.boil self
+  let bar_r = math.vec4 r.x (r.y + th.font_px + 6.0) r.z 14.0
+  ui.shapes := push_paper_fill bar_r 3.0 th.widget_fill self
+  let fw = bar_r.z * frac
+  if fw > 2.0:
+    let fr = math.vec4 (bar_r.x + 1.0) (bar_r.y + 1.0) (max 1.0 (fw - 2.0)) (bar_r.w - 2.0)
+    ui.shapes := push_paper_fill fr 2.0 th.highlight self
+    ui.segments := push_sketch_hatch fr th.accent 7.5 1.5 th.wobble_px (id * 7 + 3) ui.boil self
+  ui.segments := push_sketch_rect bar_r th.ink th.stroke_px th.wobble_px 1.8 id ui.boil false self
+  return push_a11y id vocabulary.role_progressbar text r false vocabulary.state_none vocabulary.state_none frac 0.0 1.0 0 ui
+
+// Collapsing header (`▸` / `▾`). Returns (new_open, next_ui).
+func collapsing (text: Text) -> (open: Bool) -> (ui: own Ui) : (Bool, Ui) =>
+  let (id, ui) = alloc_id ui
+  let th = ui.theme
+  let h = max 24.0 (th.font_px + 10.0)
+  let (r, ui) = next_rect h ui
+  let hovered = point_in ui.state.pointer r
+  if hovered:
+    ui.state.hot_id := id
+    if ui.state.just_pressed:
+      ui.state.active_id := id
+      ui.state.focused_id := id
+  let focused = ui.state.focused_id == id
+  let toggled = (ui.state.active_id == id and ui.state.just_released and hovered) or ui_activated ui.state id
+  if ui.state.active_id == id and ui.state.just_released:
+    ui.state.active_id := 0
+  let next_open = if toggled then not open else open
+  if hovered or focused:
+    ui.shapes := push_paper_fill r 3.0 th.panel_header self
+  if focused:
+    ui.segments := push_focus_ring r th self
+  let cx = r.x + 7.0
+  let cy = r.y + h * 0.5
+  let tri_style = marker_style (th.stroke_px * 0.9)
+  let t0 = if next_open then math.vec2 (cx - 5.0) (cy - 3.0) else math.vec2 (cx - 3.0) (cy - 5.0)
+  let t1 = if next_open then math.vec2 (cx + 5.0) (cy - 3.0) else math.vec2 (cx + 4.5) cy
+  let t2 = if next_open then math.vec2 cx (cy + 4.5) else math.vec2 (cx - 3.0) (cy + 5.0)
+  ui.segments := lines.push_line_2d t0 t1 false th.accent tri_style self
+  ui.segments := lines.push_line_2d t1 t2 true th.accent tri_style self
+  ui.segments := lines.push_line_2d t2 t0 true th.accent tri_style self
+  ui.segments := push_sketch_text text (math.vec2 (r.x + 18.0) (r.y + (h - th.font_px) * 0.5)) th.font_px th.ink true th.wobble_px id ui.boil self
+  let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_activate)
+  ui := push_a11y id vocabulary.role_button text r true vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 acts self
+  let last = ui.nodes.length - 1
+  let node = ui.nodes[last]
+  node.expanded := if next_open then vocabulary.state_true else vocabulary.state_false
+  ui.nodes[last] := node
+  return (next_open, ui)
+
+// Clickable sketchy single-line text input with blinking marker caret. Returns (next_text, next_ui).
+func text_box (label_text: Text) -> (value: own Text) -> (ui: own Ui) : (Text, Ui) =>
+  let (id, ui) = alloc_id ui
+  let th = ui.theme
+  if label_text.length > 0:
+    let (lr, ui2) = next_rect (th.font_px + 2.0) ui
+    ui := ui2
+    ui.segments := push_sketch_text label_text (math.vec2 lr.x lr.y) th.font_px th.ink false th.wobble_px (id * 19) ui.boil self
+  let bh = th.font_px + 16.0
+  let (r, ui) = next_rect bh ui
+  let hovered = point_in ui.state.pointer r
+  if hovered:
+    ui.state.hot_id := id
+    if ui.state.just_pressed:
+      ui.state.focused_id := id
+  else:
+    if ui.state.just_pressed and ui.state.focused_id == id:
+      ui.state.focused_id := 0
+  let focused = ui.state.focused_id == id
+  if focused:
+    if ui.state.key_escape:
+      ui.state.focused_id := 0
+      focused := false
+    if ui.state.key_backspace and value.length > 0:
+      let _ = @storage.pop value
+    if ui.state.typed_char >= 32 and ui.state.typed_char <= 126 and value.length < 48:
+      @storage.push value ui.state.typed_char
+  let fill = if focused then th.widget_fill else math.vec4 th.widget_fill.x th.widget_fill.y th.widget_fill.z 0.82
+  ui.shapes := push_paper_fill r 3.0 fill self
+  // Ruled notebook baseline inside the input box
+  let rule_y = r.y + bh - 5.0
+  ui.segments := push_sketch_line (math.vec2 (r.x + 6.0) rule_y) (math.vec2 (r.x + r.z - 6.0) rule_y) (math.vec4 th.secondary.x th.secondary.y th.secondary.z 0.45) 1.2 (th.wobble_px * 0.5) 0.5 (id * 19 + 1) ui.boil self
+  ui.segments := push_sketch_rect r (if focused then th.accent else th.ink) th.stroke_px th.wobble_px 1.8 id ui.boil focused self
+  if focused:
+    ui.segments := push_focus_ring r th self
+  let tx = r.x + 8.0
+  let ty = r.y + (bh - th.font_px) * 0.5 - 1.0
+  ui.segments := push_sketch_text value (math.vec2 tx ty) th.font_px th.ink false th.wobble_px (id * 19 + 2) ui.boil self
+  let blink_on = (F32.to_u32 (floor (ui.time * 2.2)) & 1) == 0
+  if focused and blink_on:
+    let cx = min (r.x + r.z - 6.0) (tx + measure_text value th.font_px + 2.0)
+    ui.segments := push_sketch_line (math.vec2 cx (r.y + 5.0)) (math.vec2 cx (r.y + bh - 5.0)) th.accent 2.2 0.4 0.5 (id * 19 + 3) ui.boil self
+  let acts = 1 << vocabulary.action_focus
+  ui := push_a11y id vocabulary.role_textbox label_text r true vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 acts self
+  return (value, ui)
+
+// Signature Drawful interactive doodle canvas!
+// `strokes` stores panel-local Vec2 points separated by sentinel `(-1.0, -1.0)` on pen-up.
+func doodle_pad (height: F32) -> (strokes: own #[Vec2]) -> (ui: own Ui) : (#[Vec2], Ui) =>
+  let (id, ui) = alloc_id ui
+  let th = ui.theme
+  let (r, ui) = next_rect (max 48.0 height) ui
+  let hovered = point_in ui.state.pointer r
+  if hovered:
+    ui.state.hot_id := id
+    if ui.state.just_pressed:
+      ui.state.active_id := id
+      if strokes.length > 0:
+        let last = strokes[strokes.length - 1]
+        if last.x >= 0.0:
+          @storage.push strokes (math.vec2 (-1.0) (-1.0))
+  if ui.state.active_id == id and ui.state.pointer_down:
+    let lx = clamp 3.0 (max 4.0 (r.z - 3.0)) (ui.state.pointer.x - r.x)
+    let ly = clamp 3.0 (max 4.0 (r.w - 3.0)) (ui.state.pointer.y - r.y)
+    let should_push = true
+    if strokes.length > 0:
+      let prev = strokes[strokes.length - 1]
+      if prev.x >= 0.0:
+        let ddx = lx - prev.x
+        let ddy = ly - prev.y
+        if ddx * ddx + ddy * ddy < 9.0:
+          should_push := false
+    if should_push and strokes.length < 1024:
+      @storage.push strokes (math.vec2 lx ly)
+  if ui.state.active_id == id and ui.state.just_released:
+    ui.state.active_id := 0
+    if strokes.length > 0 and strokes[strokes.length - 1].x >= 0.0:
+      @storage.push strokes (math.vec2 (-1.0) (-1.0))
+  // Crisp white sketch card with dashed inner frame and marker strokes
+  ui.shapes := push_paper_fill r 4.0 th.widget_fill self
+  let inner = math.vec4 (r.x + 4.0) (r.y + 4.0) (max 4.0 (r.z - 8.0)) (max 4.0 (r.w - 8.0))
+  let corner_col = math.vec4 th.muted_ink.x th.muted_ink.y th.muted_ink.z 0.35
+  ui.segments := lines.push_d2_rect (math.vec2 (inner.x + inner.z * 0.5) (inner.y + inner.w * 0.5)) (math.vec2 (inner.z * 0.5) (inner.w * 0.5)) 0.0 true corner_col (dashed_style 1.2 6.0 5.0) self
+  ui.segments := push_sketch_rect r th.ink (th.stroke_px + 0.2) th.wobble_px th.overshoot_px id ui.boil hovered self
+  let run_style = marker_style (th.stroke_px + 1.0)
+  let prev_pt = math.vec2 0.0 0.0
+  let run_len: U32 = 0
+  for k in 0 .. strokes.length:
+    let pt = strokes[k]
+    if pt.x < 0.0:
+      run_len := 0
+    else:
+      let jx = jitter (id * 71 + k) ui.boil 1 * (th.wobble_px * 0.45)
+      let jy = jitter (id * 71 + k) ui.boil 2 * (th.wobble_px * 0.45)
+      let cur = math.vec2 (r.x + pt.x + jx) (r.y + pt.y + jy)
+      if run_len > 0:
+        ui.segments := lines.push_line_2d prev_pt cur (run_len > 1) th.accent run_style self
+      prev_pt := cur
+      run_len := self + 1
+  ui := push_a11y id vocabulary.role_image "Doodle canvas" r true vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 (1 << vocabulary.action_focus) self
+  return (strokes, ui)
+
+// --- Frame completion ---
+
+// Uniform 2D viewport fit mapping a logical design canvas into physical pixels.
+type Fit is data = $Fit { offset: Vec2, scale: F32 }
+
+// Centers `logical` inside `viewport` with uniform aspect-preserving scaling.
+func fit_logical (logical: Vec2) -> (viewport: Vec2) : Fit =>
+  let sx = max 1.0 viewport.x / max 1.0 logical.x
+  let sy = max 1.0 viewport.y / max 1.0 logical.y
+  let scale = min sx sy
+  let ox = (viewport.x - logical.x * scale) * 0.5
+  let oy = (viewport.y - logical.y * scale) * 0.5
+  return $Fit { offset: math.vec2 ox oy, scale }
+
+// Anchors `logical` to the top-left of `viewport` with uniform scaling (for 3D HUD overlays).
+func fit_top_left (logical: Vec2) -> (viewport: Vec2) : Fit =>
+  let sx = max 1.0 viewport.x / max 1.0 logical.x
+  let sy = max 1.0 viewport.y / max 1.0 logical.y
+  return $Fit { offset: math.vec2 0.0 0.0, scale: min sx sy }
+
+// Maps a single host event's pixel coordinates from physical space into logical space.
+func map_event (fit: Fit) -> (ev: events.Event) : events.Event =>
+  let inv = 1.0 / max 0.0001 fit.scale
+  let ox = fit.offset.x
+  let oy = fit.offset.y
+  return case ev of
+    $events.PointerDown { button, x, y } =>
+      $events.PointerDown { button, x: (x - ox) * inv, y: (y - oy) * inv }
+    $events.PointerUp { button, x, y } =>
+      $events.PointerUp { button, x: (x - ox) * inv, y: (y - oy) * inv }
+    $events.PointerMove { x, y } =>
+      $events.PointerMove { x: (x - ox) * inv, y: (y - oy) * inv }
+    $events.Wheel { delta, x, y } =>
+      $events.Wheel { delta, x: (x - ox) * inv, y: (y - oy) * inv }
+    $events.Touch { id, x, y, phase } =>
+      $events.Touch { id, x: (x - ox) * inv, y: (y - oy) * inv, phase }
+    _ => ev
+
+// Maps a slice of host events from physical space into logical space.
+func map_events (fit: Fit) -> (evs: &[events.Event]) : #[events.Event] =>
+  let out: #[events.Event] = #[]
+  for ev in evs:
+    @storage.push out (map_event fit ev)
+  return out
+
+// Transforms 2D overlay shapes, 2D screen-space lines, and accessibility nodes by `fit`.
+// 3D world-space lines (without `lines.flag_2d`) are left untouched.
+func apply_fit (fit: Fit) -> (ui: own Ui) : Ui =>
+  let ox = fit.offset.x
+  let oy = fit.offset.y
+  let sc = fit.scale
+  for i in 0 .. ui.shapes.length:
+    let sh = ui.shapes[i]
+    if sh.overlay:
+      let r = sh.rect
+      sh.rect := math.vec4 (ox + r.x * sc) (oy + r.y * sc) (r.z * sc) (r.w * sc)
+      let cr = sh.corner_radii
+      sh.corner_radii := math.vec4 (cr.x * sc) (cr.y * sc) (cr.z * sc) (cr.w * sc)
+      sh.border_width_px := sh.border_width_px * sc
+      sh.shadow_offset := math.vec2 (sh.shadow_offset.x * sc) (sh.shadow_offset.y * sc)
+      sh.shadow_blur_px := sh.shadow_blur_px * sc
+      sh.clip_radius_px := sh.clip_radius_px * sc
+      let clip = sh.clip_rect
+      if clip.z > 0.0 or clip.w > 0.0:
+        sh.clip_rect := math.vec4 (ox + clip.x * sc) (oy + clip.y * sc) (clip.z * sc) (clip.w * sc)
+      ui.shapes[i] := sh
+  for i in 0 .. ui.segments.length:
+    let seg = ui.segments[i]
+    if (seg.flags & lines.flag_2d) != 0:
+      seg.p0 := math.vec3 (ox + seg.p0.x * sc) (oy + seg.p0.y * sc) seg.p0.z
+      seg.p1 := math.vec3 (ox + seg.p1.x * sc) (oy + seg.p1.y * sc) seg.p1.z
+      let st = seg.style
+      st.width_px := max 0.9 (st.width_px * sc)
+      st.dash_len_px := st.dash_len_px * sc
+      st.gap_len_px := st.gap_len_px * sc
+      st.feather_px := max 0.75 (st.feather_px * sc)
+      seg.style := st
+      ui.segments[i] := seg
+  for i in 0 .. ui.nodes.length:
+    let n = ui.nodes[i]
+    n.x := ox + n.x * sc
+    n.y := oy + n.y * sc
+    n.width := n.width * sc
+    n.height := n.height * sc
+    ui.nodes[i] := n
+  return ui
+
+private func is_tab_stop (node: tree.StoredNode) : Bool =>
+  if not node.focusable or node.disabled or node.hidden:
+    return false
+  if node.role == vocabulary.role_image:
+    return false
+  if node.role == vocabulary.role_radio and node.selected == vocabulary.state_false:
+    return false
+  if node.role == vocabulary.role_tab and node.selected == vocabulary.state_false:
+    return false
+  return true
+
+private func sync_focus_order (ui: own Ui) : Ui =>
+  let stops: #[U32] = #[]
+  for i in 0 .. ui.nodes.length:
+    let n = ui.nodes[i]
+    if is_tab_stop n:
+      @storage.push stops n.id
+  let count = stops.length
+  if count == 0:
+    ui.state.first_focusable := 0
+    ui.state.last_focusable := 0
+    ui.state.next_focusable := 0
+    ui.state.prev_focusable := 0
+    return ui
+  if ui.state.pending_tab == 1:
+    ui.state.focused_id := tree.along stops ui.state.focused_id true
+  if ui.state.pending_tab == 2:
+    ui.state.focused_id := tree.along stops ui.state.focused_id false
+  if ui.state.focused_id != 0:
+    let still_present = false
+    for i in 0 .. ui.nodes.length:
+      if ui.nodes[i].id == ui.state.focused_id and ui.nodes[i].focusable:
+        still_present := true
+    if not still_present:
+      ui.state.focused_id := 0
+  let cur = ui.state.focused_id
+  ui.state.first_focusable := stops[0]
+  ui.state.last_focusable := stops[count - 1]
+  ui.state.next_focusable := if cur == 0 then stops[0] else tree.along stops cur true
+  ui.state.prev_focusable := if cur == 0 then stops[count - 1] else tree.along stops cur false
+  for i in 0 .. ui.nodes.length:
+    let n = ui.nodes[i]
+    let want = cur != 0 and n.id == cur
+    if n.focused != want:
+      n.focused := want
+      ui.nodes[i] := n
+  return ui
+
+private func end_frame_state (state: State) : State =>
+  let s = state
+  s.just_pressed := false
+  s.just_released := false
+  s.pending_tab := 0
+  s.key_left := false
+  s.key_right := false
+  s.key_up := false
+  s.key_down := false
+  s.key_enter := false
+  s.key_backspace := false
+  s.key_escape := false
+  s.action_node := 0
+  s.action_kind := 0
+  s.action_value := 0.0
+  s.typed_char := 0
+  s.scroll_delta := 0.0
+  s.frame_count := s.frame_count + 1
+  return s
+
+// Emits both SDF fills (65008) and sketchy 2D marker lines (65006) into `frame`.
+func finish_into (ui: own Ui) -> (frame: own render.FrameAccess) : (State, render.FrameAccess) =>
+  ui := sync_focus_order self
+  if ui.shapes.length > 0:
+    frame := d2.emit_sdf_extension (&ui.shapes[0..ui.shapes.length]) self
+  if ui.segments.length > 0:
+    frame := lines.emit_extension ($lines.XRayConfig { alpha: 0.25, desaturate: 0.5 }) (&ui.segments[0..ui.segments.length]) self
+  return (end_frame_state ui.state, frame)
+
+// Same as `finish_into` while also returning the populated accessibility nodes & label pool
+// for host publication or `ink/ui/testing` role queries.
+func finish_with_tree (ui: own Ui) -> (frame: own render.FrameAccess) : (State, render.FrameAccess, #[tree.StoredNode], #[U32]) =>
+  ui := sync_focus_order self
+  if ui.shapes.length > 0:
+    frame := d2.emit_sdf_extension (&ui.shapes[0..ui.shapes.length]) self
+  if ui.segments.length > 0:
+    frame := lines.emit_extension ($lines.XRayConfig { alpha: 0.25, desaturate: 0.5 }) (&ui.segments[0..ui.segments.length]) self
+  return (end_frame_state ui.state, frame, ui.nodes, ui.labels)

@@ -1,9 +1,9 @@
 # Package boundary
 
-Ink is a Blot source library under `lib/`, imported through a caller's `ink/`
+Ink is a Squid source library under `lib/`, imported through a caller's `ink/`
 alias. It supplies reusable calculations, simulation, typed component pools,
 scheduling, codecs, persistence, input, presentation and headless editing tools.
-Core modules depend only on Ink and Blot's standard library. Applications own
+Core modules depend only on Ink and Squid's standard library. Applications own
 assets, vocabulary, configuration, loops and storage lifetime. Pen is an
 optional host, not part of the core library.
 
@@ -129,7 +129,7 @@ named by material, a vignette) in the render packet's `exposure` and `grade`.
 Pen meters the scene on the GPU (a log2 luminance histogram, a trimmed average,
 an exponential adaptation that keeps the exposure in GPU memory and never reads
 it back) and grades in its present pass, in light and a log encoding of it
-before tone mapping, which serves SDR and HDR displays alike. Blot holds the
+before tone mapping, which serves SDR and HDR displays alike. Squid holds the
 exact formulas (`color.grade`, `color.lut_lookup`, `color.trimmed_average`,
 `color.adapt`) for the game, and the tests hold Pen's WGSL to them. The adapter
 supplies what only it knows: `dt`, the game's seconds since the last frame (none
@@ -157,7 +157,7 @@ same mist.
 Surfaces split the same way. `lighting.Material` holds the base (colour,
 metallic, roughness, `ior`, `specular`, `specular_color`) and `lighting.Surface` adds
 the optional lobes: clear coat, Charlie sheen, anisotropy, transmission with
-volume and a cheap subsurface. Their formulas live in Blot as scalar kernels
+volume and a cheap subsurface. Their formulas live in Squid as scalar kernels
 behind `surface_response` and `shade_surface` (the whole response to one light,
 `brdf` exactly when no lobe is on) and the lobes alone (`coat_response`,
 `coat_ibl`, `sheen_response`, `sheen_albedo`, `aniso_response`, `bent_normal`,
@@ -168,7 +168,7 @@ over any height function (`grid_height` reads a texture's red channel). Pen's
 WGSL surface library follows these formulas and its tests compare it with them
 and with an independent f64 reference; `tools/native/src/surface.rs` is Ink's.
 The exact rules (rounding, clamps, the sheen table) are in the Surface lobes
-section of [blot.md](blot.md). The core `shaders/mesh.wgsl` keeps its
+section of [squid.md](squid.md). The core `shaders/mesh.wgsl` keeps its
 glTF-default `f0` and is unchanged.
 
 Pen worker jobs exchange copied numeric buffers with isolated guests. Prepared
@@ -177,7 +177,7 @@ They do not share mutable application owners. Language-level task captures and
 suspended task storage are removed from the target profile. Ordinary Foreign
 calls and host suspension keep their invocation alive until settlement.
 
-Tests and tools stay outside the source package. Run `pen test-blot` for Blot and
+Tests and tools stay outside the source package. Run `pen test-squid` for Squid and
 native reference witnesses, and `pen tool ink -- bench` for measured workloads.
 GPU checks run headlessly. Generators own their outputs: change the model or
 template, then regenerate. Consumers can export the library, shaders, examples,
@@ -187,7 +187,7 @@ The protocol fixtures in `tests/fixtures/pen/` come from `pen codegen --project
 tests/fixtures`. Pen's generator does not write `provenance.json`; update it by
 hand after regenerating: `pen_base_commit` is the Pen commit used, `schema_sha256`
 is the plain SHA-256 of Pen's `protocol/schema.json`, `generator_sha256` is the
-SHA-256 over the sorted `crates/pen-codegen/src/*.{rs,blot}` files each hashed as
+SHA-256 over the sorted `crates/pen-codegen/src/*.{rs,squid}` files each hashed as
 basename, a NUL byte and contents, and `files` has the SHA-256 of each fixture.
 A Rust test checks the fixtures' hashes; the other hashes are only as fresh as
 that update.

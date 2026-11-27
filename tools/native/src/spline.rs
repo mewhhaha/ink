@@ -63,7 +63,7 @@ fn circle(count: usize, radius: f64) -> Vec<Point> {
 }
 #[test]
 fn spline_chords_marks_circles_and_even_distance() {
-    let mut f = Fixture::new("tests/spline.blot");
+    let mut f = Fixture::new("tests/spline.sq");
     let line = [
         [1.0, 2.0, 3.0],
         [2.0, 2.0, 3.0],
@@ -144,7 +144,7 @@ fn spline_chords_marks_circles_and_even_distance() {
 }
 #[test]
 fn spline_tangents_endpoints_repeated_and_invalid_points() {
-    let mut f = Fixture::new("tests/spline.blot");
+    let mut f = Fixture::new("tests/spline.sq");
     let distances: Vec<f64> = (0..200).map(|i| i as f64 * 0.15).collect();
     let result = query(&mut f, false, &distances, &WINDING);
     for i in 0..distances.len() {

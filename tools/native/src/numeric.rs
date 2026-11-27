@@ -1,7 +1,7 @@
 use super::*;
 #[test]
 fn sorting_random_copy_rotation_and_noise() {
-    let mut f = Fixture::new("tests/library.blot");
+    let mut f = Fixture::new("tests/library.sq");
     for n in [0, 1, 7, 8, 9, 16, 17, 31, 100, 1000, 10000] {
         let keys: Vec<f64> = (0..n).map(|i| ((i * 37) % 11) as f64 - 5.0).collect();
         let mut expected: Vec<u32> = (0..n as u32).collect();
@@ -51,7 +51,7 @@ fn sorting_random_copy_rotation_and_noise() {
 }
 #[test]
 fn time_accounting_timers_and_full_width_limits() {
-    let mut f = Fixture::new("tests/time.blot");
+    let mut f = Fixture::new("tests/time.sq");
     let single = f.floats("fixed", [0.125, 20.0, 0.0, 0.9375]);
     let (mut remainder, mut steps) = (0.0, 0.0);
     for delta in [0.0625, 0.25, 0.03125, 0.46875, 0.125] {

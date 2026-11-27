@@ -169,7 +169,7 @@ impl World {
             a[74] = s.mask as f64;
         }
         Self {
-            fixture: Fixture::new("tests/physics.blot"),
+            fixture: Fixture::new("tests/physics.sq"),
             ids: sources.iter().map(|s| s.id).collect(),
             lanes,
         }
@@ -520,7 +520,7 @@ fn physics_bodies_push_bounce_sleep_wake_and_resist_tunneling() {
     let mut w = World::new(vec![floor(), crate_, ball]);
     w.tick(30);
     assert!(w.state(2).position[0] > 0.3);
-    let mut f = Fixture::new("tests/physics.blot");
+    let mut f = Fixture::new("tests/physics.sq");
     let out = f.floats("primitives", [1.0, 2.0, 3.0, 4.0, -5.0, 6.0]);
     assert_eq!(&out[..6], [-1.0, -2.0, -3.0, 1.0, 2.0, 3.0]);
     near_all(&out[6..9], &[13.0 / 3.0, 10.0 / 3.0, 5.0 / 3.0], 1e-5);

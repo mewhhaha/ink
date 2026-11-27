@@ -82,7 +82,7 @@ const PAUSE: [f64; 2] = [2.0, 0.0];
 const RESUME: [f64; 2] = [3.0, 0.0];
 #[test]
 fn timeline_tracks_easing_duplicates_discrete_custom_types_and_validation() {
-    let mut f = Fixture::new("tests/timeline.blot");
+    let mut f = Fixture::new("tests/timeline.sq");
     for (time, value) in [
         (f64::NEG_INFINITY, 10.0),
         (0.5, 10.0),
@@ -157,7 +157,7 @@ fn timeline_tracks_easing_duplicates_discrete_custom_types_and_validation() {
 }
 #[test]
 fn timeline_loops_reverse_and_ping_pong_fire_cues_once() {
-    let mut f = Fixture::new("tests/timeline.blot");
+    let mut f = Fixture::new("tests/timeline.sq");
     let s = play(
         &mut f,
         1.0,
@@ -216,7 +216,7 @@ fn timeline_loops_reverse_and_ping_pong_fire_cues_once() {
 }
 #[test]
 fn timeline_once_seek_pause_resume_and_zero_travel() {
-    let mut f = Fixture::new("tests/timeline.blot");
+    let mut f = Fixture::new("tests/timeline.sq");
     let s = play(
         &mut f,
         1.0,
@@ -319,7 +319,7 @@ fn timeline_once_seek_pause_resume_and_zero_travel() {
 }
 #[test]
 fn timeline_bounded_long_advances_and_exact_random_cue_order() {
-    let mut f = Fixture::new("tests/timeline.blot");
+    let mut f = Fixture::new("tests/timeline.sq");
     let s = play(&mut f, 1.0, 1.0, &[0.5], &[advance(1000.25)]);
     let a = &s[0];
     assert_eq!(a.passes.len(), 64);
@@ -383,7 +383,7 @@ fn timeline_bounded_long_advances_and_exact_random_cue_order() {
 }
 #[test]
 fn timeline_invalid_travel_and_codec_validation() {
-    let mut f = Fixture::new("tests/timeline.blot");
+    let mut f = Fixture::new("tests/timeline.sq");
     for seconds in [-1.0, f64::NAN, f64::INFINITY] {
         assert_eq!(run(&mut f, 1.0, 1.0, &[], &[advance(seconds)]), vec![None]);
     }

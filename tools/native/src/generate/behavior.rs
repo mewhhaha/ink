@@ -214,7 +214,7 @@ pub fn compile(g: &Graph) -> Result<String> {
         arm.extend(indented(body, "        "));
         arms.push(arm.join("\n"));
     }
-    let mut result = include_str!("behavior.blot.template").to_owned();
+    let mut result = include_str!("behavior.sq.template").to_owned();
     for (key, value) in [
         ("NAME", g.name.clone()),
         ("ACTION", g.action.clone()),

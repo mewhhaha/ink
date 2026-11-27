@@ -4,7 +4,7 @@ fn norm(xs: &[f64]) -> f64 {
 }
 #[test]
 fn numeric_boundaries_reject_nonfinite_and_keep_extreme_inputs_bounded() {
-    let mut f = Fixture::new("tests/numeric-boundaries.blot");
+    let mut f = Fixture::new("tests/numeric-boundaries.sq");
     assert!(f.floats("quaternion", [0.0, 0.0, 0.0, 0.0]).is_empty());
     assert!(f.floats("normalize_vector", [0.0, 0.0, 0.0]).is_empty());
     for scale in [1e-30, 1.0, 1e30] {
@@ -123,7 +123,7 @@ fn numeric_boundaries_reject_nonfinite_and_keep_extreme_inputs_bounded() {
 }
 #[test]
 fn formatters_round_padding_nonfinite_scientific_and_text_bounds() {
-    let mut f = Fixture::new("tests/formatters.blot");
+    let mut f = Fixture::new("tests/formatters.sq");
     fn text(f: &mut Fixture, name: &str, value: impl Into<Input>) -> String {
         f.words(name, value)
             .into_iter()
@@ -175,7 +175,7 @@ fn formatters_round_padding_nonfinite_scientific_and_text_bounds() {
 }
 #[test]
 fn authored_shader_noise_and_spline_weights() {
-    let mut f = Fixture::new("tests/noise_authored.blot");
+    let mut f = Fixture::new("tests/noise_authored.sq");
     for (input, want) in [
         ([0.1031, 33.33, 0.0, 0.0, 0.0], [0.0, -0.5]),
         (
@@ -211,7 +211,7 @@ fn authored_shader_noise_and_spline_weights() {
 }
 #[test]
 fn rigid_optimizations_preserve_every_output_bit() {
-    let mut f = Fixture::new("tests/perf/rigid-costs.blot");
+    let mut f = Fixture::new("tests/perf/rigid-costs.sq");
     for count in [0, 1, 31, 128, 512, 2048] {
         for (a, b) in [
             ("accelerated", "original"),

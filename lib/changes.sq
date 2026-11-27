@@ -1,0 +1,248 @@
+//! Explicit caller-owned invalidation. Removal wins within a batch; a later
+//! batch wins when composing. Reset discards every earlier retained value.
+//!
+//! Key items: [`Changes`], [`unique`], [`contains`], [`without`], [`borrow`].
+//!
+//! ```squid
+//! let up: #[U32] = #[]
+//! let rem: #[U32] = #[]
+//! let batch = make_into false #[3, 1, 3, 2] #[2] up rem
+//! #[batch.updated.length, batch.removed.length] // => #[2, 1]
+//! ```
+
+import * as array from "std/array"
+import * as sort from "./sort"
+
+type Changes [updated, removed] is data = $Changes {reset: Bool, updated: updated, removed: removed}
+func unique values =>
+  let length: U32 = values.length
+  if length == 0:
+    let empty: #[U32] = #[]
+    return empty
+  let previous = values.at 0
+  let uniq: U32 = 1
+  let sorted = true
+  for i in 1 .. length:
+    let key = values.at i
+    if key != previous:
+      if key < previous:
+        sorted := false
+        break
+      uniq := self + 1
+      previous := key
+  if sorted:
+    let ordered = @array.fill uniq 0
+    if uniq == length:
+      for i in 0 .. length:
+        ordered[i] := values.at i
+      return ordered
+    let prev = values.at 0
+    ordered[0] := prev
+    let out_i: U32 = 1
+    for i in 1 .. length:
+      let key = values.at i
+      if key != prev:
+        ordered[out_i] := key
+        out_i := self + 1
+        prev := key
+    return ordered
+  let copy_in = @array.fill length 0
+  for i in 0 .. length:
+    copy_in[i] := values.at i
+  let order = sort.order_u32 copy_in
+  let output = @array.fill length 0
+  let count = 0
+  for i in 0 .. length:
+    let value = copy_in[order[i]]
+    if count == 0 or output[count - 1] != value:
+      output[count] := value
+      count := self + 1
+  @storage.truncate output count
+  return output
+func contains values => func (value: U32) =>
+  let count: U32 = values.length
+  let low: U32 = 0
+  let high = count
+  for 0 .. 32:
+    if low >= high:
+      break
+    let middle = low + (high - low) / 2
+    if values.at middle < value:
+      low := middle + 1
+    else:
+      high := middle
+  return low < count and values.at low == value
+func without values => func excluded =>
+  let count: U32 = values.length
+  let excluded_count: U32 = excluded.length
+  if excluded_count == 0:
+    let copy_out = @array.fill count 0
+    for i in 0 .. count:
+      copy_out[i] := values.at i
+    return copy_out
+  let out = @array.fill count 0
+  let kept: U32 = 0
+  for index in 0 .. count:
+    let value = values.at index
+    if not (contains excluded value):
+      out[kept] := value
+      kept := self + 1
+  @storage.truncate out kept
+  return out
+// Logical deltas borrow independently named pools. Normalization writes only
+// to the two caller destinations, which must be distinct from the inputs.
+func borrow reset -> updated -> removed => return
+  $Changes {reset, updated: updated.view 0 updated.length, removed: removed.view 0 removed.length}
+func make_into reset -> updated -> removed -> (out_updated: own #[U32]) -> (out_removed: own #[U32]) : Changes [#[U32], #[U32]] =>
+  let deleted = unique removed
+  out_updated := difference_into (unique updated) deleted self
+  @storage.truncate out_removed 0
+  @storage.extend out_removed deleted
+  return $Changes {reset, updated: out_updated, removed: out_removed}
+func affected changes =>
+  if changes.removed.length == 0:
+    return unique changes.updated
+  if changes.updated.length == 0:
+    return unique changes.removed
+  return union (unique changes.updated) (unique changes.removed)
+func compose_into (earlier: Changes [earlier_updated, earlier_removed]) -> (later: Changes [later_updated, later_removed]) -> (out_updated: own #[U32]) -> (out_removed: own #[U32]) : Changes [#[U32], #[U32]] =>
+  if later.reset:
+    return make_into true later.updated later.removed out_updated out_removed
+  let eu = unique earlier.updated
+  let er = unique earlier.removed
+  let lu = unique later.updated
+  let lr = unique later.removed
+  let a: U32 = 0
+  let b: U32 = 0
+  let c: U32 = 0
+  let d: U32 = 0
+  @storage.truncate out_updated 0
+  @storage.truncate out_removed 0
+  @storage.reserve out_updated (eu.length + lu.length)
+  @storage.reserve out_removed (er.length + lr.length)
+  for ever:
+    if a == eu.length and b == er.length and c == lu.length and d == lr.length:
+      break
+    let key: U32 = 0xFFFFFFFF
+    if a < eu.length:
+      key := min key eu[a]
+    if b < er.length:
+      key := min key er[b]
+    if c < lu.length:
+      key := min key lu[c]
+    if d < lr.length:
+      key := min key lr[d]
+    let deleted = false
+    if a < eu.length and eu[a] == key:
+      a := self + 1
+    if b < er.length and er[b] == key:
+      b := self + 1
+      deleted := true
+    if c < lu.length and lu[c] == key:
+      c := self + 1
+      deleted := false
+    if d < lr.length and lr[d] == key:
+      d := self + 1
+      deleted := true
+    if deleted:
+      @storage.push out_removed key
+    else:
+      @storage.push out_updated key
+  return $Changes {reset: earlier.reset, updated: out_updated, removed: out_removed}
+
+// Apply a membership delta to sorted unique keys. This is also an explicit
+// active set: updated wakes keys, removed sleeps them, and reset starts empty.
+// Full-width keys have no reserved sentinel. The returned set is an explicit independent copy.
+func apply (change: Changes [changed_updated, changed_removed]) -> before =>
+  let removed = unique change.removed
+  let updated = difference (unique change.updated) removed
+  let kept: #[U32] = if change.reset then #[] else difference before removed
+  return union kept updated
+
+// Sorted unique set operations. Keep `without` for arbitrary source order.
+// Binary search wins when scanning the larger exclusion set would dominate.
+func difference_into values -> excluded -> (out: own #[U32]) : #[U32] =>
+  let n: U32 = values.length
+  let m: U32 = excluded.length
+  if out.length < n:
+    @storage.reserve out (n - out.length)
+    for out.length .. n:
+      @storage.push out 0
+  let kept: U32 = 0
+  if n < m / 16:
+    for i in 0 .. n:
+      let key = values.at i
+      if not (contains excluded key):
+        out[kept] := key
+        kept := self + 1
+    @storage.truncate out kept
+    return out
+  let i: U32 = 0
+  let j: U32 = 0
+  if n > 0 and m > 0:
+    let key = values.at 0
+    let other = excluded.at 0
+    for ever:
+      if other < key:
+        j := self + 1
+        if j == m:
+          break
+        other := excluded.at j
+      else:
+        if key < other:
+          out[kept] := key
+          kept := self + 1
+        i := self + 1
+        if i == n:
+          break
+        key := values.at i
+  for tail in i .. n:
+    out[kept] := values.at tail
+    kept := self + 1
+  @storage.truncate out kept
+  return out
+func difference values -> excluded =>
+  let out = @array.fill values.length 0
+  return difference_into values excluded out
+func union a -> b =>
+  let a_count: U32 = a.length
+  let b_count: U32 = b.length
+  if a_count == 0:
+    let copy_b = @array.fill b_count 0
+    for i in 0 .. b_count:
+      copy_b[i] := b.at i
+    return copy_b
+  if b_count == 0:
+    let copy_a = @array.fill a_count 0
+    for i in 0 .. a_count:
+      copy_a[i] := a.at i
+    return copy_a
+  if a_count > 0xFFFFFFFF - b_count:
+    return panic "set union capacity overflows"
+  let out = @array.fill (a_count + b_count) 0
+  let left: U32 = 0
+  let right: U32 = 0
+  let count: U32 = 0
+  for 0 .. out.length:
+    if left == a_count and right == b_count:
+      break
+    let value: U32 = 0
+    if right == b_count:
+      value := a.at left
+      left := self + 1
+    else:
+      if left == a_count:
+        value := b.at right
+        right := self + 1
+      else:
+        let av = a.at left
+        let bv = b.at right
+        value := min av bv
+        if av == value:
+          left := self + 1
+        if bv == value:
+          right := self + 1
+    out[count] := value
+    count := self + 1
+  @storage.truncate out count
+  return out

@@ -3,7 +3,7 @@ use crate::{Fixture, near};
 
 #[test]
 fn d2_inertia_matches_f64_analytic_formulas() {
-    let mut f = Fixture::new("tests/physics2d_reference.blot");
+    let mut f = Fixture::new("tests/physics2d_reference.sq");
     let (r, hw, hh, hl, m) = (1.25_f64, 1.5_f64, 0.75_f64, 1.1_f64, 4.5_f64);
     let out = f.floats("inertia_witness", [r, hw, hh, hl, m]);
     assert_eq!(out.len(), 5);
@@ -32,7 +32,7 @@ fn d2_inertia_matches_f64_analytic_formulas() {
 
 #[test]
 fn d2_elastic_collision_conserves_momentum_and_kinetic_energy() {
-    let mut f = Fixture::new("tests/physics2d_reference.blot");
+    let mut f = Fixture::new("tests/physics2d_reference.sq");
     let cases = [
         (1.0_f64, 1.0_f64, 6.0_f64, -2.0_f64),
         (2.5_f64, 1.0_f64, 5.0_f64, 0.0_f64),
@@ -59,7 +59,7 @@ fn d2_elastic_collision_conserves_momentum_and_kinetic_energy() {
 
 #[test]
 fn d2_raycast_matches_analytic_f64_circle_box_and_edge() {
-    let mut f = Fixture::new("tests/physics2d_reference.blot");
+    let mut f = Fixture::new("tests/physics2d_reference.sq");
     let (ox, oy, dx, dy) = (0.0_f64, 0.5_f64, 1.0_f64, 0.0_f64);
     let out = f.floats("raycast_witness", [ox, oy, dx, dy]);
     assert_eq!(out[0], 3.0);
@@ -82,7 +82,7 @@ fn d2_raycast_matches_analytic_f64_circle_box_and_edge() {
 
 #[test]
 fn d2_broadphase_matches_bruteforce_reference_pairs_exactly() {
-    let mut f = Fixture::new("tests/physics2d_reference.blot");
+    let mut f = Fixture::new("tests/physics2d_reference.sq");
     let count: u32 = 35;
     let words = f.words("broadphase_parity_witness", count);
     let n_pairs = words[0] as usize;
@@ -119,7 +119,7 @@ fn d2_broadphase_matches_bruteforce_reference_pairs_exactly() {
 
 #[test]
 fn d2_ccd_prevents_tunneling_and_rebounds_physically() {
-    let mut f = Fixture::new("tests/physics2d_reference.blot");
+    let mut f = Fixture::new("tests/physics2d_reference.sq");
     let (speed, wall_x, rest) = (600.0_f64, 4.0_f64, 0.8_f64);
     let out = f.floats("ccd_bullet_witness", [speed, wall_x, rest]);
     // Impact x = wall_x - wall_half_w(0.1) - bullet_r(0.25) = 3.65.
@@ -136,7 +136,7 @@ fn d2_ccd_prevents_tunneling_and_rebounds_physically() {
 
 #[test]
 fn d2_character_climbs_walkable_slope_and_rejects_steep_slope() {
-    let mut f = Fixture::new("tests/physics2d_reference.blot");
+    let mut f = Fixture::new("tests/physics2d_reference.sq");
     let gentle = f.floats("character_slope_witness", 25.0);
     let steep = f.floats("character_slope_witness", 65.0);
     assert!(

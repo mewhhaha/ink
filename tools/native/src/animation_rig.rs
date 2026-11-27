@@ -1,11 +1,11 @@
 //! Independent f64 references for IK, blend spaces, the state machine and
 //! foot placement. They restate each contract with different formulas (law of
 //! cosines by angles, area-coordinate barycentrics, closed-form eases) and
-//! compare against the Blot fixture within documented F32 tolerances.
+//! compare against the Squid fixture within documented F32 tolerances.
 use super::*;
 type V = [f64; 3];
 type Q = [f64; 4];
-const FIXTURE: &str = "tests/animation_reference.blot";
+const FIXTURE: &str = "tests/animation_reference.sq";
 
 fn sub(a: V, b: V) -> V {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -1017,7 +1017,7 @@ fn additive_layer_of_the_reference_pose_is_identity() {
 fn benchmark_workloads_keep_their_independent_witnesses() {
     for w in crate::workloads::workloads()
         .into_iter()
-        .filter(|w| w.fixture == "../tests/perf/animation_rig.blot")
+        .filter(|w| w.fixture == "../tests/perf/animation_rig.sq")
     {
         let path = root().join("tools").join(&w.fixture);
         let mut f = Fixture::new(path.to_str().unwrap());

@@ -11,7 +11,7 @@ fn flagged(flag: f64, v: Vec<f64>) -> Vec<f64> {
 }
 #[test]
 fn cuts_blends_interruptions_and_live_shots() {
-    let mut f = Fixture::new("tests/director.blot");
+    let mut f = Fixture::new("tests/director.sq");
     let shots = (1..=3).map(|i| f.floats("shot", i)).collect::<Vec<_>>();
     assert_eq!(f.floats("cut", ()), flagged(0., shots[2].clone()));
     for (x, flag, s) in [
@@ -104,7 +104,7 @@ fn cuts_blends_interruptions_and_live_shots() {
 }
 #[test]
 fn director_save_validation_and_full_width_shot_ids() {
-    let mut f = Fixture::new("tests/director.blot");
+    let mut f = Fixture::new("tests/director.sq");
     let r = f.floats("saved", ());
     assert_eq!(&r[..48], &r[48..]);
     let settled = vec![
@@ -155,7 +155,7 @@ fn director_save_validation_and_full_width_shot_ids() {
 }
 #[test]
 fn camera_space_shake_tweens_zoom_and_lens() {
-    let mut f = Fixture::new("tests/director.blot");
+    let mut f = Fixture::new("tests/director.sq");
     let still = f.floats("shot", 2);
     assert_eq!(f.floats("shaken", [0.; 6]), still);
     assert_eq!(&f.floats("settled_shake", 0.)[6..], &still);

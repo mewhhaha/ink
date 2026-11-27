@@ -1,0 +1,315 @@
+//! Reusable multi-core `#kernel` kits and ergonomic `kernel_transport` facade
+//! for Squid games running on Pen's native `KernelPool` and browser `WebKernelService`.
+//!
+//! Any entry module can expose multi-core batch offload in one line:
+//!   #kernel const bake_terrain : Kernel [#[F32], #[2; F32], #[4; F32]] = {
+//!     prepare: kernel_kits.terrain_prepare,
+//!     run: kernel_kits.terrain_eval_cell,
+//!   }
+//!   #kernel const steer_crowd : Kernel [#[F32], #[4; F32], #[4; F32]] = {
+//!     prepare: kernel_kits.crowd_prepare,
+//!     run: kernel_kits.crowd_steer_agent,
+//!   }
+//!   #kernel const sample_heightfield : Kernel [#[F32], #[2; F32], #[4; F32]] = {
+//!     prepare: kernel_kits.heightfield_prepare,
+//!     run: kernel_kits.heightfield_sample_query,
+//!   }
+//!
+//! Key items: [`TerrainSpec`], [`TerrainContext`], [`CrowdContext`], [`HeightfieldContext`], [`dispatch_batch`].
+
+import { Vec2, Vec3 } from "std/vector"
+import * as kernel from "std/kernel"
+import * as kernel_transport from "./kernel_transport"
+import * as math from "./math"
+import * as pcg_noise from "./pcg/noise"
+import * as points from "./spatial/points"
+
+// ---------------------------------------------------------------- transport facade
+
+// Ensures the kernel's `wire_ctx` is uploaded under `geom_hash` and enqueues a batch
+// when `CAP` is active and the context is ready. Reads `kernel.id` and `kernel.binding_hash`
+// directly from the compiler-verified opaque `Kernel` handle.
+func dispatch_batch (transport: own kernel_transport.Access) -> (k: Kernel [#[F32], i, o]) -> (geom_hash: kernel.Hash64) -> (wire_ctx: &[F32]) -> (item_count: U32) -> (encoded_items: &[F32]) : (Bool, kernel_transport.Access) =>
+  if not (kernel_transport.cap_active transport) or item_count == 0:
+    return (false, transport)
+  let kid = kernel.id k
+  let bhash = kernel.binding_hash k
+  let (ready, next_t) = kernel_transport.ensure_context transport kid bhash geom_hash wire_ctx
+  if not ready:
+    return (false, next_t)
+  return kernel_transport.enqueue_batch next_t kid bhash geom_hash item_count encoded_items
+
+// Finds the latest completed `BatchAnswer` matching `k`'s verified `(id, binding_hash)`
+// and `expected_geom` hash, ignoring answers from stale context revisions.
+func find_answer_for (transport: kernel_transport.Access) -> (k: Kernel [c, i, o]) -> (expected_geom: kernel.Hash64) : Maybe kernel_transport.BatchAnswer =>
+  let kid = kernel.id k
+  let bhash = kernel.binding_hash k
+  let found: Maybe kernel_transport.BatchAnswer = $Nothing
+  for i in 0 .. transport.completed.length:
+    let ans = transport.completed[i]
+    if ans.kernel_id == kid and kernel.same_hash ans.binding_hash bhash and kernel.same_hash ans.geom_hash expected_geom:
+      found := $Some ans
+  return found
+
+// ---------------------------------------------------------------- Kit 1: PCG terrain chunk evaluator
+
+type TerrainSpec is data = $TerrainSpec {
+  seed: U32,
+  origin_x: F32,
+  origin_z: F32,
+  cell_size: F32,
+  frequency: F32,
+  octaves: U32,
+  ridge_weight: F32,
+  warp_strength: F32,
+  amplitude: F32,
+}
+
+type TerrainContext is data = $TerrainContext {
+  seed: U32,
+  origin_x: F32,
+  origin_z: F32,
+  cell_size: F32,
+  frequency: F32,
+  octaves: U32,
+  ridge_weight: F32,
+  warp_strength: F32,
+  amplitude: F32,
+}
+
+func terrain_ctx_pack (spec: TerrainSpec) : #[F32] =>
+  let (seed_lo, seed_hi) = kernel.pack_u32 spec.seed
+  return #[
+    seed_lo,
+    seed_hi,
+    spec.origin_x,
+    spec.origin_z,
+    spec.cell_size,
+    spec.frequency,
+    U32.to_f32 (min 8 (max 1 spec.octaves)),
+    clamp 0.0 1.0 spec.ridge_weight,
+    max 0.0 spec.warp_strength,
+    spec.amplitude,
+  ]
+
+func terrain_prepare (wire: #[F32]) : TerrainContext =>
+  if wire.length < 10:
+    return $TerrainContext {
+      seed: 1,
+      origin_x: 0.0,
+      origin_z: 0.0,
+      cell_size: 1.0,
+      frequency: 0.05,
+      octaves: 3,
+      ridge_weight: 0.35,
+      warp_strength: 0.25,
+      amplitude: 10.0,
+    }
+  let seed = Maybe.unwrap_or 1 (kernel.unpack_u32 wire[0] wire[1])
+  let octaves = if is_finite wire[6] then min 8 (max 1 (F32.to_u32 (clamp 1.0 8.0 wire[6]))) else 3
+  return $TerrainContext {
+    seed,
+    origin_x: if is_finite wire[2] then wire[2] else 0.0,
+    origin_z: if is_finite wire[3] then wire[3] else 0.0,
+    cell_size: if is_finite wire[4] then max 0.001 wire[4] else 1.0,
+    frequency: if is_finite wire[5] then max 0.0001 wire[5] else 0.05,
+    octaves,
+    ridge_weight: if is_finite wire[7] then clamp 0.0 1.0 wire[7] else 0.35,
+    warp_strength: if is_finite wire[8] then max 0.0 wire[8] else 0.25,
+    amplitude: if is_finite wire[9] then wire[9] else 10.0,
+  }
+
+// Evaluates one grid cell `(gx, gz)` into `[height, simplex_val, worley_f1, worley_edge]`.
+func terrain_eval_cell (ctx: TerrainContext) -> (cell: #[2; F32]) : #[4; F32] =>
+  let wx = ctx.origin_x + cell[0] * ctx.cell_size
+  let wz = ctx.origin_z + cell[1] * ctx.cell_size
+  let p = $Vec2 { x: wx * ctx.frequency, y: wz * ctx.frequency }
+  let warped = pcg_noise.warp2 ctx.seed ctx.octaves ctx.warp_strength p
+  let ridged = pcg_noise.ridged2 (ctx.seed ^ 0x9e3779b9) ctx.octaves 2.0 0.5 p
+  let worley = pcg_noise.worley2 (ctx.seed ^ 0x85ebca6b) ($Vec2 { x: p.x * 1.5, y: p.y * 1.5 })
+  let blended = warped * (1.0 - ctx.ridge_weight) + (ridged * 2.0 - 1.0) * ctx.ridge_weight
+  let height = blended * ctx.amplitude
+  return #[height, warped, worley.f1, worley.edge]
+
+// ---------------------------------------------------------------- Kit 2: Spatial crowd steering
+
+type CrowdContext is data = $CrowdContext {
+  storage: points.Storage,
+  stored: points.Stored,
+  positions: #[Vec3],
+  max_force: F32,
+}
+
+// Packs `[max_force, count, x0, y0, z0, ...]` for once-per-frame spatial index preparation.
+func crowd_ctx_pack (positions: &[Vec3]) -> (max_force: F32) : #[F32] =>
+  let out: #[F32] = #[max 0.0 max_force, U32.to_f32 positions.length]
+  for i in 0 .. positions.length:
+    let p = positions[i]
+    @storage.push out p.x
+    @storage.push out p.y
+    @storage.push out p.z
+  return out
+
+func crowd_prepare (wire: #[F32]) : CrowdContext =>
+  let bounds: #[F32] = #[]
+  let order: #[U32] = #[]
+  let leaves: #[U32] = #[]
+  let storage = $points.Storage { bounds, order, leaves }
+  let max_force = if wire.length >= 1 and is_finite wire[0] then max 0.0 wire[0] else 10.0
+  let max_items = if wire.length >= 2 then (wire.length - 2) / 3 else 0
+  let count = if wire.length >= 2 and is_finite wire[1] and wire[1] >= 0.0 and wire[1] < 4294967040.0 then min max_items (F32.to_u32 wire[1]) else 0
+  let positions: #[Vec3] = #[]
+  for i in 0 .. count:
+    let x = wire[2 + i * 3]
+    let y = wire[2 + i * 3 + 1]
+    let z = wire[2 + i * 3 + 2]
+    if is_finite x and is_finite y and is_finite z:
+      @storage.push positions (math.vec3 x y z)
+  let (stored, next_storage) = points.build_into storage positions
+  return $CrowdContext { storage: next_storage, stored, positions, max_force }
+
+// Queries `[px, py, pz, radius]` against the prepared point BVH, returning
+// `[nearest_idx_or_neg1, sep_x, sep_y, sep_z]` with inverse-square separation clamped to `max_force`.
+func crowd_steer_agent (ctx: CrowdContext) -> (agent: #[4; F32]) : #[4; F32] =>
+  let pos = math.vec3 agent[0] agent[1] agent[2]
+  let radius = max 0.0 agent[3]
+  let index = points.read ctx.storage ctx.stored
+  let nearest_idx = case points.nearest index pos of
+    $Some idx => U32.to_f32 idx
+    $Nothing => (-1.0)
+  let r2 = radius * radius
+  let sx = 0.0
+  let sy = 0.0
+  let sz = 0.0
+  if radius > 0.0 and ctx.positions.length > 0:
+    let hits: #[U32] = #[]
+    let found = points.within_into index pos radius hits
+    for k in 0 .. found.length:
+      let other = ctx.positions[found[k]]
+      let dx = pos.x - other.x
+      let dy = pos.y - other.y
+      let dz = pos.z - other.z
+      let d2 = dx * dx + dy * dy + dz * dz
+      if d2 > 0.000001 and d2 < r2:
+        let inv = 1.0 / d2
+        sx := self + dx * inv
+        sy := self + dy * inv
+        sz := self + dz * inv
+  let mag = sqrt (sx * sx + sy * sy + sz * sz)
+  if mag > ctx.max_force and mag > 0.000001:
+    let scale = ctx.max_force / mag
+    sx := self * scale
+    sy := self * scale
+    sz := self * scale
+  return #[nearest_idx, sx, sy, sz]
+
+// ---------------------------------------------------------------- Kit 3: Heightfield sampling & normals
+
+type HeightfieldContext is data = $HeightfieldContext {
+  width: U32,
+  depth: U32,
+  cell_size: F32,
+  origin_x: F32,
+  origin_z: F32,
+  heights: #[F32],
+}
+
+// Packs `[width, depth, cell_size, origin_x, origin_z, h0, h1, ...]`.
+func heightfield_ctx_pack (width: U32) -> (depth: U32) -> (cell_size: F32) -> (origin_x: F32) -> (origin_z: F32) -> (heights: &[F32]) : #[F32] =>
+  let cs = if is_finite cell_size then max 0.001 cell_size else 1.0
+  let ox = if is_finite origin_x then origin_x else 0.0
+  let oz = if is_finite origin_z then origin_z else 0.0
+  if width == 0 or depth == 0 or depth > 4194304 / width:
+    return #[1.0, 1.0, cs, ox, oz, 0.0]
+  let total = width * depth
+  let out = @array.fill (5 + total) 0.0
+  out[0] := U32.to_f32 width
+  out[1] := U32.to_f32 depth
+  out[2] := cs
+  out[3] := ox
+  out[4] := oz
+  for i in 0 .. total:
+    let h = if i < heights.length and is_finite heights[i] then heights[i] else 0.0
+    out[5 + i] := h
+  return out
+
+func heightfield_prepare (wire: #[F32]) : HeightfieldContext =>
+  if wire.length < 5:
+    return $HeightfieldContext { width: 1, depth: 1, cell_size: 1.0, origin_x: 0.0, origin_z: 0.0, heights: #[0.0] }
+  let w = if is_finite wire[0] and wire[0] >= 1.0 and wire[0] <= 65535.0 then F32.to_u32 wire[0] else 1
+  let d = if is_finite wire[1] and wire[1] >= 1.0 and wire[1] <= 65535.0 then F32.to_u32 wire[1] else 1
+  let cell_size = if is_finite wire[2] then max 0.001 wire[2] else 1.0
+  let avail = wire.length - 5
+  let total = if d > 4294967295 / w then avail else min (w * d) avail
+  let heights = spark #[if is_finite wire[5 + i] then wire[5 + i] else 0.0 | i <- 0 .. total]
+  return $HeightfieldContext {
+    width: w,
+    depth: d,
+    cell_size,
+    origin_x: if is_finite wire[3] then wire[3] else 0.0,
+    origin_z: if is_finite wire[4] then wire[4] else 0.0,
+    heights,
+  }
+
+private func hf_at (ctx: HeightfieldContext) -> (gx: U32) -> (gz: U32) : F32 =>
+  if ctx.width == 0 or ctx.depth == 0:
+    return 0.0
+  let cx = min (ctx.width - 1) gx
+  let cz = min (ctx.depth - 1) gz
+  if cz > 4294967295 / ctx.width:
+    return 0.0
+  let row = cz * ctx.width
+  if cx > 4294967295 - row:
+    return 0.0
+  let idx = row + cx
+  return if idx < ctx.heights.length then ctx.heights[idx] else 0.0
+
+private func safe_lerp_f32 (a: F32) -> (b: F32) -> (t: F32) : F32 =>
+  let diff = b - a
+  if is_finite diff:
+    return a + diff * t
+  return a * (1.0 - t) + b * t
+
+// Bilinearly samples height and central-difference unit surface normal at world `(x, z)`,
+// returning `[height, nx, ny, nz]`.
+func heightfield_sample_query (ctx: HeightfieldContext) -> (world_xz: #[2; F32]) : #[4; F32] =>
+  if ctx.width == 0 or ctx.depth == 0 or not (is_finite ctx.cell_size and ctx.cell_size > 0.0 and is_finite ctx.origin_x and is_finite ctx.origin_z and is_finite world_xz[0] and is_finite world_xz[1]):
+    return #[0.0, 0.0, 1.0, 0.0]
+  let inv = 1.0 / ctx.cell_size
+  let rx = (world_xz[0] - ctx.origin_x) * inv
+  let rz = (world_xz[1] - ctx.origin_z) * inv
+  if not (is_finite rx and is_finite rz):
+    return #[0.0, 0.0, 1.0, 0.0]
+  let max_x = min 4294967040.0 (U32.to_f32 (ctx.width - 1))
+  let max_z = min 4294967040.0 (U32.to_f32 (ctx.depth - 1))
+  let fx = clamp 0.0 max_x rx
+  let fz = clamp 0.0 max_z rz
+  let x0 = min (ctx.width - 1) (F32.to_u32 (floor fx))
+  let z0 = min (ctx.depth - 1) (F32.to_u32 (floor fz))
+  let x1 = min (ctx.width - 1) (x0 + 1)
+  let z1 = min (ctx.depth - 1) (z0 + 1)
+  let tx = fx - U32.to_f32 x0
+  let tz = fz - U32.to_f32 z0
+  let h00 = hf_at ctx x0 z0
+  let h10 = hf_at ctx x1 z0
+  let h01 = hf_at ctx x0 z1
+  let h11 = hf_at ctx x1 z1
+  let h0 = safe_lerp_f32 h00 h10 tx
+  let h1 = safe_lerp_f32 h01 h11 tx
+  let height = safe_lerp_f32 h0 h1 tz
+  let xl = if x0 > 0 then x0 - 1 else 0
+  let xr = min (ctx.width - 1) (x0 + 1)
+  let zd = if z0 > 0 then z0 - 1 else 0
+  let zu = min (ctx.depth - 1) (z0 + 1)
+  let dx_span = max 1.0 (U32.to_f32 (xr - xl)) * ctx.cell_size
+  let dz_span = max 1.0 (U32.to_f32 (zu - zd)) * ctx.cell_size
+  let hx_r = hf_at ctx xr z0
+  let hx_l = hf_at ctx xl z0
+  let hz_u = hf_at ctx x0 zu
+  let hz_d = hf_at ctx x0 zd
+  let dx_diff = hx_r - hx_l
+  let dz_diff = hz_u - hz_d
+  let dhdx = if is_finite dx_diff then dx_diff / dx_span else hx_r / dx_span - hx_l / dx_span
+  let dhdz = if is_finite dz_diff then dz_diff / dz_span else hz_u / dz_span - hz_d / dz_span
+  let n = if is_finite dhdx and is_finite dhdz then Maybe.unwrap_or math.up (math.normalize3 (math.vec3 (0.0 - dhdx) 1.0 (0.0 - dhdz))) else math.up
+  return #[if is_finite height then height else 0.0, n.x, n.y, n.z]

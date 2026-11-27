@@ -1,10 +1,10 @@
 //! An f64 reference for `ink/render/shadow`: cascaded sun shadows fitted to a camera.
 //!
-//! The reference rebuilds a case from its lanes (see `tests/shadow_support.blot`:
+//! The reference rebuilds a case from its lanes (see `tests/shadow_support.sq`:
 //! pose, lens, light direction and plan), slices the camera's view at the
 //! practical splits, finds each slice's smallest enclosing sphere by searching
 //! the view axis rather than by the library's closed form, and snaps windows to
-//! whole texels of the light's view. It then compares what Blot returns.
+//! whole texels of the light's view. It then compares what Squid returns.
 use crate::render_math::splits;
 use crate::*;
 
@@ -241,7 +241,7 @@ fn ndc(view: &[f64], window: &[f64], p: V3) -> V3 {
     [c[0] / c[3], c[1] / c[3], c[2] / c[3]]
 }
 
-/// Checks Blot's fit of a case against the reference. `view` holds the light's
+/// Checks Squid's fit of a case against the reference. `view` holds the light's
 /// view lanes and `rows` each cascade's 18 lanes: projection, texel, far.
 /// Returns the worst overshoot of any slice corner beyond its window.
 #[cfg(test)]
@@ -310,7 +310,7 @@ pub fn check_fit(case: &Case, view: &[f64], rows: &[f64]) -> f64 {
         // The depth range reaches 60 beyond the sphere's own radius.
         let low = c.depth - radius - 60.;
         near(row[14], -low * scale, 2e-5);
-        // Every corner of the slice, through Blot's own matrices.
+        // Every corner of the slice, through Squid's own matrices.
         for corner in case.corners(near_depth, far_depth) {
             let n = ndc(view, &row[..16], corner);
             worst = worst
@@ -372,7 +372,7 @@ fn random_case(r: &mut Random) -> Vec<f64> {
 
 #[test]
 fn cascades_match_the_f64_reference_and_hold_every_slice_corner() {
-    let mut f = Fixture::new("tests/render-math.blot");
+    let mut f = Fixture::new("tests/render-math.sq");
     let mut r = Random(0x5eed_1234);
     let mut cascades = 0;
     let mut worst = f64::MIN;
@@ -387,7 +387,7 @@ fn cascades_match_the_f64_reference_and_hold_every_slice_corner() {
         assert_eq!(out.len(), 16 + 18 * case.count, "{lanes:?}");
         worst = worst.max(check_fit(&case, &out[..16], &out[16..]));
         cascades += case.count;
-        // The worst overshoot Blot sees itself agrees.
+        // The worst overshoot Squid sees itself agrees.
         let reach = f.floats("cascade_reach", lanes);
         assert_eq!(reach[1] as usize, case.count);
         assert!(reach[0] <= 1e-5, "{reach:?}");
@@ -400,7 +400,7 @@ fn cascades_match_the_f64_reference_and_hold_every_slice_corner() {
 
 #[test]
 fn a_known_orthographic_slice_has_the_hand_computed_window() {
-    let mut f = Fixture::new("tests/render-math.blot");
+    let mut f = Fixture::new("tests/render-math.sq");
     // A camera at the origin looking down -Z through a 6 by 6 box from depth 1
     // to 4.1, under a light shining along -Z. The slice's corners lie 3 and 3
     // from its axis, so the smallest sphere has radius sqrt(18 + 1.55^2) at
@@ -438,7 +438,7 @@ fn a_known_orthographic_slice_has_the_hand_computed_window() {
 
 #[test]
 fn windows_move_only_in_whole_texels_and_radius_ignores_pose() {
-    let mut f = Fixture::new("tests/render-math.blot");
+    let mut f = Fixture::new("tests/render-math.sq");
     let mut r = Random(0xc0ffee11);
     let mut moved = 0;
     for _ in 0..120 {

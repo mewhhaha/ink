@@ -1,0 +1,314 @@
+//! The host's simulation services, which every host answers with the same
+//! bits (pen's pen-simulation crate; protocol.sq's PhysicsOperation,
+//! ColliderShape, NavmeshOperation, SpatialOperation and NoiseOperation lay
+//! the numbers out): rigid-body physics, paths over a navmesh, ray and shape
+//! queries against colliders, and noise and heightfields.
+//!
+//! A request carries the whole problem: the game keeps its bodies,
+//! colliders and areas in its own state and sends them each time, so after
+//! a rewind or reload it asks the same and is answered the same. Each
+//! request below is made through ink/services' `ask` and gives its id; the
+//! readers turn the answer `services.take` gives back into records.
+//!
+//! Optional Pen adapter: all game state, timing and request policy are caller-owned.
+//!
+//! Key items: [`Shape`], [`Collider`], [`Body`], [`Motion`], [`ball`].
+
+import * as array from "std/array"
+import { Vec2, Vec3 } from "std/vector"
+import * as math from "../math"
+import * as protocol from "pen/protocol"
+import * as requests from "../services"
+
+// A collider's shape: its kind (protocol.collider_shape_*), its size and its
+// values (a hull's points, the heights, a mesh), as ColliderShape says.
+type Shape is data = $Shape { kind: U32, size: Vec3, values: #[F32] }
+
+func ball (radius: F32) => $Shape { kind: protocol.collider_shape_ball, size: math.vec3 radius 0.0 0.0, values: #[] }
+
+// A box of half extents `half`.
+func cuboid (half: Vec3) => $Shape { kind: protocol.collider_shape_cuboid, size: half, values: #[] }
+
+// Round-ended, upright along its y axis: `radius` round a segment `half`
+// metres each way.
+func capsule (radius: F32) => func (half: F32) => return
+  $Shape { kind: protocol.collider_shape_capsule, size: math.vec3 radius half 0.0, values: #[] }
+
+func cylinder (radius: F32) => func (half: F32) => return
+  $Shape { kind: protocol.collider_shape_cylinder, size: math.vec3 radius half 0.0, values: #[] }
+
+func vector_values points => array.generate (points.length * 3) (func i => if i % 3 == 0 then points[i / 3].x else if i % 3 == 1 then points[i / 3].y else points[i / 3].z)
+func append_values values -> (destination: own #[F32]) : #[F32] =>
+  for value in values:
+    @storage.push destination value
+  return destination
+
+func convex points =>
+  let payload: #[F32] = #[]
+  for point in points:
+    @storage.push payload point.x
+    @storage.push payload point.y
+    @storage.push payload point.z
+  return $Shape {kind: protocol.collider_shape_convex, size: math.vec3 (U32.to_f32 points.length) 0.0 0.0, values: payload}
+
+func heightfield (columns: U32) => func (rows: U32) => func (spacing: F32) => func (heights: &[F32]) => $Shape {
+  kind: protocol.collider_shape_heightfield, size: math.vec3 (U32.to_f32 columns) (U32.to_f32 rows) spacing,
+  values: array.generate heights.length (func i => heights[i]),
+}
+
+// Triangles over `vertices`, three indices each.
+func trimesh vertices -> corners =>
+  let payload: #[F32] = #[]
+  for point in vertices:
+    @storage.push payload point.x
+    @storage.push payload point.y
+    @storage.push payload point.z
+  for corner in corners:
+    @storage.push payload (U32.to_f32 corner)
+  return $Shape {kind: protocol.collider_shape_trimesh,
+    size: math.vec3 (U32.to_f32 vertices.length) (U32.to_f32 (corners.length / 3)) 0.0,
+    values: payload}
+
+type Collider is data = $Collider { shape: Shape, position: Vec3, rotation: math.Quat }
+
+func place (shape: own Shape) -> (position: Vec3) => $Collider { shape, position, rotation: math.identity_quat }
+
+// A collider's record: its shape's kind and size, position and rotation.
+func record (collider: Collider) =>
+  let size = collider.shape.size
+  let at = collider.position
+  let turn = collider.rotation
+  return #[U32.to_f32 collider.shape.kind, size.x, size.y, size.z, at.x, at.y, at.z, turn.x, turn.y, turn.z, turn.w]
+
+func collider_values colliders : #[F32] =>
+  let output: #[F32] = #[]
+  for collider in colliders:
+    output := append_values (record collider) self
+    output := append_values collider.shape.values self
+  return output
+
+type Body is data = $Body {
+  kind: U32, collider: Collider, velocity: Vec3, spin: Vec3, friction: F32, restitution: F32, density: F32,
+}
+
+// A body at rest, with friction 0.5, no bounce and the density of water.
+func body (kind: U32) -> (collider: own Collider) => $Body {
+  kind, collider, velocity: math.zero3, spin: math.zero3, friction: 0.5, restitution: 0.0, density: 1.0,
+}
+
+func body_values (moving: Body) : #[F32] =>
+  let v = moving.velocity
+  let w = moving.spin
+  let output: #[F32] = #[]
+  output := append_values #[U32.to_f32 moving.kind] self
+  output := append_values (record moving.collider) self
+  output := append_values #[v.x, v.y, v.z, w.x, w.y, w.z, moving.friction, moving.restitution, moving.density] self
+  output := append_values moving.collider.shape.values self
+  return output
+
+func bodies_values bodies : #[F32] =>
+  let output: #[F32] = #[]
+  for moving in bodies:
+    output := append_values (body_values moving) self
+  return output
+
+// Steps the bodies `steps` times, `seconds` apart, with `gravity` along y
+// (-9.81 on Earth).
+func step (service_state: own requests.Services) -> (bodies: #[Body]) -> (steps: U32) -> (seconds: F32) -> (gravity: F32) : (U32, requests.Services) => return
+  requests.ask service_state protocol.service_physics protocol.physics_op_step (U32.to_f32 steps) seconds gravity 0.0
+    (bodies_values bodies)
+
+// Where a body went: the answer's 13 numbers for it.
+type Motion is data = $Motion { position: Vec3, rotation: math.Quat, velocity: Vec3, spin: Vec3 }
+
+const motion_lanes = 13
+
+func motion_at values -> (at: U32) : Motion =>
+  let read: U32 -> F32 = values.at
+  return $Motion {
+    position: math.vec3 (read at) (read (at + 1)) (read (at + 2)),
+    rotation: $math.Quat { x: (read (at + 3)), y: (read (at + 4)), z: (read (at + 5)), w: (read (at + 6)) },
+    velocity: math.vec3 (read (at + 7)) (read (at + 8)) (read (at + 9)),
+    spin: math.vec3 (read (at + 10)) (read (at + 11)) (read (at + 12)),
+  }
+
+
+private func safe_u32 (v: F32) : U32 =>
+  if is_finite v and v >= 0.0 and v < 4294967040.0 then F32.to_u32 v else 0
+
+private func all_finite_span (values: &[F32]) -> (start: U32) -> (count: U32) : Bool =>
+  if start > values.length or count > values.length - start:
+    return false
+  for i in 0 .. count:
+    if not (is_finite (values.at (start + i))):
+      return false
+  return true
+
+// The motions of the `count` bodies stepped, in the order they were sent;
+// none when the answer has fewer or contains non-finite lanes.
+func motions service_state -> (count: U32) -> (found: requests.Answer) : #[Motion] =>
+  let values = requests.values service_state found.values
+  if count > 4294967295 / motion_lanes or not (all_finite_span values 0 (count * motion_lanes)):
+    return #[]
+  return array.generate count (func (index: U32) => motion_at values (index * motion_lanes))
+
+// The bodies moved as the answer says.
+func moved service_state -> (bodies: own #[Body]) -> (found: requests.Answer) =>
+  let went = motions service_state bodies.length found
+  if went.length != bodies.length:
+    return bodies
+  for index in 0 .. bodies.length:
+    let after = went[index]
+    bodies[index].collider.position := after.position
+    bodies[index].collider.rotation := after.rotation
+    bodies[index].velocity := after.velocity
+    bodies[index].spin := after.spin
+  return bodies
+
+// Two bodies touching after the step: their indices (the lower first), the
+// deepest point, the normal from the first to the second, and how far apart
+// they are (negative while they overlap).
+type Contact is data = $Contact { first: U32, second: U32, point: Vec3, normal: Vec3, distance: F32 }
+
+const contact_lanes = 9
+
+// The contacts after the `count` bodies' motions.
+func contacts service_state -> (count: U32) -> (found: requests.Answer) : #[Contact] =>
+  let values = requests.values service_state found.values
+  if count > 4294967295 / motion_lanes or not (is_finite found.value) or found.value < 0.0 or found.value >= 4294967040.0:
+    return #[]
+  let start = count * motion_lanes
+  let touching = F32.to_u32 found.value
+  if touching > 4294967295 / contact_lanes or not (all_finite_span values start (touching * contact_lanes)):
+    return #[]
+  return array.generate touching (func (index: U32) =>
+    let at = start + index * contact_lanes
+    let values = values
+    return $Contact {
+      first: safe_u32 values[at], second: safe_u32 values[at + 1],
+      point: math.vec3 values[at + 2] values[at + 3] values[at + 4],
+      normal: math.vec3 values[at + 5] values[at + 6] values[at + 7],
+      distance: values[at + 8],
+    })
+
+// Spatial queries.
+
+// The first collider each ray meets within `reach` metres; with `solid`, a
+// ray starting inside a shape meets it at once.
+func ray_lanes (ray: math.Ray) => return
+  #[ray.origin.x, ray.origin.y, ray.origin.z, ray.direction.x, ray.direction.y, ray.direction.z]
+
+func raycast (service_state: own requests.Services) -> (colliders: #[Collider]) -> (rays: #[math.Ray]) -> (reach: F32) -> (solid: Bool) : (U32, requests.Services) =>
+  let ray_values = array.generate (rays.length * 6) (func index =>
+    let ray = rays[index / 6]
+    return case index % 6 of
+      0 => ray.origin.x
+      1 => ray.origin.y
+      2 => ray.origin.z
+      3 => ray.direction.x
+      4 => ray.direction.y
+      _ => ray.direction.z)
+  let inside = if solid then 1.0 else 0.0
+  return requests.ask service_state protocol.service_spatial protocol.spatial_op_raycast (U32.to_f32 colliders.length) reach inside 0.0
+    (array.concat (collider_values colliders) ray_values)
+
+// What a ray or point found: the collider (its index + 1, 0 for none), the
+// distance, and the surface's normal (a ray) or the closest point (a point).
+type Found is data = $Found { collider: U32, distance: F32, at: Vec3 }
+
+const found_lanes = 5
+
+// The answer's findings, one to a ray or point.
+func findings service_state => func (found: requests.Answer) =>
+  let values = requests.values service_state found.values
+  if values.length % found_lanes != 0 or not (all_finite_span values 0 values.length):
+    return #[]
+  let n = values.length / found_lanes
+  return array.generate n (func (index: U32) =>
+    let at = index * found_lanes
+    return $Found {
+      collider: safe_u32 (values.at at), distance: values.at (at + 1),
+      at: math.vec3 (values.at (at + 2)) (values.at (at + 3)) (values.at (at + 4)),
+    })
+
+// The colliders `probe` touches.
+func overlap (service_state: own requests.Services) -> (colliders: #[Collider]) -> (probe: Collider) : (U32, requests.Services) => return
+  requests.ask service_state protocol.service_spatial protocol.spatial_op_overlap (U32.to_f32 colliders.length) 0.0 0.0 0.0
+    (collider_values (array.push probe colliders))
+
+// Their indices, in order.
+func touched service_state => func (found: requests.Answer) =>
+  let values = requests.values service_state found.values
+  return #[safe_u32 index | index <- values]
+
+// The nearest collider to each point within `reach` metres.
+func nearest (service_state: own requests.Services) -> (colliders: #[Collider]) -> (points: #[Vec3]) -> (reach: F32) : (U32, requests.Services) => return
+  requests.ask service_state protocol.service_spatial protocol.spatial_op_nearest (U32.to_f32 colliders.length) reach 0.0 0.0
+    (array.concat (collider_values colliders) (vector_values points))
+
+// Navmesh paths, on the ground plane: a Vec2's x is x, its y is z.
+
+// Ground to walk on, or something in the way (protocol.navmesh_area_*).
+type Area is data = $Area { kind: U32, corners: &[Vec2] }
+
+func walkable (corners: &[Vec2]) => $Area { kind: protocol.navmesh_area_walkable, corners }
+func obstacle (corners: &[Vec2]) => $Area { kind: protocol.navmesh_area_obstacle, corners }
+
+// An area's lanes: its kind, its corner count and its corners.
+func area_lanes (area: Area) => array.generate (2 + area.corners.length * 2) (func i => return
+  if i == 0 then U32.to_f32 area.kind else if i == 1 then U32.to_f32 area.corners.length
+  else if i % 2 == 0 then area.corners[(i - 2) / 2].x else area.corners[(i - 2) / 2].y)
+
+func area_values (radius: F32) -> areas : #[F32] =>
+  let output: #[F32] = #[radius]
+  for area in areas:
+    output := append_values (area_lanes area) self
+  return output
+
+func find_way (service_state: own requests.Services) -> (areas: #[Area]) -> (radius: F32) -> (start: Vec2) -> (goal: Vec2) : (U32, requests.Services) => return
+  requests.ask service_state protocol.service_navmesh protocol.navmesh_op_find start.x start.y goal.x goal.y (area_values radius areas)
+
+// The navmesh's walkable triangles, three corners each.
+func navmesh (service_state: own requests.Services) -> (areas: #[Area]) : (U32, requests.Services) => return
+  requests.ask service_state protocol.service_navmesh protocol.navmesh_op_triangles 0.0 0.0 0.0 0.0 (area_values 0.0 areas)
+
+// The answer's points: a way from start to goal, empty when there is none,
+// or the triangles' corners.
+func navmesh_points service_state => func (found: requests.Answer) =>
+  let values = requests.values service_state found.values
+  if values.length % 2 != 0 or not (all_finite_span values 0 values.length):
+    return #[]
+  let n = values.length / 2
+  return array.generate n (func (index: U32) => return
+    $Vec2 { x: values.at (index * 2), y: values.at (index * 2 + 1) })
+
+// Noise.
+
+// Octaves of simplex noise: the seed, how many (1 to 16), the first's
+// frequency (cycles a metre), the heights' amplitude, each octave's
+// frequency over the last's and its weight over the last's, and the style
+// (protocol.noise_style_*).
+type Fractal is data = $Fractal {
+  seed: U32, octaves: U32, frequency: F32, amplitude: F32, lacunarity: F32, gain: F32, style: U32,
+}
+
+// Rolling hills: five octaves of fBm, each twice the last's frequency and
+// half its weight.
+func hills (seed: U32) => func (frequency: F32) => func (amplitude: F32) => $Fractal {
+  seed, octaves: 5, frequency, amplitude, lacunarity: 2.0, gain: 0.5, style: protocol.noise_style_fbm,
+}
+
+func fractal_values (fractal: Fractal) => return
+  #[fractal.frequency, fractal.amplitude, fractal.lacunarity, fractal.gain, U32.to_f32 fractal.style]
+
+// `columns` by `rows` heights `spacing` metres apart, from the corner
+// `corner` (its rows along +z, its columns along +x): the answer's values,
+// ready for `heightfield`.
+func terrain (service_state: own requests.Services) -> (fractal: Fractal) -> (columns: U32) -> (rows: U32) -> (corner: Vec2) -> (spacing: F32) : (U32, requests.Services) => return
+  requests.ask service_state protocol.service_noise protocol.noise_op_heightfield (U32.to_f32 columns) (U32.to_f32 rows)
+    (U32.to_f32 fractal.seed) (U32.to_f32 fractal.octaves) (array.concat (fractal_values fractal) #[corner.x, corner.y, spacing])
+
+// The heights at the points: the answer's values.
+func noise_at (service_state: own requests.Services) -> (fractal: Fractal) -> (at: #[Vec2]) : (U32, requests.Services) => return
+  requests.ask service_state protocol.service_noise protocol.noise_op_sample 0.0 0.0 (U32.to_f32 fractal.seed) (U32.to_f32 fractal.octaves)
+    (array.concat (fractal_values fractal) (array.generate (at.length * 2) (func i => if i % 2 == 0 then at[i / 2].x else at[i / 2].y)))

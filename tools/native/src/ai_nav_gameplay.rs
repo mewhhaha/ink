@@ -2,7 +2,7 @@
 //! scoring, AI perception attenuation, and gameplay attribute evaluation.
 use super::*;
 
-const FIXTURE: &str = "tests/ai_nav_reference.blot";
+const FIXTURE: &str = "tests/ai_nav_reference.sq";
 
 #[test]
 fn utility_curves_and_compensation_match_f64_reference() {

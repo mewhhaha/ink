@@ -1,5 +1,5 @@
 //! A Rust port of RVO2's `Agent::computeNewVelocity` and its linear programs,
-//! used as an independent reference for `lib/ai/avoidance.blot`, plus direct
+//! used as an independent reference for `lib/ai/avoidance.sq`, plus direct
 //! half-plane checks, a circle-swap simulation and adversarial inputs.
 use super::*;
 
@@ -529,7 +529,7 @@ fn lines_of(out: &[f64]) -> Vec<Line> {
 
 #[test]
 fn orca_matches_rvo2_port_and_satisfies_constraints() {
-    let mut f = Fixture::new("tests/avoidance.blot");
+    let mut f = Fixture::new("tests/avoidance.sq");
     let (mut relaxed, mut obstacle_lines, mut compared) = (0, 0, 0);
     for seed in 1..=120u32 {
         let mut r = Random(seed);
@@ -615,7 +615,7 @@ fn orca_matches_rvo2_port_and_satisfies_constraints() {
 }
 #[test]
 fn agents_swapping_places_on_a_circle_do_not_collide() {
-    let mut f = Fixture::new("tests/avoidance.blot");
+    let mut f = Fixture::new("tests/avoidance.sq");
     for (count, ring, horizon) in [
         (2, 3.0, 6.0),
         (4, 8.0, 5.0),
@@ -680,7 +680,7 @@ fn agent(x: f32, y: f32, vx: f32, vy: f32) -> Agent {
 }
 #[test]
 fn orca_adversarial_inputs() {
-    let mut f = Fixture::new("tests/avoidance.blot");
+    let mut f = Fixture::new("tests/avoidance.sq");
     // Lone agent: preferred velocity, clamped to the speed limit.
     let out = simple(
         &mut f,

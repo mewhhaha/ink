@@ -38,7 +38,7 @@ fn follow(f: &mut Fixture, r: Vec<f64>, dt: f64, steps: &[[f64; 7]]) -> Vec<Vec<
 }
 #[test]
 fn look_at_degenerate_axes_and_exponential_turning() {
-    let mut f = Fixture::new("tests/rig.blot");
+    let mut f = Fixture::new("tests/rig.sq");
     near_all(
         &f.floats("look", [0., 0., 0., 0., 0., -5., 0., 1., 0.])[3..7],
         &[0., 0., 0., 1.],
@@ -79,7 +79,7 @@ fn look_at_degenerate_axes_and_exponential_turning() {
 }
 #[test]
 fn followers_dead_zones_lookahead_and_turning() {
-    let mut f = Fixture::new("tests/rig.blot");
+    let mut f = Fixture::new("tests/rig.sq");
     let states = follow(
         &mut f,
         rules(1., 0., 0., 6.),
@@ -153,7 +153,7 @@ fn followers_dead_zones_lookahead_and_turning() {
 }
 #[test]
 fn followers_agree_across_frame_rates_and_reject_invalid_settings() {
-    let mut f = Fixture::new("tests/rig.blot");
+    let mut f = Fixture::new("tests/rig.sq");
     let mut last = Vec::new();
     for rate in [30, 120] {
         let steps = (0..=2 * rate)
@@ -222,7 +222,7 @@ fn framed(f: &mut Fixture, points: &[V], padding: f64, aspect: f64) -> Vec<f64> 
 }
 #[test]
 fn framing_fits_tightly_padding_and_impossible_views() {
-    let mut f = Fixture::new("tests/rig.blot");
+    let mut f = Fixture::new("tests/rig.sq");
     let cluster = [
         [0., 0., 0.],
         [3., 1., -2.],
@@ -280,7 +280,7 @@ fn framing_fits_tightly_padding_and_impossible_views() {
 }
 #[test]
 fn camera_collision_and_spline_dolly() {
-    let mut f = Fixture::new("tests/rig.blot");
+    let mut f = Fixture::new("tests/rig.sq");
     assert_eq!(
         f.floats("collision", [0., 0., 0., 0., 0.5, 4., 0.3, 0.]),
         vec![0., 0.5, 4.]

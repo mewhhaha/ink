@@ -51,11 +51,11 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
         assert_eq!(files[path], format!("{:x}", Sha256::digest(&copy)));
     }
     let settings =
-        json!({"std":root().join("../blot2/std"),"imports":{"kit/":package_root.join("lib")}});
+        json!({"std":root().join("../squid-lang/std"),"imports":{"kit/":package_root.join("lib")}});
     let examples: Vec<_> = expected
         .iter()
         .filter(|relative| {
-            relative.starts_with("examples") && relative.extension() == Some("blot".as_ref())
+            relative.starts_with("examples") && relative.extension() == Some("sq".as_ref())
         })
         .map(|relative| {
             let path = package_root.join(relative);
@@ -83,7 +83,7 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
         ("rollback", "two_peers", 40.),
         ("showcase_editor", "edit_and_play", 0.5),
     ] {
-        let path = package_root.join(format!("examples/{file}.blot"));
+        let path = package_root.join(format!("examples/{file}.sq"));
         let mut compiler = plugins()
             .compiler_with_settings(&path, Some(&settings))
             .unwrap();
@@ -147,7 +147,7 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
             p.to_str()
                 .unwrap()
                 .strip_prefix("lib/")
-                .map(|p| p.trim_end_matches(".blot").to_owned())
+                .map(|p| p.trim_end_matches(".sq").to_owned())
         })
         .collect();
     let measured: std::collections::BTreeSet<_> = crate::workloads::workloads()
@@ -158,7 +158,7 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
     let library = root().join("lib").canonicalize().unwrap();
     let imports = Regex::new(r#"\b(?:from|import)\s*(?:\(\s*)?["']([^"']+)["']"#).unwrap();
     for module in &modules {
-        let file = library.join(format!("{module}.blot"));
+        let file = library.join(format!("{module}.sq"));
         let source = std::fs::read_to_string(&file).unwrap();
         let code: String = source
             .lines()
@@ -177,7 +177,7 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
             let dependency = file
                 .parent()
                 .unwrap()
-                .join(format!("{path}.blot"))
+                .join(format!("{path}.sq"))
                 .canonicalize()
                 .unwrap();
             assert!(
@@ -191,13 +191,13 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
         assert!(readme.contains(&format!("ink/{m}")), "undocumented {m}");
     }
     let links = Regex::new(r"\[[^\]]+\]\(([^)]+)\)").unwrap();
-    let fences = Regex::new(r"(?m)^```blot\n([\s\S]*?)^```").unwrap();
+    let fences = Regex::new(r"(?m)^```squid\n([\s\S]*?)^```").unwrap();
     let names = Regex::new(r#"["'`]ink/([a-z0-9_/]+)"#).unwrap();
     let mut examples = 0;
     for doc in [
         "README.md",
         "docs/architecture.md",
-        "docs/blot.md",
+        "docs/squid.md",
         "docs/shaders.md",
     ] {
         let path = root().join(doc);
@@ -224,7 +224,7 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
         for fence in fences.captures_iter(&source) {
             examples += 1;
             let code = &fence[1];
-            let path = root().join(format!("tests/documented_{examples}.blot"));
+            let path = root().join(format!("tests/documented_{examples}.sq"));
             let mut f = Fixture::from_module(&compiled(
                 path.to_str().unwrap(),
                 &[Overlay {

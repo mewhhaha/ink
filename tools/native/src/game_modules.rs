@@ -43,7 +43,7 @@ pub fn spring(x: f64, v: f64, target: f64, w: f64, z: f64, dt: f64) -> [f64; 2] 
 }
 #[test]
 fn camera_projection_matrix_picking_roundtrips_and_frustum() {
-    let mut f = Fixture::new("tests/game_modules.blot");
+    let mut f = Fixture::new("tests/game_modules.sq");
     for ortho in [false, true] {
         for reversed in [false, true] {
             for local in [[0., 0., -0.2], [0.5, -0.4, -4.], [0., 0., -200.]] {
@@ -129,7 +129,7 @@ fn camera_projection_matrix_picking_roundtrips_and_frustum() {
 }
 #[test]
 fn analytic_springs_and_seeded_ballistic_particles() {
-    let mut f = Fixture::new("tests/game_modules.blot");
+    let mut f = Fixture::new("tests/game_modules.sq");
     for damping in [0., 0.3, 0.99, 1., 1.01, 2., 10.] {
         for dt in [0.001, 0.2, 2.] {
             let full = f.floats("spring_probe", [3., -2., 1., 5., damping, dt, 0.3]);
@@ -182,7 +182,7 @@ fn analytic_springs_and_seeded_ballistic_particles() {
 }
 #[test]
 fn animation_masks_loop_motion_and_ordered_crossings() {
-    let mut f = Fixture::new("tests/game_modules.blot");
+    let mut f = Fixture::new("tests/game_modules.sq");
     let r = f.floats("animation_probe", [0.8, 2.2, 1.]);
     near_all(&r[..3], &[2., 1., 2.], 2e-5);
     near(r[3], 1. + 2. * 0.1f64.cos(), 0.002);
@@ -220,7 +220,7 @@ fn candidate(x: i32, z: i32) -> (u32, [f64; 2]) {
 }
 #[test]
 fn placement_matches_independent_candidates_across_chunk_seams() {
-    let mut f = Fixture::new("tests/game_modules.blot");
+    let mut f = Fixture::new("tests/game_modules.sq");
     let full = f.floats("placement_probe", [123., 1., 1.2, -4., -3., 8., 6.]);
     let chunks = [
         f.floats("placement_probe", [123., 1., 1.2, 0., -3., 4., 6.]),
@@ -272,7 +272,7 @@ fn placement_matches_independent_candidates_across_chunk_seams() {
 }
 #[test]
 fn debug_geometry_sprite_winding_billboards_and_bounded_workloads() {
-    let mut f = Fixture::new("tests/game_modules.blot");
+    let mut f = Fixture::new("tests/game_modules.sq");
     for (name, expected) in [
         ("debug_probe", vec![12., 52., 168., 1., 0.5, 0., 1.]),
         ("edge_probe", vec![1., 4., 2., 3., 7., 0.]),
@@ -360,7 +360,7 @@ fn debug_geometry_sprite_winding_billboards_and_bounded_workloads() {
 }
 #[test]
 fn bounded_compiler_probes_and_library_examples() {
-    let mut f = Fixture::new("tools/compiler-probe.blot");
+    let mut f = Fixture::new("tools/compiler-probe.sq");
     for n in [1000, 2000] {
         for entry in ["inline_writes", "break_writes"] {
             assert_eq!(
@@ -382,11 +382,11 @@ fn bounded_compiler_probes_and_library_examples() {
             ]
         );
     }
-    let r = Fixture::new("examples/navigation.blot").floats("route", 0);
+    let r = Fixture::new("examples/navigation.sq").floats("route", 0);
     assert_eq!(&r[..2], &[7., 4.]);
     near(r[2], 0., 1e-6);
     assert!(r[3] > 0.);
-    let r = Fixture::new("examples/joints.blot").floats("pendulum", 16);
+    let r = Fixture::new("examples/joints.sq").floats("pendulum", 16);
     near(r[2], 1., 0.002);
     assert!(r[1] < 2.);
 }

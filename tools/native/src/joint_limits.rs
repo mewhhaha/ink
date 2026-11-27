@@ -228,7 +228,7 @@ fn pendulum(rot: Q, ang: V) -> (Vec<Body>, V) {
 
 #[test]
 fn cone_twist_limits_hold_under_gravity_and_spin() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let (swing_limit, low, high) = (0.5f64, -0.4f64, 0.6f64);
     let joint = Joint::new(3.0, 0, 1, [0.0; 3], [0.0, 0.5, 0.0])
         .axes([0.0, 1.0, 0.0], [0.0, 1.0, 0.0])
@@ -281,7 +281,7 @@ fn cone_twist_limits_hold_under_gravity_and_spin() {
 
 #[test]
 fn cone_wall_holds_a_sideways_load() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let joint = Joint::new(3.0, 0, 1, [0.0; 3], [0.0, 0.5, 0.0])
         .axes([0.0, 1.0, 0.0], [0.0, 1.0, 0.0])
         .swing(0.5)
@@ -297,7 +297,7 @@ fn cone_wall_holds_a_sideways_load() {
 
 #[test]
 fn hinge_angle_limits_and_motors() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     // Arm along +x from a z-axis hinge; gravity swings it down (negative angle).
     let arm = |rot_z: f64, ang: V| {
         let mut b = Body::dynamic([1.0, 2.0, 0.0]);
@@ -385,7 +385,7 @@ fn hinge_angle_limits_and_motors() {
 
 #[test]
 fn slider_limits_and_motors() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let bodies = |vx: f64| {
         let mut b = Body::dynamic([0.0, 1.0, 0.0]);
         b.lin = [vx, 0.0, 0.0];
@@ -441,7 +441,7 @@ fn slider_limits_and_motors() {
 
 #[test]
 fn fixed_joint_holds_pose() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let mut b = Body::dynamic([1.5, 2.0, 0.0]);
     b.shape = 1.0;
     b.ang = [1.0, 2.0, 0.5];
@@ -462,7 +462,7 @@ fn fixed_joint_holds_pose() {
 
 #[test]
 fn heavy_chain_keeps_every_limit_over_a_long_run() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     // Six ball joints in a chain with a heavy tip, swung from the side.
     let links = 6;
     let mut bodies = vec![Body::fixed([0.0, 4.0, 0.0])];
@@ -529,7 +529,7 @@ fn heavy_chain_keeps_every_limit_over_a_long_run() {
 
 #[test]
 fn joint_scenarios_replay_bit_identically() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let (bodies, _) = pendulum(axis_angle([0.0, 0.0, 1.0], 1.0), [1.0, 2.0, 3.0]);
     let joint = Joint::new(3.0, 0, 1, [0.0; 3], [0.0, 0.5, 0.0])
         .axes([0.0, 1.0, 0.0], [0.0, 1.0, 0.0])
@@ -553,7 +553,7 @@ fn joint_scenarios_replay_bit_identically() {
 
 #[test]
 fn invalid_joints_are_rejected_or_ignored() {
-    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut f = Fixture::new("tests/ragdoll.sq");
     let base = || {
         Joint::new(3.0, 0, 1, [0.0; 3], [0.0, 0.5, 0.0])
             .swing(0.5)

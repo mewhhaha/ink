@@ -1,7 +1,7 @@
 # Idiomatic Patterns & Performance Cookbook
 
-Short, representative recipes for writing fast, allocation-light Blot code with Ink.
-For full compiler rules and owner contracts, see [docs/blot.md](blot.md) and [docs/architecture.md](architecture.md).
+Short, representative recipes for writing fast, allocation-light Squid code with Ink.
+For full compiler rules and owner contracts, see [docs/squid.md](squid.md) and [docs/architecture.md](architecture.md).
 
 ## Contents
 
@@ -19,8 +19,8 @@ For full compiler rules and owner contracts, see [docs/blot.md](blot.md) and [do
 12. [Deterministic GGPO Rollback (`ink/net/rollback`)](#12-deterministic-ggpo-rollback-inknetrollback)
 13. [Word-Native Persistence & Comptime Record Codecs](#13-word-native-persistence--comptime-record-codecs)
 14. [Maps, Frozen Tables & Generational Handles](#14-maps-frozen-tables--generational-handles)
-15. [Blot Hot-Loop Idioms](#15-blot-hot-loop-idioms)
-16. [First-Class Tests, Expected Traps & Doctests (`std/test`, `blot doc`)](#16-first-class-tests-expected-traps--doctests-stdtest-blot-doc)
+15. [Squid Hot-Loop Idioms](#15-squid-hot-loop-idioms)
+16. [First-Class Tests, Expected Traps & Doctests (`std/test`, `squid doc`)](#16-first-class-tests-expected-traps--doctests-stdtest-squid-doc)
 
 ---
 
@@ -28,7 +28,7 @@ For full compiler rules and owner contracts, see [docs/blot.md](blot.md) and [do
 
 Keep long-lived arrays owned by the caller and pass them with `own` into `_into` functions. `@storage.truncate dst 0` keeps capacity warm so steady-state frames do zero heap allocations.
 
-```blot
+```squid
 func collect_active (flags: &[Bool]) -> (dst: own #[U32]) : #[U32] =>
   @storage.truncate dst 0
   for i in 0 .. flags.length:
@@ -43,9 +43,9 @@ func collect_active (flags: &[Bool]) -> (dst: own #[U32]) : #[U32] =>
 
 ## 2. Zero-Allocation `for ever:` Main Loops
 
-Blot rewinds per-iteration stack temporaries in `for ever:` loops only when every loop-carried word in a boxed `Access` record stays unchanged. Keep mutable scalar state inside a 1-element `#[Scalars]` slot and mutate pre-allocated arrays in place.
+Squid rewinds per-iteration stack temporaries in `for ever:` loops only when every loop-carried word in a boxed `Access` record stays unchanged. Keep mutable scalar state inside a 1-element `#[Scalars]` slot and mutate pre-allocated arrays in place.
 
-```blot
+```squid
 type WorldScalars is data = $WorldScalars { time: F32, score: U32, paused: Bool }
 type World is data = $World {
   scalars: #[WorldScalars], // 1-element slot mutated via world.scalars[0] := ...
@@ -67,7 +67,7 @@ func tick (world: own World) -> (dt: F32) : World =>
 
 Views (`&[T]`, `xs.view start end`) and access records alias live storage at zero cost; they never snapshot. Use `@storage.copy` (or a module's `copy_into`) only at explicit save/undo/rollback boundaries.
 
-```blot
+```squid
 let live: #[U32] = #[10, 20, 30]
 let snapshot = @storage.copy live       // independent checkpoint
 let window: &[U32] = &live[0..live.length] // zero-copy invocation borrow
@@ -86,7 +86,7 @@ live[0] := 99                           // snapshot[0] is still 10
 
 `Finite`, `NonZeroFinite`, and `UnitF32` lower to raw Wasm `f32` registers — validate once at the boundary, pay zero checks inside hot math.
 
-```blot
+```squid
 import * as numeric from "ink/numeric"
 
 func scale_speed (raw_dt: F32) -> (raw_mass: F32) : F32 =>
@@ -99,7 +99,7 @@ func scale_speed (raw_dt: F32) -> (raw_mass: F32) : F32 =>
 
 Static monomorphization compiles `numeric.fast_ieee` to zero extra instructions, `numeric.fallback` to an inline finite check, and `numeric.strict_trap` to an immediate panic.
 
-```blot
+```squid
 import * as numeric from "ink/numeric"
 
 func blend_ratio (policy: p) -> (a: F32) -> (b: F32) -> (v: F32) : F32 where { numeric.NanPolicy p } =>
@@ -115,7 +115,7 @@ let dev  = blend_ratio numeric.strict_trap 0.0 10.0 x
 
 Guarded calls return immediately when finite and invoke `Numeric.non_finite` only on actual NaN/Inf. Swap handlers per scope without changing simulation code.
 
-```blot
+```squid
 import * as numeric from "ink/numeric"
 
 func aim_angle (dy: F32) -> (dx: F32) : F32 ! { numeric.Numeric } =>
@@ -132,7 +132,7 @@ let (val, sites) = numeric.run_collecting fault_log (func () => aim_angle y x)
 
 Validate or repair entire records at frame, physics, or save boundaries; non-float fields (`U32`, `Bool`, `Finite`) compile away completely.
 
-```blot
+```squid
 import * as numeric from "ink/numeric"
 
 type BodyState is data = $BodyState { id: U32, pos: Vec3, vel: Vec3, rot: math.Quat }
@@ -148,7 +148,7 @@ if not (numeric.record_finite body):
 
 Check `query.is_current` against lightweight `SourceMeta` headers before building `query.source` membership masks, commit column edits in a coalesced batch via `commands.apply`, and consume sparse updates via `journal.read_into`.
 
-```blot
+```squid
 import * as ecs from "ink/ecs"
 import * as query from "ink/ecs/query"
 import * as commands from "ink/ecs/commands"
@@ -174,7 +174,7 @@ let (positions, pos_meta) = commands.apply alive positions pos_meta edits
 
 Bake static level geometry once with `physics/prepared.refresh_into`, step only moving bodies with `prepared.simulate_into`, refit dynamic scenes with explicit dirty indices via `scene.update`, and prefer boolean `scene.ray_any` for line-of-sight checks.
 
-```blot
+```squid
 import * as physics from "ink/physics"
 import * as prepared from "ink/physics/prepared"
 import * as scene from "ink/physics/scene"
@@ -199,7 +199,7 @@ let blocked = scene.ray_any fixed.scene eye dir reach mask skip_id
 
 Drive physics with `time.fixed` using an explicit catch-up cap and interpolate between the previous and current simulation poses with `transform.lerp3` for smooth rendering.
 
-```blot
+```squid
 import * as time from "ink/time"
 import * as transform from "ink/transform"
 
@@ -218,7 +218,7 @@ let display_pose = transform.lerp3 prev_pose cur_pose step.alpha
 
 Reuse one `render.FrameAccess` across frames (`render.begin_frame`), refresh only dirty draw matrices with `render/cache.update_changes`, and stream incremental GPU instance deltas with `render/retained.update_keyed`.
 
-```blot
+```squid
 import * as changes from "ink/changes"
 import * as render from "ink/render"
 import * as cache from "ink/render/cache"
@@ -236,7 +236,7 @@ let (draw_cache, draw_payload) = cache.update_changes cur_poses prev_poses appea
 
 `ink/ui/sketch` renders asset-free, Drawful-style wobbly marker UI directly onto Ink's SDF (`65008`) and 2D polyline (`65006`) extensions and generates semantic accessibility nodes automatically. Use `sketch.reuse_into` to keep its four draw/a11y arrays warm across frames.
 
-```blot
+```squid
 import * as sketch from "ink/ui/sketch"
 import * as math from "ink/math"
 
@@ -258,7 +258,7 @@ Use `sketch.finish_with_tree` instead of `finish_into` when publishing accessibi
 
 Derive node IDs from stable `(scope, local)` keys rather than draw order, and push/pop modal scopes with `tree.enter` / `tree.leave` so closing a dialog restores focus to its opener automatically.
 
-```blot
+```squid
 import * as tree from "ink/ui/tree"
 
 const scope_dialog: U32 = 4
@@ -277,7 +277,7 @@ focus := tree.leave scope_dialog self
 
 Allocate `flow.Flow` or `anyangle.Work` once per agent/crowd and amortize large Dijkstra rebuilds across frames with `flow.step_into` using a per-frame expansion budget.
 
-```blot
+```squid
 import * as flow from "ink/navigation/flow"
 import * as anyangle from "ink/navigation/anyangle"
 
@@ -299,7 +299,7 @@ let (work, res) = anyangle.search_into work nav_grid start_cell goal_cell 512 tr
 
 `ink/net/rollback` owns only input rings and confirmation tracking; your game owns `state` and the fixed-size snapshot `ring`, passing compile-known `step`, `save`, `load`, and `checksum` callbacks.
 
-```blot
+```squid
 import * as rollback from "ink/net/rollback"
 
 let (session, ok) = rollback.receive (&packet[0..packet.length]) session
@@ -316,7 +316,7 @@ Size the snapshot ring to `rollback.snapshots config` slots (`config.window + 1`
 
 Combine `#for #fields` record codecs (`ink/codec`) with `ink/persist/words` to get exact U32 IEEE-754 bit round-trips (no 24-bit F32 ID loss) and schema-versioned sections without hand-written boilerplate.
 
-```blot
+```squid
 import * as codec from "ink/codec"
 import * as words from "ink/persist/words"
 
@@ -339,7 +339,7 @@ save_buf := words.frame words.magic 1 w self
 - Use `ink/map/frozen` (`frozen.from`) for read-mostly lookup tables built once at load time (dense open addressing, stable order).
 - Use `ink/handles` (`handles.Store`) when you need opaque typed handles that reject stale generations and cross-store misuse.
 
-```blot
+```squid
 import * as handles from "ink/handles"
 
 type UnitTag is data = $UnitTag
@@ -349,9 +349,9 @@ let (maybe_h, store) = handles.insert $UnitTag (math.vec3 1.0 0.0 0.0) store
 
 ---
 
-## 15. Blot Hot-Loop Idioms
+## 15. Squid Hot-Loop Idioms
 
-Small patterns that eliminate indirect calls, extra copies, and borrow/ownership friction in hot Blot loops (full notes in [docs/blot.md](blot.md)):
+Small patterns that eliminate indirect calls, extra copies, and borrow/ownership friction in hot Squid loops (full notes in [docs/squid.md](squid.md)):
 
 | Pattern | Fast & Idiomatic | Why |
 | --- | --- | --- |
@@ -366,11 +366,11 @@ Small patterns that eliminate indirect calls, extra copies, and borrow/ownership
 
 ---
 
-## 16. First-Class Tests, Expected Traps & Doctests (`std/test`, `blot test`, `blot doc`)
+## 16. First-Class Tests, Expected Traps & Doctests (`std/test`, `squid test`, `squid doc`)
 
-Write Blot test suites using `@[test.suite]` with `test "..." :` and `test expect_trap "..." :` declarations plus `std/test` assertions. Bind pure helper calls or `.length` projections in `let` locals before `use test.*`, and return observed tuples out of `own`-taking CPS helpers before asserting.
+Write Squid test suites using `@[test.suite]` with `test "..." :` and `test expect_trap "..." :` declarations plus `std/test` assertions. Bind pure helper calls or `.length` projections in `let` locals before `use test.*`, and return observed tuples out of `own`-taking CPS helpers before asserting.
 
-```blot
+```squid
 import * as test from "std/test"
 import * as math from "ink/math"
 
@@ -385,4 +385,4 @@ test expect_trap "rejects invalid argument":
   panic "out of range"
 ```
 
-Document modules with top-of-file `//!` headers, verified intra-doc symbol links (`` [`Symbol`] ``), and runnable ```` ```blot ```` examples checked by `blot doc ink --check-links --test`. Run `blot test` standalone via `blot.json` or `pen test-blot` for Blot + Rust + headless GPU checks.
+Document modules with top-of-file `//!` headers, verified intra-doc symbol links (`` [`Symbol`] ``), and runnable ```` ```squid ```` examples checked by `squid doc ink --check-links --test`. Run `squid test` standalone via `squid.json` or `pen test-squid` for Squid + Rust + headless GPU checks.

@@ -30,7 +30,7 @@ fn lanes(field: &Field, p: [f64; 3], q: Option<[f64; 3]>, radius: f64, kind: f64
 }
 #[test]
 fn heightfield_gaps_contacts_walls_and_features() {
-    let mut f = Fixture::new("tests/heightfield.blot");
+    let mut f = Fixture::new("tests/heightfield.sq");
     let field = Field {
         origin: [10.0, 3.0, -5.0],
         grid: Some(vec![1.0; 4]),
@@ -133,7 +133,7 @@ fn heightfield_gaps_contacts_walls_and_features() {
 }
 #[test]
 fn heightfield_scene_masks_sweeps_settling_and_walking() {
-    let mut f = Fixture::new("tests/heightfield.blot");
+    let mut f = Fixture::new("tests/heightfield.sq");
     let field = Field {
         origin: [10.0, 3.0, -5.0],
         grid: Some(vec![-2.0, 2.0, -2.0, 2.0]),
@@ -242,7 +242,7 @@ fn distance(s: &[f64]) -> f64 {
 }
 #[test]
 fn joint_pendulum_spring_hinge_and_contact_stability() {
-    let mut f = Fixture::new("tests/joints.blot");
+    let mut f = Fixture::new("tests/joints.sq");
     let mut s = initial(0.0, 1.0, 2.0, 2.0, 0.0);
     let (mut drift, mut max_energy) = (0.0f64, 0.0f64);
     for _ in 0..3600 {
@@ -320,7 +320,7 @@ fn joint_pendulum_spring_hinge_and_contact_stability() {
 }
 #[test]
 fn tiles_floor_walls_heads_one_way_ladders_and_hazards() {
-    let mut f = Fixture::new("tests/tiles.blot");
+    let mut f = Fixture::new("tests/tiles.sq");
     let mut cells = vec![0.0; 40];
     cells[..8].fill(1.0);
     for (x, y, v) in [

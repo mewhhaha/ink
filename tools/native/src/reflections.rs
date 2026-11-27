@@ -124,7 +124,7 @@ fn random_probes(rng: &mut Lcg, n: usize) -> Vec<Probe> {
 
 #[test]
 fn shares_match_the_f64_reference_sum_to_the_coverage_and_never_pass_one() {
-    let mut f = Fixture::new("tests/reflections.blot");
+    let mut f = Fixture::new("tests/reflections.sq");
     let mut rng = Lcg(7);
     let mut covered = 0;
     for case in 0..120 {
@@ -159,7 +159,7 @@ fn shares_match_the_f64_reference_sum_to_the_coverage_and_never_pass_one() {
 
 #[test]
 fn a_higher_priority_takes_first_equal_ones_share_and_a_fifth_probe_is_left_out() {
-    let mut f = Fixture::new("tests/reflections.blot");
+    let mut f = Fixture::new("tests/reflections.sq");
     let b = |id, priority, x: f64| Probe {
         id,
         priority,
@@ -200,7 +200,7 @@ fn a_higher_priority_takes_first_equal_ones_share_and_a_fifth_probe_is_left_out(
 
 #[test]
 fn the_weight_fades_smoothly_from_a_face_to_the_blend_distance() {
-    let mut f = Fixture::new("tests/reflections.blot");
+    let mut f = Fixture::new("tests/reflections.sq");
     let p = Probe {
         id: 1,
         priority: 0,
@@ -222,7 +222,7 @@ fn the_weight_fades_smoothly_from_a_face_to_the_blend_distance() {
 
 #[test]
 fn a_reflected_ray_is_looked_up_where_it_leaves_the_parallax_box() {
-    let mut f = Fixture::new("tests/reflections.blot");
+    let mut f = Fixture::new("tests/reflections.sq");
     let mut rng = Lcg(11);
     for case in 0..200 {
         let position = [
@@ -287,7 +287,7 @@ fn a_reflected_ray_is_looked_up_where_it_leaves_the_parallax_box() {
 
 #[test]
 fn the_host_keeps_the_highest_priority_then_the_nearest_boxes() {
-    let mut f = Fixture::new("tests/reflections.blot");
+    let mut f = Fixture::new("tests/reflections.sq");
     let probes: Vec<Probe> = (0..10u32)
         .map(|i| Probe {
             id: i + 1,

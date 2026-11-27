@@ -3,7 +3,7 @@
 // the local volumes, the height mist's optical depth by closed form and by a
 // fine sum, the phase function, a froxel's source and the front to back
 // integration of a column. The same formulas Pen's froxel shaders are held to
-// (crates/pen-render/src/shaders/volume_*.wgsl). Blot's arithmetic is F32 and
+// (crates/pen-render/src/shaders/volume_*.wgsl). Squid's arithmetic is F32 and
 // blends `a + (b - a) t`; this one is f64 and blends `a (1 - t) + b t`, as
 // WGSL's `mix` does, so agreement is to F32's precision and not by construction.
 use crate::*;
@@ -100,7 +100,7 @@ fn random_point(rng: &mut Lcg, reach: f64) -> [f64; 3] {
 
 #[test]
 fn value_noise_and_its_fractal_sum_match_the_f64_reference() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(3);
     let (mut least, mut most) = (1.0f64, -1.0f64);
     for case in 0..600 {
@@ -133,7 +133,7 @@ fn value_noise_and_its_fractal_sum_match_the_f64_reference() {
 
 #[test]
 fn value_noise_at_a_lattice_point_is_its_hashed_corner_and_the_wrap_is_that_of_u32() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     for (seed, x, y, z) in [
         (0u32, 0i32, 0i32, 0i32),
         (7, 2, 3, 5),
@@ -164,7 +164,7 @@ fn value_noise_at_a_lattice_point_is_its_hashed_corner_and_the_wrap_is_that_of_u
 
 #[test]
 fn the_fractal_sum_has_no_mean_over_many_points() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(21);
     let (mut sum, mut sum_squares) = (0.0, 0.0);
     let n = 3000;
@@ -197,7 +197,7 @@ fn boundary(distance: f64, slices: f64, depth: f64) -> f64 {
 
 #[test]
 fn slicing_matches_the_f64_reference_round_trips_and_ends_at_the_reach() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(5);
     for case in 0..120 {
         let distance = rng.between(1.0, 600.0);
@@ -268,7 +268,7 @@ fn slicing_matches_the_f64_reference_round_trips_and_ends_at_the_reach() {
 
 #[test]
 fn a_slices_centre_and_length_along_a_slanted_ray_match_the_f64_reference() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(8);
     for case in 0..100 {
         let distance = rng.between(5.0, 400.0);
@@ -451,7 +451,7 @@ fn random_volume(rng: &mut Lcg, near: [f64; 3]) -> Volume {
 
 #[test]
 fn the_medium_matches_the_f64_reference_for_mist_noise_and_local_volumes() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(13);
     let (mut inside, mut noisy, mut cleared, mut soft) = (0, 0, 0, 0);
     for case in 0..500 {
@@ -494,7 +494,7 @@ fn the_medium_matches_the_f64_reference_for_mist_noise_and_local_volumes() {
 
 #[test]
 fn a_volume_is_bounded_by_its_box_or_its_ellipsoid_and_adds_to_the_mist() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let fog = Fog {
         radius: 0.0,
         density: 0.0,
@@ -573,7 +573,7 @@ fn height_sum(density: f64, height: f64, a: [f64; 3], b: [f64; 3]) -> f64 {
 
 #[test]
 fn the_height_mists_optical_depth_is_its_closed_form_and_its_fine_sum() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(17);
     for case in 0..300 {
         let density = rng.between(0.01, 2.0);
@@ -634,7 +634,7 @@ fn phase_scaled(g: f64, c: f64) -> f64 {
 
 #[test]
 fn the_phase_function_matches_the_f64_reference_and_the_normalised_one_integrates_to_one() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(19);
     for case in 0..300 {
         let (g, c) = (rng.between(-1.2, 1.2), rng.between(-1.0, 1.0));
@@ -672,7 +672,7 @@ fn the_phase_function_matches_the_f64_reference_and_the_normalised_one_integrate
 
 #[test]
 fn a_froxels_source_matches_the_f64_formula() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(23);
     for case in 0..200 {
         let g = rng.between(-0.95, 0.95);
@@ -764,7 +764,7 @@ fn random_slices(rng: &mut Lcg, n: usize) -> Vec<([f64; 3], f64, f64)> {
 
 #[test]
 fn a_column_integrates_front_to_back_as_the_f64_reference_does() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(29);
     for case in 0..200 {
         let n = 1 + (case % 64);
@@ -793,7 +793,7 @@ fn a_medium_that_is_in_equilibrium_with_its_light_never_adds_or_loses_any() {
     // Source = extinction * L everywhere, whatever the thickness: the light
     // reaching the eye plus L attenuated by the optical depth is always L, so
     // an exact integral of a slice conserves energy however thick the slice is.
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(31);
     let light = [0.25, 0.5, 2.0];
     for case in 0..200 {
@@ -824,7 +824,7 @@ fn a_medium_that_is_in_equilibrium_with_its_light_never_adds_or_loses_any() {
 
 #[test]
 fn the_histories_weight_and_blend_match_the_f64_reference() {
-    let mut f = Fixture::new("tests/volumetrics.blot");
+    let mut f = Fixture::new("tests/volumetrics.sq");
     let mut rng = Lcg(37);
     let (mut full, mut none, mut between) = (0, 0, 0);
     for case in 0..400 {
@@ -867,7 +867,7 @@ fn the_histories_weight_and_blend_match_the_f64_reference() {
 
 #[test]
 fn the_volumetrics_lane_decodes_off_low_and_high_and_traps_beyond() {
-    let mut f = Fixture::new("tests/preferences.blot");
+    let mut f = Fixture::new("tests/preferences.sq");
     for tier in [0.0, 1.0, 2.0] {
         let saved = f.floats("resaved", vec![15.0, tier]);
         assert_eq!(saved.len(), 17);

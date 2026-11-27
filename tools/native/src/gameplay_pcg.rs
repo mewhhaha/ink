@@ -2,7 +2,7 @@ use crate::Fixture;
 
 #[test]
 fn ballistics_rk4_lead_and_mesh_slice_match_f64_reference() {
-    let mut f = Fixture::new("tests/feel_physics_extra.blot");
+    let mut f = Fixture::new("tests/feel_physics_extra.sq");
     let got = f.floats("witness_ballistics_and_slice", 0u32);
     assert_eq!(got.len(), 10);
 
@@ -93,7 +93,7 @@ fn ballistics_rk4_lead_and_mesh_slice_match_f64_reference() {
 
 #[test]
 fn pcg_poisson_and_noise_invariants_hold() {
-    let mut f = Fixture::new("tests/gameplay_pcg.blot");
+    let mut f = Fixture::new("tests/gameplay_pcg.sq");
     let got = f.floats("witness_pcg_stats", 42u32);
     assert_eq!(got.len(), 8);
     assert!(got[0] >= 12.0, "poisson point count {}", got[0]);

@@ -1,0 +1,623 @@
+//! Library-owned word and F32-lane serialization traits plus `#for #fields` comptime record codecs.
+//!
+//! Key items: [`Codec`], [`LaneEncode`], [`LaneDecode`], [`Persistence`], [`encode`].
+//!
+//! ```squid
+//! type Header is data = $Header { tick: U32, seed: U32 }
+//! let words = encode_record 1 7 ($Header { tick: 12, seed: 99 })
+//! let dec: Maybe Header = decode_record 1 7 words
+//! let $Some h = dec else:
+//!   return #[]
+//! #[h.tick, h.seed] // => #[12, 99]
+//! ```
+
+import * as array from "std/array"
+import * as words from "std/codec"
+import * as simd from "std/simd"
+import { Vec2, Vec3 } from "std/vector"
+import * as lanes from "./lanes"
+import * as math from "./math"
+
+// Squid's orphan rule prevents adding a std/codec implementation for F32 from
+// Ink. This library-owned contract uses the same framing and generator, while
+// admitting Ink's finite F32 policy and caller-owned custom implementations.
+type Codec a is trait = {
+  encode: a -> #[U32],
+  decode: #[U32] -> Maybe a,
+}
+func encode (value: a): #[U32] where { Codec a } => Codec.encode value
+func unsigned_word (value: U32) => value
+func unsigned_from_word (word: U32) => $Some word
+func boolean_word (value: Bool) : U32 => if value then 1 else 0
+func boolean_from_word (word: U32) : Maybe Bool => if word <= 1 then $Some (word == 1) else $Nothing
+const U32.Codec: Codec U32 = {
+  encode: func value => #[value],
+  decode: func values => if values.length == 1 then $Some values[0] else $Nothing,
+}
+const Bool.Codec: Codec Bool = {
+  encode: func value => #[if value then 1 else 0],
+  decode: func values => if values.length == 1 and values[0] <= 1 then $Some (values[0] == 1) else $Nothing,
+}
+func frame id => func payload => words.frame id payload
+func take_field id => func payload => words.take_field id payload
+
+// IEEE-754 bits, not a numeric cast. Signed zero and subnormals round trip.
+func float_word (value: F32) =>
+  use lanes.require (is_finite value)
+  let (bits, _, _, _) = simd.f32_bits (value, 0.0, 0.0, 0.0)
+  return bits
+func float_encode (value: F32) => #[float_word value]
+func float_from_word (word: U32) : Maybe F32 =>
+  let (value, _, _, _) = simd.f32_from_bits (word, 0, 0, 0)
+  if not (is_finite value):
+    return $Nothing
+  return $Some value
+func float_decode (payload: #[U32]) : Maybe F32 =>
+  if payload.length != 1:
+    return $Nothing
+  return float_from_word payload[0]
+const F32.Codec: Codec F32 = {
+  encode: func value => float_encode value,
+  decode: func values => float_decode values,
+}
+
+func sequence_encode (values: #[a]): #[U32] where { Codec a } =>
+  let out: #[U32] = Array.with_capacity (1 + values.length * 2)
+  @storage.push out values.length
+  for value in values:
+    let payload = encode value
+    @storage.push out payload.length
+    @storage.extend out payload
+  return out
+func sequence_decode (words: #[U32]): Maybe #[a] where { Codec a } =>
+  if words.length == 0 or words[0] > words.length - 1:
+    return $Nothing
+  let count = words[0]
+  let cursor = 1
+  let output: #[a] = Array.with_capacity count
+  for ignored in 0 .. count:
+    if cursor >= words.length:
+      return $Nothing
+    let width = words[cursor]
+    cursor := self + 1
+    if width > words.length - cursor:
+      return $Nothing
+    let decoded: Maybe a = Codec.decode (@array.slice words cursor width)
+    let $Some value = decoded else:
+      return $Nothing
+    @storage.push output value
+    cursor := self + width
+  if cursor != words.length:
+    return $Nothing
+  return $Some output
+const Array.Codec: Codec #[a] where { Codec a } = {
+  encode: func values => sequence_encode values,
+  decode: func words => sequence_decode words,
+}
+
+// Adapter format 1: exact U32 count in two F32 halves, then low/high halves
+// for each word. Optional zero padding makes a bounded component fixed-width.
+func pack (capacity: U32) => func (payload: #[U32]) =>
+  let size = if capacity == 0 then payload.length else capacity
+  use lanes.require (payload.length <= size and size <= (lanes.max_integer - 2) / 2)
+  let result = @array.fill (2 + size * 2) 0.0
+  result[0] := U32.to_f32 (payload.length & 65535)
+  result[1] := U32.to_f32 (payload.length >> 16)
+  let low_mask = (65535, 65535, 65535, 65535)
+  for group in 0 .. payload.length / 4:
+    let i = group * 4
+    let words = @simd.load payload i
+    let low = @simd.u32x4.to_f32 (@simd.u32x4.bit_and words low_mask)
+    let high = @simd.u32x4.to_f32 (@simd.u32x4.shr words 16)
+    @simd.store result (2 + i * 2) (@simd.f32x4.shuffle (0, 4, 1, 5) (low, high))
+    @simd.store result (6 + i * 2) (@simd.f32x4.shuffle (2, 6, 3, 7) (low, high))
+  for i in payload.length / 4 * 4 .. payload.length:
+    let word = payload[i]
+    result[2 + i * 2] := U32.to_f32 (word & 65535)
+    result[3 + i * 2] := U32.to_f32 (word >> 16)
+  return result
+
+func unpack (capacity: U32) -> (payload: #[F32]) : Maybe (#[U32]) =>
+  return unpack_range capacity (&payload[0..payload.length])
+
+func unpack_range (capacity: U32) -> (payload: &[F32]) : Maybe (#[U32]) =>
+  let plen = payload.length
+  if plen < 2 or (plen & 1) != 0:
+    return $Nothing
+  let p0 = payload[0]
+  let p1 = payload[1]
+  if not (p0 >= 0.0 and p0 <= 65535.0 and floor p0 == p0 and p1 >= 0.0 and p1 <= 65535.0 and floor p1 == p1):
+    return $Nothing
+  let count = F32.to_u32 p0 | (F32.to_u32 p1 << 16)
+  let size = (plen - 2) / 2
+  if count > size or (capacity == 0 and count != size) or (capacity != 0 and size != capacity):
+    return $Nothing
+  let padding = 2 + count * 2
+  let padding_groups = (plen - padding) / 4
+  let zero = (0.0, 0.0, 0.0, 0.0)
+  for group in 0 .. padding_groups:
+    if not (@simd.u32x4.all_true (@simd.f32x4.eq (@simd.load payload (padding + group * 4)) zero)):
+      return $Nothing
+  for i in padding + padding_groups * 4 .. plen:
+    if payload[i] != 0.0:
+      return $Nothing
+  let result = @array.fill count 0
+  let maximum = (65535.0, 65535.0, 65535.0, 65535.0)
+  for group in 0 .. count / 4:
+    let i = group * 4
+    let a = @simd.load payload (2 + i * 2)
+    let b = @simd.load payload (6 + i * 2)
+    let range_a = @simd.u32x4.bit_and (@simd.f32x4.ge a zero) (@simd.f32x4.le a maximum)
+    let range_b = @simd.u32x4.bit_and (@simd.f32x4.ge b zero) (@simd.f32x4.le b maximum)
+    let integers = @simd.u32x4.bit_and (@simd.f32x4.eq (@simd.f32x4.floor a) a) (@simd.f32x4.eq (@simd.f32x4.floor b) b)
+    if not (@simd.u32x4.all_true (@simd.u32x4.bit_and integers (@simd.u32x4.bit_and range_a range_b))):
+      return $Nothing
+    let lo = @simd.f32x4.to_u32 (@simd.f32x4.shuffle (0, 2, 4, 6) (a, b))
+    let hi = @simd.f32x4.to_u32 (@simd.f32x4.shuffle (1, 3, 5, 7) (a, b))
+    @simd.store result i (@simd.u32x4.bit_or lo (@simd.u32x4.shl hi 16))
+  for i in count / 4 * 4 .. count:
+    let at = 2 + i * 2
+    let lo = payload[at]
+    let hi = payload[at + 1]
+    if not (lo >= 0.0 and lo <= 65535.0 and floor lo == lo and hi >= 0.0 and hi <= 65535.0 and floor hi == hi):
+      return $Nothing
+    result[i] := F32.to_u32 lo | (F32.to_u32 hi << 16)
+  return $Some result
+
+// Append directly to a packet owner. Fixed capacity uses the same zero padding as pack.
+func append_packed (capacity: U32) -> (words: #[U32]) -> (out: own #[F32]) : #[F32] =>
+  let count = words.length
+  let size = if capacity == 0 then count else capacity
+  lanes.require (count <= size and size <= (lanes.max_integer - 2) / 2)
+  @storage.reserve out (2 + size * 2)
+  @storage.push out (U32.to_f32 (count & 65535))
+  @storage.push out (U32.to_f32 (count >> 16))
+  for word in words:
+    @storage.push out (U32.to_f32 (word & 65535))
+    @storage.push out (U32.to_f32 (word >> 16))
+  for 0 .. (size - count) * 2:
+    @storage.push out 0.0
+  return out
+
+func no_migration (version: U32) -> (values: #[U32]) : Maybe (#[U32]) => $Nothing
+
+// Metadata for word-native persistence and U32 host boundaries. Variable-width
+// values need no F32 halves or component padding.
+type Persistence a is data = $Persistence {
+  key: U32, version: U32, encode: a -> #[U32],
+  decode: #[U32] -> Maybe a,
+  migrate: U32 -> #[U32] -> Maybe (#[U32]),
+}
+func saved key => func version => func encode => func decode => func migrate => return
+  $Persistence { key, version, encode, decode, migrate }
+
+// capacity=0 is variable-width (resources). For components, the caller chooses
+// a positive maximum encoded word count; overflow rejects instead of truncating.
+// Migrations receive old words independent of the old padding capacity.
+func bridge (key: U32) => func (version: U32) => func (capacity: U32) => return
+  func (encode: value -> #[U32]) => func (decode: #[U32] -> Maybe value) => func migrate =>
+    let read = func payload =>
+      let $Some payload = unpack capacity payload else:
+        return panic "invalid Ink word framing"
+      let $Some value = decode payload else:
+        return panic "invalid derived Ink value"
+      return value
+    let migration = func saved -> payload =>
+      if payload.length < 2:
+        return panic "invalid migrated word framing"
+      let $Some old = unpack ((payload.length - 2) / 2) payload else:
+        return panic "invalid migrated word framing"
+      return case migrate saved old of
+        $Nothing => $Nothing
+        $Some converted => $Some (pack capacity converted)
+    return $lanes.Codec { key, version, encode: func value => pack capacity (encode value), decode: read, migrate: migration }
+
+type Kind is data = $Unsigned | $Float | $Boolean | $Encoded
+type Span is data = $Span {start: U32, count: U32}
+type Field is data = $Field {id: U32, label: Span, type_name: Span, kind: Kind}
+type Variant is data = $Variant {tag: U32, label: Span, fields: Span}
+type Descriptor is data = $Descriptor {version: U32, variants: &[Variant], fields: &[Field], text: &[U32]}
+func descriptor_text (descriptor: Descriptor) -> (span: Span) =>
+  if span.start > descriptor.text.length or span.count > descriptor.text.length - span.start:
+    return &descriptor.text[0..0]
+  return &descriptor.text[span.start..span.start + span.count]
+func variant_fields (descriptor: Descriptor) -> (variant: Variant) =>
+  if variant.fields.start > descriptor.fields.length or variant.fields.count > descriptor.fields.length - variant.fields.start:
+    return &descriptor.fields[0..0]
+  return &descriptor.fields[variant.fields.start..variant.fields.start + variant.fields.count]
+type Value is data = $UnsignedValue U32 | $FloatValue F32 | $BooleanValue Bool | $EncodedValue (&[U32])
+type FieldView is data = $FieldView { field: Field, value: Value, words: &[U32] }
+type View is data = $View { tag: U32, label: &[U32], fields: #[FieldView] }
+
+func field_value (kind: Kind) -> (payload: &[U32]) : Maybe Value => case kind of
+  $Unsigned => if payload.length == 1 then $Some ($UnsignedValue payload[0]) else $Nothing
+  $Float => if payload.length == 1 then Maybe.map (func value => $FloatValue value) (float_from_word payload[0]) else $Nothing
+  $Boolean => if payload.length == 1 and payload[0] <= 1 then $Some ($BooleanValue (payload[0] == 1)) else $Nothing
+  $Encoded => $Some ($EncodedValue (&payload[0..payload.length]))
+// Metadata and payload owners belong to the caller. Output FieldView rows are
+// flat borrowed descriptors, never owners hidden inside a collection element.
+func inspect (descriptor: Descriptor) -> decode -> payload -> (fields: own #[FieldView]) =>
+  let encoded = array.generate payload.length (func i => payload[i])
+  let $Some decoded = decode encoded else:
+    return $Nothing
+  if payload.length < 3 or payload[0] != descriptor.version:
+    return $Nothing
+  let found = $Nothing
+  for variant in descriptor.variants:
+    if variant.tag == payload[1]:
+      found := $Some variant
+  let $Some variant = found else:
+    return $Nothing
+  if variant.fields.start > descriptor.fields.length or variant.fields.count > descriptor.fields.length - variant.fields.start:
+    return $Nothing
+  if variant.label.start > descriptor.text.length or variant.label.count > descriptor.text.length - variant.label.start:
+    return $Nothing
+  let selected_fields = variant_fields descriptor variant
+  if payload[2] != selected_fields.length:
+    return $Nothing
+  @storage.truncate fields 0
+  let cursor = 3
+  for field in selected_fields:
+    if cursor > payload.length or payload.length - cursor < 2:
+      return $Nothing
+    let width = payload[cursor + 1]
+    if payload[cursor] != field.id or width > payload.length - cursor - 2:
+      return $Nothing
+    let words = &payload[cursor + 2..cursor + 2 + width]
+    let $Some value = field_value field.kind words else:
+      return $Nothing
+    @storage.push fields ($FieldView {field, value, words})
+    cursor := cursor + 2 + width
+  if cursor != payload.length:
+    return $Nothing
+  return $Some (decoded, $View {tag: variant.tag, label: descriptor_text descriptor variant.label, fields})
+
+func same_words a => func b =>
+  if a.length != b.length:
+    return false
+  for i in 0 .. a.length:
+    if (a.at i) != (b.at i):
+      return false
+  return true
+
+// Changed stable field ids. A variant change reports every new field; callers
+// compare the separate tags to represent removed fields or nullary variants.
+func changed (before: View) => func (after: View) =>
+  let ids: #[U32] = #[]
+  for current in after.fields:
+    let equal = false
+    if before.tag == after.tag:
+      for old in before.fields:
+        if old.field.id == current.field.id:
+          equal := same_words old.words current.words
+    if not equal:
+      @storage.push ids current.field.id
+  return ids
+
+func Persistence.words (c: Persistence a) => {
+  key: c.key, version: c.version, encode: c.encode, decode: c.decode, migrate: c.migrate,
+}
+
+// Comptime field/variant attribute tags for generic `#for #fields` / `#variants` codecs.
+type FieldId is data = $FieldId U32
+type Skip is data = $Skip
+type VariantTag is data = $VariantTag U32
+
+// Flat F32 lane encoding for `$lanes.Codec` records. These instances retain
+// the original numeric casts and F32 bits; callers own save validation.
+type LaneEncode a is trait = {
+  to_lanes: a -> #[F32],
+}
+const F32.LaneEncode: LaneEncode F32 = {
+  to_lanes: func value => #[value],
+}
+const U32.LaneEncode: LaneEncode U32 = {
+  to_lanes: func value => #[U32.to_f32 value],
+}
+const Bool.LaneEncode: LaneEncode Bool = {
+  to_lanes: func value => #[lanes.bit value],
+}
+const Vec2.LaneEncode: LaneEncode Vec2 = {
+  to_lanes: func v => #[v.x, v.y],
+}
+const Vec3.LaneEncode: LaneEncode Vec3 = {
+  to_lanes: func v => #[v.x, v.y, v.z],
+}
+const Vec4.LaneEncode: LaneEncode math.Vec4 = {
+  to_lanes: func v => #[v.x, v.y, v.z, v.w],
+}
+const Quat.LaneEncode: LaneEncode math.Quat = {
+  to_lanes: func q => #[q.x, q.y, q.z, q.w],
+}
+const Color.LaneEncode: LaneEncode math.Color = {
+  to_lanes: func c => #[c.r, c.g, c.b, c.a],
+}
+
+// Fixed-width cursor readers return Nothing on malformed or truncated lanes.
+// Record decoders impose their own field ranges and domain invariants.
+type LaneDecode a is trait = {
+  lane_width: a -> U32,
+  from_lanes: #[F32] -> U32 -> Maybe (a, U32),
+}
+
+func read_lane (values: #[F32]) -> (at: U32): Maybe (a, U32) where { LaneDecode a } =>
+  LaneDecode.from_lanes values at
+
+func available (values: #[F32]) -> (at: U32) -> (width: U32) =>
+  at <= values.length and width <= values.length - at
+
+func finite_lanes (values: #[F32]) -> (at: U32) -> (width: U32) =>
+  if not (available values at width):
+    return false
+  for i in at .. at + width:
+    if not (is_finite values[i]):
+      return false
+  return true
+
+func read_lane_f32 (values: #[F32]) -> (at: U32): Maybe (F32, U32) =>
+  if not (finite_lanes values at 1):
+    return $Nothing
+  return $Some (values[at], at + 1)
+
+const F32.LaneDecode: LaneDecode F32 = {
+  lane_width: func _ => 1,
+  from_lanes: read_lane_f32,
+}
+
+// Accept any U32 exactly representable in a lane. A particular wire format
+// can require a smaller maximum, such as lanes.max_integer or a field limit.
+func read_lane_u32 (values: #[F32]) -> (at: U32): Maybe (U32, U32) =>
+  if not (available values at 1):
+    return $Nothing
+  let value = values[at]
+  if not (value >= 0.0 and value < 4294967296.0 and floor value == value):
+    return $Nothing
+  return $Some (F32.to_u32 value, at + 1)
+
+const U32.LaneDecode: LaneDecode U32 = {
+  lane_width: func _ => 1,
+  from_lanes: read_lane_u32,
+}
+
+func read_lane_bool (values: #[F32]) -> (at: U32): Maybe (Bool, U32) =>
+  if not (available values at 1):
+    return $Nothing
+  let value = values[at]
+  if value != 0.0 and value != 1.0:
+    return $Nothing
+  return $Some (value == 1.0, at + 1)
+
+const Bool.LaneDecode: LaneDecode Bool = {
+  lane_width: func _ => 1,
+  from_lanes: read_lane_bool,
+}
+
+func read_lane_vec2 (values: #[F32]) -> (at: U32): Maybe (Vec2, U32) =>
+  if not (finite_lanes values at 2):
+    return $Nothing
+  return $Some ($Vec2 { x: values[at], y: values[at + 1] }, at + 2)
+
+const Vec2.LaneDecode: LaneDecode Vec2 = {
+  lane_width: func _ => 2,
+  from_lanes: read_lane_vec2,
+}
+
+func read_lane_vec3 (values: #[F32]) -> (at: U32): Maybe (Vec3, U32) =>
+  if not (finite_lanes values at 3):
+    return $Nothing
+  return $Some ($Vec3 { x: values[at], y: values[at + 1], z: values[at + 2] }, at + 3)
+
+const Vec3.LaneDecode: LaneDecode Vec3 = {
+  lane_width: func _ => 3,
+  from_lanes: read_lane_vec3,
+}
+
+func read_lane_vec4 (values: #[F32]) -> (at: U32): Maybe (math.Vec4, U32) =>
+  if not (finite_lanes values at 4):
+    return $Nothing
+  return $Some ($math.Vec4 { x: values[at], y: values[at + 1], z: values[at + 2], w: values[at + 3] }, at + 4)
+
+const Vec4.LaneDecode: LaneDecode math.Vec4 = {
+  lane_width: func _ => 4,
+  from_lanes: read_lane_vec4,
+}
+
+// Quat reads finite components. Existing pose codecs also require unit length.
+func read_lane_quat (values: #[F32]) -> (at: U32): Maybe (math.Quat, U32) =>
+  if not (finite_lanes values at 4):
+    return $Nothing
+  return $Some ($math.Quat { x: values[at], y: values[at + 1], z: values[at + 2], w: values[at + 3] }, at + 4)
+
+const Quat.LaneDecode: LaneDecode math.Quat = {
+  lane_width: func _ => 4,
+  from_lanes: read_lane_quat,
+}
+
+func read_lane_color (values: #[F32]) -> (at: U32): Maybe (math.Color, U32) =>
+  if not (finite_lanes values at 4):
+    return $Nothing
+  return $Some ($math.Color { r: values[at], g: values[at + 1], b: values[at + 2], a: values[at + 3] }, at + 4)
+
+const Color.LaneDecode: LaneDecode math.Color = {
+  lane_width: func _ => 4,
+  from_lanes: read_lane_color,
+}
+
+// Generic comptime flat-lane encoder for any nominal record whose non-Skip
+// fields implement `LaneEncode`. Visits fields in declared order and produces
+// the exact flat `#[F32]` wire layout expected by `$lanes.Codec`.
+func encode_lanes (value: t): #[F32] =>
+  let out: #[F32] = #[]
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      let part = LaneEncode.to_lanes value.(field)
+      for lane in part:
+        @storage.push out lane
+  return out
+
+// The value supplies field types for trait resolution. Widths are fixed by
+// those types, and fields marked Skip need no LaneDecode instance.
+func lane_count (value: t): U32 =>
+  let count: U32 = 0
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      count := self + LaneDecode.lane_width value.(field)
+  return count
+
+// Generic comptime flat-lane decoder paired with `encode_lanes`. Visits fields
+// in declared order, decodes each non-Skip field through `LaneDecode`, and
+// fills `@[$Skip]` fields from their declared `field.default`.
+func decode_lanes (values: #[F32]): Maybe t =>
+  let at: U32 = 0
+  let built: t = #for field in #fields t:
+    #if field.has_tag $Skip:
+      break field.default
+    #else:
+      let $Some (value, next) = LaneDecode.from_lanes values at else:
+        return $Nothing
+      at := next
+      break value
+  if at != values.length:
+    return $Nothing
+  return $Some built
+
+// Count non-Skip fields of a record type at compile time.
+func record_field_count (value: t): U32 =>
+  let count: U32 = 0
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      count := self + 1
+  return count
+
+// Generic comptime word-framed encoder for any single-constructor record `t`
+// whose non-Skip fields implement `Codec`. Emits Ink's exact framed word layout:
+//   [version, tag, field_count, id0, len0, ...words0, ...]
+// Fields annotated with `@[$FieldId n]` use `n`; otherwise 1-based ordinals.
+func encode_record (version: U32) -> (tag: U32) -> (value: t): #[U32] =>
+  let out: #[U32] = #[version, tag, 0]
+  let count: U32 = 0
+  let ordinal: U32 = 1
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      let id: U32 = 0
+      #if field.has_tag $FieldId:
+        id := field.tag $FieldId
+      #else:
+        id := ordinal
+      let payload = Codec.encode value.(field)
+      @storage.push out id
+      @storage.push out payload.length
+      for word in payload:
+        @storage.push out word
+      count := self + 1
+    ordinal := self + 1
+  out[2] := count
+  return out
+
+// Comptime framed header check + cursor field reader paired with `encode_record`.
+func check_header (version: U32) -> (tag: U32) -> (expected_fields: U32) -> (words: #[U32]): Bool =>
+  return words.length >= 3 and words[0] == version and words[1] == tag and words[2] == expected_fields
+
+func read_field (words: #[U32]) -> (cursor: U32) -> (expected_id: U32): Maybe (a, U32) where { Codec a } =>
+  if cursor > words.length or words.length - cursor < 2:
+    return $Nothing
+  if words[cursor] != expected_id:
+    return $Nothing
+  let width = words[cursor + 1]
+  let start = cursor + 2
+  if width > words.length - start:
+    return $Nothing
+  let decoded: Maybe a = Codec.decode (@array.slice words start width)
+  let $Some value = decoded else:
+    return $Nothing
+  return $Some (value, start + width)
+
+// Generic comptime word-framed decoder paired with `encode_record`. Checks the
+// header, reads non-Skip fields in declared order by `@[$FieldId n]` (or
+// 1-based ordinal), and restores `@[$Skip]` fields from `field.default`.
+func decode_record (version: U32) -> (tag: U32) -> (words: #[U32]): Maybe t =>
+  let expected: U32 = 0
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      expected := self + 1
+  if not (check_header version tag expected words):
+    return $Nothing
+  let cursor: U32 = 3
+  let ordinal: U32 = 1
+  let built: t = #for field in #fields t:
+    let this_ordinal = ordinal
+    ordinal := self + 1
+    #if field.has_tag $Skip:
+      break field.default
+    #else:
+      let id: U32 = 0
+      #if field.has_tag $FieldId:
+        id := field.tag $FieldId
+      #else:
+        id := this_ordinal
+      let $Some (value, next) = read_field words cursor id else:
+        return $Nothing
+      cursor := next
+      break value
+  if cursor != words.length:
+    return $Nothing
+  return $Some built
+
+// Comptime field-id and variant-tag metadata builders using `#for #fields` / `#for #variants`.
+func record_field_ids (value: t): #[U32] =>
+  let ids: #[U32] = #[]
+  let ordinal: U32 = 1
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      #if field.has_tag $FieldId:
+        @storage.push ids (field.tag $FieldId)
+      #else:
+        @storage.push ids ordinal
+    ordinal := self + 1
+  return ids
+
+func variant_tags (value: t): #[U32] =>
+  let tags: #[U32] = #[]
+  #for variant in #variants t:
+    #if not (variant.has_tag $Skip):
+      #if variant.has_tag $VariantTag:
+        @storage.push tags (variant.tag $VariantTag)
+      #else:
+        @storage.push tags (variant.index + 1)
+  return tags
+
+func variant_count (value: t): U32 =>
+  let count: U32 = 0
+  #for variant in #variants t:
+    #if not (variant.has_tag $Skip):
+      count := self + 1
+  return count
+
+func describe_record_parts (tag: U32) -> (type_name: #[U32]) -> (value: t): (#[Variant], #[Field], #[U32]) =>
+  let text: #[U32] = #[]
+  let label_start = text.length
+  for ch in type_name:
+    @storage.push text ch
+  let type_label = $Span { start: label_start, count: type_name.length }
+  let fields: #[Field] = #[]
+  let ordinal: U32 = 1
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      let id: U32 = 0
+      #if field.has_tag $FieldId:
+        id := field.tag $FieldId
+      #else:
+        id := ordinal
+      let fname = field.name
+      let fstart = text.length
+      for ch in fname:
+        @storage.push text ch
+      @storage.push fields ($Field {
+        id,
+        label: $Span { start: fstart, count: fname.length },
+        type_name: $Span { start: 0, count: 0 },
+        kind: $Encoded,
+      })
+    ordinal := self + 1
+  let variants: #[Variant] = #[$Variant { tag, label: type_label, fields: $Span { start: 0, count: fields.length } }]
+  return (variants, fields, text)

@@ -1,9 +1,9 @@
 # Application state mechanisms
 
 These modules keep identities, cached calculations and behavior progress in
-caller-owned Blot values. Their fixtures use building, staffing and delivery
-vocabulary; the library does not. See `tests/handles.blot`,
-`tests/derived.blot`, `tests/codec.blot` and `tests/behavior.blot` for complete
+caller-owned Squid values. Their fixtures use building, staffing and delivery
+vocabulary; the library does not. See `tests/handles.sq`,
+`tests/derived.sq`, `tests/codec.sq` and `tests/behavior.sq` for complete
 integrations.
 
 ## Stable handles
@@ -75,7 +75,7 @@ collection types are outside this qualified generator path. Unsupported source
 types remain native checker/generator errors, never a guessed layout.
 
 `ink/codec.Codec` has the upstream `encode`/`decode` contract and framed U32
-representation. Ink owns this equivalent contract because Blot's orphan rule
+representation. Ink owns this equivalent contract because Squid's orphan rule
 forbids implementing `std/codec.Codec F32` in Ink. The native generator is
 bound to the Ink contract. U32 uses every bit, Bool accepts only 0/1, and F32
 stores its IEEE bits, preserving signed zero and subnormals while rejecting
@@ -278,7 +278,7 @@ Construct `codec.saved key version encode decode migrate`, or use generated
 `write_snapshotted_resource`, `write_component` and `write_snapshotted_component`
 inside an `encode_state` / `encode_scene` schema callback, and restore with
 `restore_alive`, `restore_resource`, `restore_component` and `decode_state` /
-`decode_scene` into caller-owned pools. `tests/word-persist.blot` is a complete
+`decode_scene` into caller-owned pools. `tests/word-persist.sq` is a complete
 example. Hosts copy the returned `Uint32Array` bytes; numeric conversion to
 `Float32Array` loses integer bits.
 
@@ -305,7 +305,7 @@ applications whose hosts accept U32 buffers, not a change to Pen's state ABI.
 ## Compiled authored behaviors
 
 A `behavior` generation job compiles a caller-authored JSON graph into direct
-Blot branches. It supplies `source`, `graph`, `output`, a `prefix` importing
+Squid branches. It supplies `source`, `graph`, `output`, a `prefix` importing
 `ink/behavior` as `_behavior`, and an optional checked `entry`. Add `selector: true`
 to emit a one-shot selector too. The native compiler checks the callbacks and
 result. Use the same `pen tool ink -- generate CONFIG.json [--write]` command.
@@ -340,9 +340,9 @@ does not guarantee a selector beats a short handwritten branch.
 
 A `dataflow` generation job compiles a small JSON dataflow description with typed
 input/output, named pure calls and result references. Nodes may be declared in
-any order; the compiler emits stable dependency waves as ordinary Blot calls. It
+any order; the compiler emits stable dependency waves as ordinary Squid calls. It
 rejects cycles, unused work, duplicate outputs and arbitrary source strings. The
-generated function must still be checked by Blot. Its node/result `let` bindings
+generated function must still be checked by Squid. Its node/result `let` bindings
 reject effects even if the caller could handle them.
 
 The result contains source, dependencies and eligible waves. Eligibility does
@@ -366,7 +366,7 @@ actor revisions before applying a delayed result.
 
 ## Saved task lifetimes
 
-`tests/task_world.blot` demonstrates `task_queue` inside an actual word-saved
+`tests/task_world.sq` demonstrates `task_queue` inside an actual word-saved
 application. Pending requests are reissued under a fresh epoch after restore;
 ready results and explicit continuation data survive. Delivery publishes a ready
 prefix in submission order, and old-epoch replies are rejected. The decoder also

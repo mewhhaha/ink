@@ -102,7 +102,7 @@ fn focus_reference(nodes: &[Node], focus: u32) -> Vec<u32> {
 }
 #[test]
 fn indexed_ui_matches_bounded_ancestor_reference_and_snapshots() {
-    let mut f = Fixture::new("tests/perf/ui-text.blot");
+    let mut f = Fixture::new("tests/perf/ui-text.sq");
     let mut cases = vec![vec![], vec![make(0, 0)], vec![make(u32::MAX, 0)]];
     for depth in [1, 2, 16, 17, 63, 64, 65, 128] {
         let mut nodes: Vec<Node> = (0..depth).map(|i| make(u32::MAX - i as u32, 0)).collect();
@@ -171,7 +171,7 @@ fn indexed_ui_matches_bounded_ancestor_reference_and_snapshots() {
 }
 #[test]
 fn unicode_split_join_empty_chunks_and_snapshots() {
-    let mut f = Fixture::new("tests/perf/ui-text.blot");
+    let mut f = Fixture::new("tests/perf/ui-text.sq");
     let cases = vec![
         vec![],
         vec![32],
@@ -265,7 +265,7 @@ fn ui_and_text_adversarial_workloads_reuse_bounded_memory() {
             1024 * 1024,
         ),
     ] {
-        let mut f = Fixture::new("tests/perf/ui-text.blot");
+        let mut f = Fixture::new("tests/perf/ui-text.sq");
         let mut committed = 0;
         for replay in 0..3 {
             assert_eq!(f.words(entry, size), expected);
@@ -281,7 +281,7 @@ fn ui_and_text_adversarial_workloads_reuse_bounded_memory() {
 #[test]
 fn semantic_json_preserves_unicode_ids_schemas_and_optional_values() {
     use serde_json::{Value as Json, json};
-    let mut f = Fixture::new("tests/semantic.blot");
+    let mut f = Fixture::new("tests/semantic.sq");
     let bytes: Vec<u8> = f
         .floats("observation", u32::MAX)
         .into_iter()

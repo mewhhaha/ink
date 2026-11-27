@@ -1,6 +1,6 @@
 //! Structural extraction for opted-in data declarations. The native compiler
 //! checks the complete source before this runs and checks the emitted code too.
-//! This scanner does not decide whether a Blot program is well typed.
+//! This scanner does not decide whether a Squid program is well typed.
 use super::*;
 #[derive(Clone, Debug)]
 pub struct Field {

@@ -858,8 +858,8 @@ mod tests {
     }
 
     #[test]
-    fn mini_minecraft_blot_gameplay_suite_passes() {
-        let mut fx = crate::Fixture::new("examples/mini_minecraft.blot");
+    fn mini_minecraft_squid_gameplay_suite_passes() {
+        let mut fx = crate::Fixture::new("examples/mini_minecraft.sq");
         let out = fx.floats("test_mini_minecraft", ());
         assert_eq!(out, vec![1.0, 0.0], "mini_minecraft gameplay tests failed");
     }

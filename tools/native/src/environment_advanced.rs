@@ -3,7 +3,7 @@
 //! bending + octahedral impostor encoding/decoding.
 use super::*;
 
-const FIXTURE: &str = "tests/render_environment_reference.blot";
+const FIXTURE: &str = "tests/render_environment_reference.sq";
 
 #[test]
 fn cdlod_splat_triplanar_and_morph_match_f64_reference() {

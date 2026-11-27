@@ -1,7 +1,7 @@
 use super::*;
 #[test]
 fn word_persistence_identity_snapshots_migrations_and_corruption() {
-    let mut f = Fixture::new("tests/word-persist.blot");
+    let mut f = Fixture::new("tests/word-persist.sq");
     for count in [0u32, 1, 3, 256, 1024] {
         let sum = count * (count.saturating_sub(1)) / 2 + count * 10;
         let expected = vec![1, count, 9, 7, sum, 0, u32::MAX];
@@ -60,7 +60,7 @@ fn word_persistence_identity_snapshots_migrations_and_corruption() {
 }
 #[test]
 fn behavior_traces_replay_budgets_and_corruption() {
-    let mut f = Fixture::new("tests/behavior.blot");
+    let mut f = Fixture::new("tests/behavior.sq");
     for deltas in [
         vec![0.0, 0.25, 0.25, 0.25, 0.25],
         vec![2.0],
@@ -131,7 +131,7 @@ fn behavior_traces_replay_budgets_and_corruption() {
 }
 #[test]
 fn application_event_order_and_observation_callbacks() {
-    let mut f = Fixture::new("tests/app-hooks.blot");
+    let mut f = Fixture::new("tests/app-hooks.sq");
     assert_eq!(
         f.floats("pause_events", ()),
         [
@@ -149,7 +149,7 @@ fn application_event_order_and_observation_callbacks() {
         .guest
         .call(
             "observed_calls",
-            blot_host::Argument::Callback(Box::new(move |v| {
+            squid_host::Argument::Callback(Box::new(move |v| {
                 let Value::U32(x) = v else {
                     panic!("callback argument")
                 };
@@ -173,7 +173,7 @@ fn application_event_order_and_observation_callbacks() {
     let recorded = calls.clone();
     let failed = f.guest.call(
         "observed_calls",
-        blot_host::Argument::Callback(Box::new(move |value| {
+        squid_host::Argument::Callback(Box::new(move |value| {
             let Value::U32(code) = value else {
                 panic!("callback argument")
             };
@@ -192,7 +192,7 @@ fn application_event_order_and_observation_callbacks() {
 }
 #[test]
 fn compiled_behavior_matches_interpreter_at_all_boundaries() {
-    let mut f = Fixture::new("tests/compiled-behavior.blot");
+    let mut f = Fixture::new("tests/compiled-behavior.sq");
     for budget in [0, 1, 2, 7, 64] {
         for frames in [0, 1, 2, 4] {
             for local in [0, 1, 100] {
@@ -225,7 +225,7 @@ fn compiled_behavior_matches_interpreter_at_all_boundaries() {
 }
 #[test]
 fn contact_cache_keeps_full_width_ids() {
-    let mut f = Fixture::new("tests/cache.blot");
+    let mut f = Fixture::new("tests/cache.sq");
     for ids in [
         [1u32, 16777216, 16777217, 16777218],
         [u32::MAX, 0x80000000, 0x80000001, 0x80000002],

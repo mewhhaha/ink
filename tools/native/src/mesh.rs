@@ -241,7 +241,7 @@ fn midpoint_length(m: &Mesh, corridor: &[usize], s: (f64, f64), g: (f64, f64)) -
 
 #[test]
 fn polygon_search_matches_brute_force_dijkstra_and_funnel_is_shortest() {
-    let mut f = Fixture::new("tests/navigation_mesh.blot");
+    let mut f = Fixture::new("tests/navigation_mesh.sq");
     let mut checked = 0;
     let mut unreachable = 0;
     for seed in 1..=60u32 {
@@ -366,7 +366,7 @@ fn route(f: &mut Fixture, m: &Mesh, radius: f64, s: (f64, f64), g: (f64, f64)) -
 }
 #[test]
 fn funnel_known_answers_clearance_and_heights() {
-    let mut f = Fixture::new("tests/navigation_mesh.blot");
+    let mut f = Fixture::new("tests/navigation_mesh.sq");
     let m = squares();
     // Around the inner corner (1, 1): start, corner, goal.
     let r = route(&mut f, &m, 0.0, (0.2, 1.9), (1.9, 0.1));
@@ -402,7 +402,7 @@ fn funnel_known_answers_clearance_and_heights() {
 }
 #[test]
 fn mesh_search_adversarial_inputs() {
-    let mut f = Fixture::new("tests/navigation_mesh.blot");
+    let mut f = Fixture::new("tests/navigation_mesh.sq");
     let m = squares();
     // Outside points snap to the nearest mesh point.
     let r = route(&mut f, &m, 0.0, (-5.0, 0.5), (2.0 + 4.0, 0.5));
@@ -531,7 +531,7 @@ fn mesh_search_adversarial_inputs() {
 }
 #[test]
 fn location_closest_point_and_straight_walks_match_brute_force() {
-    let mut f = Fixture::new("tests/navigation_mesh.blot");
+    let mut f = Fixture::new("tests/navigation_mesh.sq");
     for seed in 1..=20u32 {
         let m = jittered(seed, 8, 7, 0.25);
         let mut r = Random(seed * 31);
@@ -653,7 +653,7 @@ fn location_closest_point_and_straight_walks_match_brute_force() {
 }
 #[test]
 fn grid_mesh_covers_exactly_the_walkable_cells() {
-    let mut f = Fixture::new("tests/navigation_mesh.blot");
+    let mut f = Fixture::new("tests/navigation_mesh.sq");
     for seed in 1..=30u32 {
         let (w, h) = (3 + seed as usize % 9, 2 + seed as usize % 7);
         let mut r = Random(seed);
@@ -750,7 +750,7 @@ fn grid_mesh_covers_exactly_the_walkable_cells() {
 }
 #[test]
 fn navmesh_example_routes_around_the_corner_and_avoids() {
-    let mut f = Fixture::new("examples/navmesh.blot");
+    let mut f = Fixture::new("examples/navmesh.sq");
     let r = f.floats("route", ());
     assert_eq!(r[0], 0.0);
     let points: Vec<_> = r[1..].chunks(3).map(|c| (c[0], c[2])).collect();

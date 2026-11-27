@@ -1,8 +1,8 @@
 # Ink
 
-One reusable, asset-free game systems source library for [Blot](https://github.com/mewhhaha/blot2), imported as `ink/*`.
+One reusable, asset-free game systems source library for [Squid](https://github.com/mewhhaha/squid-lang), imported as `ink/*`.
 
-Applications own their state layout, main loop, clocks, assets, policies, and GPU resources; Ink provides deterministic simulation, math, physics, rendering descriptors, UI, audio, AI, navigation, netcode, and persistence as plain Blot source modules with zero installer or JS runtime required.
+Applications own their state layout, main loop, clocks, assets, policies, and GPU resources; Ink provides deterministic simulation, math, physics, rendering descriptors, UI, audio, AI, navigation, netcode, and persistence as plain Squid source modules with zero installer or JS runtime required.
 
 > This is a greenfield project; breaking changes are welcome and superseded APIs are removed. See [AGENTS.md](AGENTS.md) for contributor rules and verification gates.
 
@@ -29,7 +29,7 @@ Applications own their state layout, main loop, clocks, assets, policies, and GP
 
 ## Quick Start
 
-```blot
+```squid
 import * as math from "ink/math"
 
 io orbit (angle: F32) : Array F32 => return do:
@@ -37,12 +37,12 @@ io orbit (angle: F32) : Array F32 => return do:
   break #[p.x, p.y, p.z]
 ```
 
-Clone or vendor this repository and map the `ink` alias to `lib/`. In a standalone Blot project (`blot.json`, using Ink's `blot-workspace.yaml`):
+Clone or vendor this repository and map the `ink` alias to `lib/`. In a standalone Squid project (`squid.json`, using Ink's `squid-workspace.yaml`):
 
 ```json
 {
   "dependencies": {
-    "std": { "path": "../blot2" },
+    "std": { "path": "../squid-lang" },
     "ink": { "path": "../ink" }
   },
   "prelude": "std"
@@ -54,7 +54,7 @@ For Pen, merge into `pen.json`:
 ```json
 {
   "compiler": {
-    "plugin": "blot",
+    "plugin": "squid",
     "settings": { "imports": { "ink/": "../ink/lib/" } }
   }
 }
@@ -62,7 +62,7 @@ For Pen, merge into `pen.json`:
 
 Export a self-contained source bundle (library, shaders, examples, docs, and SHA-256 inventory) with `pen tool ink -- pack dist/ink`.
 
-Applications supply state, assets, font metrics, and policy. Core modules and [examples/ecs.blot](examples/ecs.blot) work without Pen; only the optional `ink/pen/` adapter imports generated `pen/` bindings from `pen codegen`.
+Applications supply state, assets, font metrics, and policy. Core modules and [examples/ecs.sq](examples/ecs.sq) work without Pen; only the optional `ink/pen/` adapter imports generated `pen/` bindings from `pen codegen`.
 
 Looking for concise, high-performance usage recipes? Start with the **[Idiomatic Patterns & Performance Cookbook](docs/patterns.md)**.
 
@@ -146,32 +146,32 @@ Looking for concise, high-performance usage recipes? Start with the **[Idiomatic
 | --- | --- |
 | `ink/persist`, `ink/persist/words`, `ink/codec`, `ink/lanes` | Versioned scene/state saves, exact U32 word-native framing, `#for #fields` derived codecs, and checked F32 lane codecs |
 | `ink/editor`, `ink/editor/scene`, `ink/editor/history`, `ink/scene_graph`, `ink/brush`, `ink/gizmos`, `ink/orbit`, `ink/picking`, `ink/profile` | Editable convex brushes, headless 3D scene-graph editor (picking, RGB gizmos, bounded undo/redo history, stash/restore play snapshots), orbit camera, and flame profiler |
-| `ink/pen/host`, `ink/pen/program`, `ink/pen/events`, `ink/pen/platform`, `ink/pen/services`, `ink/pen/settings`, `ink/pen/instances`, `ink/pen/retained`, `ink/pen/locale`, `ink/pen/profile`, `ink/pen/semantic`, `ink/pen/simulation` | Optional Blot adapters for Pen's generated wire bindings (`pen/`), retained instances, host services, locale, profiling, semantic observations, and native simulation requests |
+| `ink/pen/host`, `ink/pen/program`, `ink/pen/events`, `ink/pen/platform`, `ink/pen/services`, `ink/pen/settings`, `ink/pen/instances`, `ink/pen/retained`, `ink/pen/locale`, `ink/pen/profile`, `ink/pen/semantic`, `ink/pen/simulation` | Optional Squid adapters for Pen's generated wire bindings (`pen/`), retained instances, host services, locale, profiling, semantic observations, and native simulation requests |
 
 ## Examples
 
-Runnable standalone Blot programs under `examples/` (no schemas or generated code required):
+Runnable standalone Squid programs under `examples/` (no schemas or generated code required):
 
 | Example | Demonstrates |
 | --- | --- |
-| [examples/orbit.blot](examples/orbit.blot) | Minimal quaternion rotation entry point |
-| [examples/ecs.blot](examples/ecs.blot) | Core ECS entity/component pools without Pen |
-| [examples/incremental_ecs.blot](examples/incremental_ecs.blot) | Cached queries, recipes, coalesced commands, journals, relations, and message streams |
-| [examples/collections.blot](examples/collections.blot) | Caller-owned maps, sets, handles, and explicit copies |
-| [examples/physics.blot](examples/physics.blot), [examples/physics_owners.blot](examples/physics_owners.blot) | 3D rigid body simulation and explicit caller-owned physics storage |
-| [examples/steps.blot](examples/steps.blot) | Fixed-timestep simulation loop with pose interpolation |
-| [examples/joints.blot](examples/joints.blot) | Distance/hinge joint pendulum simulation |
-| [examples/ground.blot](examples/ground.blot) | Heightfield terrain queries and ground following |
-| [examples/navigation.blot](examples/navigation.blot), [examples/navmesh.blot](examples/navmesh.blot) | Grid A* routing and convex navmesh corridor/funnel smoothing |
-| [examples/animation.blot](examples/animation.blot), [examples/cinematic.blot](examples/cinematic.blot) | Skeletal animation blending and multi-track sequencer cinematics |
-| [examples/sketch_ui.blot](examples/sketch_ui.blot) | Asset-free Drawful-style immediate-mode UI with live widgets, 5 fps line boil, and doodle pad (interactive Pen WebGPU demo) |
-| [examples/d2_lighting.blot](examples/d2_lighting.blot) | 2D tilemaps, sprites, SDF UI, click-to-toss 2D physics, and Radiance Cascades 2D GI (interactive Pen WebGPU demo) |
-| [examples/physics_sandbox.blot](examples/physics_sandbox.blot) | 3D wireframe rigid-body crate tower smashed by a swinging distance-joint pendulum with live HUD (interactive Pen WebGPU demo) |
-| [examples/nav_playground.blot](examples/nav_playground.blot) | Convex polygon navmesh, A* corridor, funnel string-pulling, and 6 ORCA crowd agents (interactive Pen WebGPU demo) |
-| [examples/ik_rig.blot](examples/ik_rig.blot) | Analytic 2-bone IK + 6-segment FABRIK chain tracking a spring-damped cursor target with trauma shake (interactive Pen WebGPU demo) |
-| [examples/rollback.blot](examples/rollback.blot) | Deterministic two-peer GGPO rollback with snapshot rings and checksums |
-| [examples/showcase_editor.blot](examples/showcase_editor.blot) | Headless 3D scene-graph editor with picking, gizmos, undo/redo, and play snapshots |
-| [examples/game.blot](examples/game.blot), [examples/mechanisms.blot](examples/mechanisms.blot) | End-to-end game state composition and cross-module state mechanisms |
+| [examples/orbit.sq](examples/orbit.sq) | Minimal quaternion rotation entry point |
+| [examples/ecs.sq](examples/ecs.sq) | Core ECS entity/component pools without Pen |
+| [examples/incremental_ecs.sq](examples/incremental_ecs.sq) | Cached queries, recipes, coalesced commands, journals, relations, and message streams |
+| [examples/collections.sq](examples/collections.sq) | Caller-owned maps, sets, handles, and explicit copies |
+| [examples/physics.sq](examples/physics.sq), [examples/physics_owners.sq](examples/physics_owners.sq) | 3D rigid body simulation and explicit caller-owned physics storage |
+| [examples/steps.sq](examples/steps.sq) | Fixed-timestep simulation loop with pose interpolation |
+| [examples/joints.sq](examples/joints.sq) | Distance/hinge joint pendulum simulation |
+| [examples/ground.sq](examples/ground.sq) | Heightfield terrain queries and ground following |
+| [examples/navigation.sq](examples/navigation.sq), [examples/navmesh.sq](examples/navmesh.sq) | Grid A* routing and convex navmesh corridor/funnel smoothing |
+| [examples/animation.sq](examples/animation.sq), [examples/cinematic.sq](examples/cinematic.sq) | Skeletal animation blending and multi-track sequencer cinematics |
+| [examples/sketch_ui.sq](examples/sketch_ui.sq) | Asset-free Drawful-style immediate-mode UI with live widgets, 5 fps line boil, and doodle pad (interactive Pen WebGPU demo) |
+| [examples/d2_lighting.sq](examples/d2_lighting.sq) | 2D tilemaps, sprites, SDF UI, click-to-toss 2D physics, and Radiance Cascades 2D GI (interactive Pen WebGPU demo) |
+| [examples/physics_sandbox.sq](examples/physics_sandbox.sq) | 3D wireframe rigid-body crate tower smashed by a swinging distance-joint pendulum with live HUD (interactive Pen WebGPU demo) |
+| [examples/nav_playground.sq](examples/nav_playground.sq) | Convex polygon navmesh, A* corridor, funnel string-pulling, and 6 ORCA crowd agents (interactive Pen WebGPU demo) |
+| [examples/ik_rig.sq](examples/ik_rig.sq) | Analytic 2-bone IK + 6-segment FABRIK chain tracking a spring-damped cursor target with trauma shake (interactive Pen WebGPU demo) |
+| [examples/rollback.sq](examples/rollback.sq) | Deterministic two-peer GGPO rollback with snapshot rings and checksums |
+| [examples/showcase_editor.sq](examples/showcase_editor.sq) | Headless 3D scene-graph editor with picking, gizmos, undo/redo, and play snapshots |
+| [examples/game.sq](examples/game.sq), [examples/mechanisms.sq](examples/mechanisms.sq) | End-to-end game state composition and cross-module state mechanisms |
 
 ## Core Shaders
 
@@ -189,28 +189,28 @@ Five standalone WGSL shaders ship under `shaders/` with [documented bindings and
 
 | Guide | Covers |
 | --- | --- |
-| [docs/patterns.md](docs/patterns.md) | Extensive, concise cookbook of performant & idiomatic Ink/Blot patterns with short examples |
-| [docs/blot.md](docs/blot.md) | Full module API contracts, ownership/borrowing rules, and compiler quirks |
+| [docs/patterns.md](docs/patterns.md) | Extensive, concise cookbook of performant & idiomatic Ink/Squid patterns with short examples |
+| [docs/squid.md](docs/squid.md) | Full module API contracts, ownership/borrowing rules, and compiler quirks |
 | [docs/architecture.md](docs/architecture.md) | Package boundaries, host/library separation, and ABI invariants |
 | [docs/state.md](docs/state.md) | Handles, caching, saveable behaviors, and opt-in codec generation |
 | [docs/shaders.md](docs/shaders.md) | Core WGSL binding layouts, uniforms, and vertex attributes |
-| [docs/testing.md](docs/testing.md) | Blot fixtures, Rust reference oracles, and headless GPU shader tests |
+| [docs/testing.md](docs/testing.md) | Squid fixtures, Rust reference oracles, and headless GPU shader tests |
 | [docs/benchmarks.md](docs/benchmarks.md) | Benchmark methodology, numerical witnesses, and memory plateau measurements |
 
 ## Develop & Verify
 
-Requires a locally built Pen binary, Rust/Cargo, and sibling `../blot2` checkout (`pen.json` wires compiler paths and aliases). Shader tests run headlessly (Mesa's software Vulkan adapter works in CI) and the full suite requires no JS/TS tooling.
+Requires a locally built Pen binary, Rust/Cargo, and sibling `../squid-lang` checkout (`pen.json` wires compiler paths and aliases). Shader tests run headlessly (Mesa's software Vulkan adapter works in CI) and the full suite requires no JS/TS tooling.
 
 ```sh
-blot test                                  # All Blot test suites + rejected fixtures (via blot.json)
-blot test --filter navigation              # Filter Blot test suites by name
-pen test-blot                              # All Blot suites + Rust reference & headless GPU tests
-pen test-blot --filter navigation          # Filter both Blot and Rust suites
-pen test-blot tests/dialogs.blot           # Run one Blot fixture file
-blot doc ink --check-links --test          # Verify intra-doc links and run all lib/ doctests
-blot doc ink/numeric                       # Print compiler-checked Markdown API for one module
-blot doc ink --search Quat                 # Search symbols, signatures, and doc comments
-blot doc ink --html --out docs-site        # Export static HTML site with live Wasm examples
+squid test                                  # All Squid test suites + rejected fixtures (via squid.json)
+squid test --filter navigation              # Filter Squid test suites by name
+pen test-squid                              # All Squid suites + Rust reference & headless GPU tests
+pen test-squid --filter navigation          # Filter both Squid and Rust suites
+pen test-squid tests/dialogs.sq           # Run one Squid fixture file
+squid doc ink --check-links --test          # Verify intra-doc links and run all lib/ doctests
+squid doc ink/numeric                       # Print compiler-checked Markdown API for one module
+squid doc ink --search Quat                 # Search symbols, signatures, and doc comments
+squid doc ink --html --out docs-site        # Export static HTML site with live Wasm examples
 pen tool ink -- fmt --check                # Format check
 pen tool ink -- generate tools/generate.json
 pen tool ink -- bench                      # Full 335-workload benchmark + witnesses

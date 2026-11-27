@@ -71,7 +71,7 @@ pub fn splits(n: f64, f: f64, count: usize, blend: f64) -> Vec<f64> {
 }
 #[test]
 fn color_transfer_hdr_exposure_and_ggx_energy() {
-    let mut f = Fixture::new("tests/render-math.blot");
+    let mut f = Fixture::new("tests/render-math.sq");
     for v in [0., 0.0031308, 0.04045, 0.18, 0.5, 1., 4.] {
         let c = [v, v * 0.5, v * 1.5];
         let r = f.floats(
@@ -144,7 +144,7 @@ pub fn basis(d: &[f64]) -> [f64; 9] {
 }
 #[test]
 fn lighting_falloff_spot_cones_sky_and_sh_quadrature() {
-    let mut f = Fixture::new("tests/render-math.blot");
+    let mut f = Fixture::new("tests/render-math.sq");
     for distance in [1f64, 2., 9., 10., 11.] {
         let attenuation = if distance < 10. {
             (1. - (distance / 10.).powi(4)).powi(2) / (distance * distance)
@@ -242,7 +242,7 @@ fn lighting_falloff_spot_cones_sky_and_sh_quadrature() {
 }
 #[test]
 fn shadow_splits_match_the_reference_increase_and_end_at_far() {
-    let mut f = Fixture::new("tests/render-math.blot");
+    let mut f = Fixture::new("tests/render-math.sq");
     for blend in [0., 0.5, 1.] {
         for count in [1, 4, 8] {
             let r = f.floats("splits", [0.1, 1000., count as f64, blend]);
@@ -305,7 +305,7 @@ fn sky_light_toward(settings: &[[f64; 3]; 3], n: &[f64; 3]) -> [f64; 3] {
 }
 #[test]
 fn sky_sh_diffuse_matches_direct_cosine_integration_and_keeps_flat_ambient() {
-    let mut f = Fixture::new("tests/render-math.blot");
+    let mut f = Fixture::new("tests/render-math.sq");
     let skies = [
         [[0.1, 0.2, 0.4], [0.3, 0.4, 0.5], [0.01, 0.02, 0.03]],
         [[0.9, 0.5, 0.2], [1.2, 0.8, 0.5], [0.05, 0.04, 0.03]],
@@ -397,7 +397,7 @@ fn sky_sh_diffuse_matches_direct_cosine_integration_and_keeps_flat_ambient() {
 
 #[test]
 fn camera_relative_planar_reflection_oblique_clip_and_split_screen_match_f64_reference() {
-    let mut f = Fixture::new("tests/render-math.blot");
+    let mut f = Fixture::new("tests/render-math.sq");
     let eye = [10000.0, 2.5, -5000.0];
     let plane_pt = [0.0, 0.0, 0.0];
     let plane_n = [0.0, 1.0, 0.0];

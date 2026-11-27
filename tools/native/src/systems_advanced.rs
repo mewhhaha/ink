@@ -3,7 +3,7 @@
 //! camera-facing ribbon geometry, and LOD crossfade continuity.
 use super::*;
 
-const FIXTURE: &str = "tests/systems_advanced_reference.blot";
+const FIXTURE: &str = "tests/systems_advanced_reference.sq";
 
 #[test]
 fn audio_compressor_and_reverb_match_f64_reference() {
@@ -219,7 +219,7 @@ fn acoustics_ray_tracing_eyring_and_smoothing_match_f64_reference() {
         small[5] < 0.02 && large[5] < 0.02,
         "closed cube must have ~0 outdoor escape"
     );
-    // Check Blot's Eyring RT60 formula matches f64 given the measured MFP to < 1e-3!
+    // Check Squid's Eyring RT60 formula matches f64 given the measured MFP to < 1e-3!
     let eyring = |mfp: f64, alpha: f64, air: f64, outdoor: f64| -> f64 {
         let wall = -(1.0 - alpha.clamp(0.01, 0.98)).ln();
         let raw = 0.04025 * mfp / (wall + air * mfp).max(0.015);

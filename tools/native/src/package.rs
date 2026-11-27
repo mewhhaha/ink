@@ -19,9 +19,9 @@ pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
     }
     let mut out = vec![PathBuf::from("LICENSE"), PathBuf::from("README.md")];
     for (dir, suffix) in [
-        ("lib", "blot"),
+        ("lib", "sq"),
         ("shaders", "wgsl"),
-        ("examples", "blot"),
+        ("examples", "sq"),
         ("docs", "md"),
     ] {
         walk(root, &root.join(dir), suffix, &mut out)?;

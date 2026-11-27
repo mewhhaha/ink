@@ -1,11 +1,11 @@
 use anyhow::{Result, ensure};
-use blot_host::{
-    Guest, Value,
-    kernels::{KernelConfig, KernelPool},
-};
 use ink_tools::{compiled, engine};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use squid_host::{
+    Guest, Value,
+    kernels::{KernelConfig, KernelPool},
+};
 use std::time::Instant;
 
 fn reference(context: &[f32], queries: &[f32]) -> Vec<f32> {
@@ -43,7 +43,7 @@ fn from_words(words: &[u32]) -> Vec<f32> {
 
 fn main() -> Result<()> {
     let engine = engine().clone();
-    let module = compiled("tests/perf/worker_sessions.blot", &[]);
+    let module = compiled("tests/perf/worker_sessions.sq", &[]);
     let mut cfg = KernelConfig::default();
     cfg.workers = 4;
     let mut pool = KernelPool::open(&engine, &module, "nearest_points", cfg)?;

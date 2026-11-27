@@ -12,7 +12,7 @@ const OTHER: u32 = 5;
 
 #[test]
 fn i18n_cldr_plurals_match_reference() {
-    let mut f = Fixture::new("tests/ui_headless.blot");
+    let mut f = Fixture::new("tests/ui_headless.sq");
     let cases: &[(&str, f32, u32)] = &[
         // English / German / Swedish
         ("en", 0.0, OTHER),
@@ -107,7 +107,7 @@ fn i18n_cldr_plurals_match_reference() {
 
 #[test]
 fn i18n_rtl_detection_matches_bcp47_scripts() {
-    let mut f = Fixture::new("tests/ui_headless.blot");
+    let mut f = Fixture::new("tests/ui_headless.sq");
     let cases: &[(&str, bool)] = &[
         ("ar", true),
         ("ar-EG", true),

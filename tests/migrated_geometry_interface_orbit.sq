@@ -1,0 +1,106 @@
+// The orbit camera (packages/orbit.sq) against the mountains round the
+// floor: panned out to the boundary, then turned all the way round there.
+import { Vec3 } from "std/vector"
+import * as test from "std/test"
+import * as math from "ink/math"
+import * as orbit from "ink/orbit"
+
+const initial = $orbit.Orbit { focus: math.zero3, yaw: 0.0, pitch: 0.6, distance: 6.0 }
+const bounds = $orbit.Settings { bindings: $orbit.Bindings { ahead: 17, back: 31, left: 30, right: 32, fast: 42, button: 2 }, start: initial, nearest: 3.0, farthest: 20.0, lowest: 0.3, steepest: 1.4, room: 10.0, overlook: false }
+
+func radius (point: Vec3) => sqrt (point.x * point.x + point.z * point.z)
+
+// Panned 60 times toward -z, well past the boundary.
+const panned_out = do:
+  let moved = initial
+  for 0 .. 60:
+    moved := orbit.panned bounds self (math.vec3 0.0 0.0 (-0.8))
+  break moved
+
+@[test.suite]
+test "panning reaches the camera boundary":
+  let z = (orbit.view bounds panned_out).position.z
+  use test.near "boundary z" 0.001 (-10.0) z
+  return ()
+
+// Every yaw at the boundary: the farthest the camera gets from the middle,
+// and how far its height strays from where panning left it.
+@[test.suite]
+test "a full turn stays inside the mountains at the same height":
+  let close = orbit.view bounds panned_out
+  let moved = panned_out
+  let farthest = 0.0
+  let height_error = 0.0
+  for index in 0 .. 120:
+    moved.yaw := U32.to_f32 index * tau / 120.0
+    let camera = orbit.view bounds moved
+    farthest := max self (radius camera.position)
+    height_error := max self (abs (camera.position.y - close.position.y))
+  use test.within "farthest radius" 0.0 10.001 farthest
+  use test.holds "height error < 0.001" (height_error < 0.001)
+  return ()
+
+// Turned to face out at the wall, panning back inward moves the camera at
+// once.
+@[test.suite]
+test "panning inward responds at once after turning":
+  let moved = panned_out
+  moved.yaw := pi
+  let before = radius (orbit.view bounds moved).position
+  let after = radius (orbit.view bounds (orbit.panned bounds moved (math.vec3 0.0 0.0 1.0))).position
+  use test.holds "inward move > 0.99" (before - after > 0.99)
+  return ()
+
+const overlook = do:
+  let settings = bounds
+  settings.overlook := true
+  break settings
+
+@[test.suite]
+test "looking inward can back beyond the rim without losing the focus":
+  let far = orbit.zoomed overlook 1.0 initial 10.0
+  let (_, back) = orbit.turning far
+  let shown = orbit.view overlook far
+  let aimed = shown.position - back * far.distance
+  let outside_rim = radius shown.position > overlook.room
+  use test.holds "backed beyond rim" outside_rim
+  use test.near_array "aimed at origin" 0.001 #[0.0, 0.0, 0.0] #[aimed.x, aimed.y, aimed.z]
+  return ()
+
+@[test.suite]
+test "overlook still stops an outward view and rebases after turning":
+  let moved = initial
+  for 0 .. 60:
+    moved := orbit.panned overlook self (math.vec3 0.0 0.0 (-0.8))
+  let outward = orbit.view overlook moved
+  moved.yaw := pi
+  let before = orbit.view overlook moved
+  let after = orbit.view overlook (orbit.panned overlook moved (math.vec3 0.0 0.0 1.0))
+  let dz = after.position.z - before.position.z
+  let beyond_rim = radius before.position > overlook.room
+  use test.near_array "outward stop and inward step" 0.001 #[-10.0, 1.0] #[outward.position.z, dz]
+  use test.holds "beyond rim after turn" beyond_rim
+  return ()
+
+@[test.suite]
+test "turning over the rim remains continuous and keeps the arena in reach":
+  let moved = initial
+  moved.distance := 20.0
+  moved.focus := math.vec3 7.0 0.0 (-14.0)
+  let previous = orbit.view overlook moved
+  for index in 1 .. 361:
+    moved.yaw := U32.to_f32 index * tau / 360.0
+    let (_, back) = orbit.turning moved
+    let reach = back * moved.distance
+    let eye = (orbit.view overlook moved).position
+    let t = clamp 0.0 1.0 ((eye.x * reach.x + eye.z * reach.z) / (reach.x * reach.x + reach.z * reach.z))
+    let nearest = eye - reach * t
+    let r = radius nearest
+    let step_len = (eye - previous.position).length
+    let prev_y = previous.position.y
+    let eye_y = eye.y
+    use test.within "arena in reach" 0.0 10.001 r
+    use test.holds "continuous step" (step_len < 0.8)
+    use test.near "constant height" 0.001 prev_y eye_y
+    previous := orbit.view overlook moved
+  return ()

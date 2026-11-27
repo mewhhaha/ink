@@ -1,0 +1,69 @@
+//! Separate named owners: rows plus metadata [epoch, capacity, next, oldest].
+//! A reader is ordinary data; no callback registry or retained continuation.
+//!
+//! Key items: [`Messages`], [`Metadata`], [`Reader`], [`Delivery`], [`empty`].
+//!
+//! ```squid
+//! import * as msg from "ink/messages"
+//! let stream: msg.Messages U32 = msg.empty ()
+//! let meta = msg.metadata 1 8
+//! let reader = msg.cursor meta
+//! let (stream, meta) = msg.write_many #[5, 8, 13] stream meta
+//! let out: #[U32] = #[]
+//! let $msg.Items { values } = msg.read reader stream meta out else:
+//!   return #[]
+//! values // => #[5, 8, 13]
+//! ```
+
+import * as array from "std/array"
+
+type Messages a = #[a]
+type Metadata = #[U32]
+type Reader is data = $Reader { epoch: U32, next: U32 }
+type Delivery a is data = $Items { values: #[a], cursor: Reader } | $Reset Reader
+func empty () : Messages a => #[]
+func metadata (epoch: U32) -> (capacity: U32) : Metadata => #[epoch, capacity, 0, 0]
+func cursor (meta: Metadata) => $Reader { epoch: meta[0], next: meta[2] }
+func beginning (meta: Metadata) => $Reader { epoch: meta[0], next: meta[3] }
+func restart (epoch: U32) -> (log: own Messages a) -> (meta: own Metadata): (Messages a, Metadata) =>
+  if epoch == meta[0]:
+    return panic "message restart requires a fresh epoch"
+  @storage.truncate log 0
+  meta[0] := epoch
+  meta[2] := 0
+  meta[3] := 0
+  return (log, meta)
+func write value -> (log: own Messages a) -> (meta: own Metadata): (Messages a, Metadata) =>
+  if meta[2] == 0xFFFFFFFF:
+    return panic "message sequence exhausted"
+  let next = meta[2] + 1
+  let capacity = meta[1]
+  if capacity > 0:
+    if log.length < capacity:
+      @storage.push log value
+    else:
+      log[meta[2] % capacity] := value
+  meta[2] := next
+  meta[3] := max meta[3] (next - min next capacity)
+  return (log, meta)
+func write_many (values: #[a]) -> (log: own Messages a) -> (meta: own Metadata): (Messages a, Metadata) =>
+  if values.length > 0xFFFFFFFF - meta[2]:
+    return panic "message sequence exhausted"
+  let state = (log, meta)
+  let count = values.length
+  for i in 0 .. count:
+    state := do:
+      let (l, m) = self
+      break write values[i] l m
+  return state
+// Read into a separately named caller-owned destination. The returned ADT is
+// flat and borrows that destination; it cannot extend its lifetime or own a
+// nested array inside a log/queue element. Payload rows must themselves be flat.
+func read (reader: Reader) -> (log: Messages a) -> (meta: Metadata) -> (destination: own #[a]) : Delivery a =>
+  let after = cursor meta
+  if reader.epoch != meta[0] or reader.next < meta[3] or reader.next > meta[2]:
+    return $Reset after
+  @storage.truncate destination 0
+  for i in 0 .. meta[2] - reader.next:
+    @storage.push destination log[(reader.next + i) % meta[1]]
+  return $Items {values: destination, cursor: after}

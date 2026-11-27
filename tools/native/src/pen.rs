@@ -1,6 +1,6 @@
 use crate::*;
 
-// Named header lane indices matching `tests/fixtures/pen/protocol.blot`.
+// Named header lane indices matching `tests/fixtures/pen/protocol.sq`.
 const LANE_PROBE_VOLUME_START: usize = 117;
 const LANE_FOG_BASE_START: usize = 125;
 const LANE_BUS_COUNT: usize = 163;
@@ -82,7 +82,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
 }
 #[test]
 fn pen_packets_preserve_offsets_tails_and_record_meanings() {
-    let mut f = Fixture::new("tests/pen.blot");
+    let mut f = Fixture::new("tests/pen.sq");
     let p = f.floats("frame_packet", 0);
     // Session2 render packets carry no opaque state; snapshots are explicit.
     assert_eq!(p.len(), 679 + HEADER_GROWTH);
@@ -272,12 +272,12 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
             rust_hash = rust_hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
-    let blot_hash = f.words(
+    let squid_hash = f.words(
         "kernel_fnv1a64_f32s",
         sample.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
     );
     assert_eq!(
-        blot_hash,
+        squid_hash,
         vec![(rust_hash & 0xffff_ffff) as u32, (rust_hash >> 32) as u32]
     );
     // Shared host.measure_frame_floats matches 1 + encoded.length with & without extensions.
@@ -386,7 +386,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
 }
 #[test]
 fn pen_preferences_and_scene_caps_stay_separate() {
-    let mut f = Fixture::new("tests/pen.blot");
+    let mut f = Fixture::new("tests/pen.sq");
     assert!(matches!(
         f.call("occlusion_default", 0).unwrap(),
         Value::Bool(true)
@@ -421,7 +421,7 @@ fn pen_preferences_and_scene_caps_stay_separate() {
 #[test]
 fn shadow_settings_cascades_and_a_shadow_casting_spot_light_survive_the_encoder() {
     use crate::shadow::{Case, check_fit};
-    let mut f = Fixture::new("tests/pen.blot");
+    let mut f = Fixture::new("tests/pen.sq");
     // Header lanes of the generated protocol: the shadow view, then texels,
     // filter, softness, contact steps, contact length, local casters and their
     // map size; the light and cascade counts follow the quality lanes.
@@ -510,7 +510,7 @@ fn identity() -> [f64; 16] {
 }
 #[test]
 fn adapter_parent_indices_and_presentation_snapshots() {
-    let mut f = Fixture::new("tests/perf/adapters.blot");
+    let mut f = Fixture::new("tests/perf/adapters.sq");
     let pairs = vec![
         0u32,
         0,
@@ -541,7 +541,7 @@ fn adapter_parent_indices_and_presentation_snapshots() {
         f.words("parent_indices", pairs),
         vec![0, 0, 2, 2, 4, 5, 0, 7, 0, 9, 0, 5]
     );
-    let mut f = Fixture::new("tests/perf/presentation.blot");
+    let mut f = Fixture::new("tests/perf/presentation.sq");
     for entry in ["render_columns", "render_meshes"] {
         assert_eq!(f.floats(entry, 0), vec![0.; 3]);
     }
@@ -569,7 +569,7 @@ fn adapter_parent_indices_and_presentation_snapshots() {
 }
 #[test]
 fn probe_volumes_encode_their_header_and_each_probes_twenty_eight_lanes() {
-    let mut f = Fixture::new("tests/pen.blot");
+    let mut f = Fixture::new("tests/pen.sq");
     let values: Vec<f64> = (0..56).map(|i| (i as f64) * 0.25 - 3.0).collect();
     let p = f.floats("probe_packet", values.clone());
     assert_eq!(
@@ -592,7 +592,7 @@ fn probe_volumes_encode_their_header_and_each_probes_twenty_eight_lanes() {
 
 #[test]
 fn reflection_probes_encode_their_fields_and_the_quality_tiers_cap_the_march() {
-    let mut f = Fixture::new("tests/pen.blot");
+    let mut f = Fixture::new("tests/pen.sq");
     let p = f.floats("reflection_packet", vec![2., 1., 3.]);
     // The header: two probes, the lower of the game's and the player's march, the budget.
     assert_eq!(
@@ -649,7 +649,7 @@ fn reflection_probes_encode_their_fields_and_the_quality_tiers_cap_the_march() {
 
 #[test]
 fn fog_and_its_volumes_encode_their_fields_and_the_tiers_cap_the_froxel_volume() {
-    let mut f = Fixture::new("tests/pen.blot");
+    let mut f = Fixture::new("tests/pen.sq");
     // The scene's tier, the player's tier and the player's fog thickness.
     let p = f.floats("fog_packet", vec![2., 1., 0.5]);
     // The old lanes: the radius, the density scaled by the player's thickness, the height.
@@ -770,7 +770,7 @@ fn traps_with(f: &mut Fixture, what: &str, input: [f64; 7]) {
 
 #[test]
 fn a_retained_instance_keeps_every_bit_of_its_id_and_order_in_the_encoder() {
-    let mut f = Fixture::new("tests/pen-instances.blot");
+    let mut f = Fixture::new("tests/pen-instances.sq");
     // Ids are full width: both 16-bit halves travel, whatever the id; orders reach 2^24 - 1.
     for id in [
         0u32,
@@ -823,7 +823,7 @@ fn a_retained_instance_keeps_every_bit_of_its_id_and_order_in_the_encoder() {
 
 #[test]
 fn the_encoder_traps_on_an_order_extra_data_or_counts_the_wire_cannot_hold() {
-    let mut f = Fixture::new("tests/pen-instances.blot");
+    let mut f = Fixture::new("tests/pen-instances.sq");
     let (updates, removals) = (100_000., 100_000.);
     // At the limits it encodes: the last order, the most updates, the most removals.
     let one = encoded(&mut f, 7, 16_777_215., 0., 1., 0., false);
@@ -865,7 +865,7 @@ fn the_encoder_traps_on_an_order_extra_data_or_counts_the_wire_cannot_hold() {
 
 #[test]
 fn attach_rejects_the_same_streams_before_they_reach_the_encoder() {
-    let mut f = Fixture::new("tests/pen-instances.blot");
+    let mut f = Fixture::new("tests/pen-instances.sq");
     let (updates, removals) = (100_000., 100_000.);
     // It accepts what fits, up to the limits, and refuses the rest without touching the frame:
     // the answer is whether it was accepted, then the frame's updates, removals and retained flag.
@@ -897,7 +897,7 @@ fn attach_rejects_the_same_streams_before_they_reach_the_encoder() {
 
 #[test]
 fn exposure_and_the_grade_reach_the_packets_header_as_the_game_set_them() {
-    let mut f = Fixture::new("tests/pen.blot");
+    let mut f = Fixture::new("tests/pen.sq");
     let p = f.floats("look_packet", 0);
     // Exposure: auto, compensation, least, most, brighten, darken, low, high, centre, the
     // histogram's range, middle grey, the game's seconds, and a cut.
@@ -921,7 +921,7 @@ fn exposure_and_the_grade_reach_the_packets_header_as_the_game_set_them() {
 #[test]
 fn fidelity_post_features_area_lights_pbr_decals_camera_targets_and_video_streams_encode_accurately()
  {
-    let mut f = Fixture::new("tests/pen.blot");
+    let mut f = Fixture::new("tests/pen.sq");
     let raw = f.floats("fidelity_packet", 0);
     let measured = *raw.last().unwrap() as usize;
     let p = &raw[..raw.len() - 1];
@@ -973,7 +973,7 @@ fn fidelity_post_features_area_lights_pbr_decals_camera_targets_and_video_stream
 
 #[test]
 fn spatial_audio_reverb_zones_synths_and_doppler_encode_accurately() {
-    let mut f = Fixture::new("tests/pen.blot");
+    let mut f = Fixture::new("tests/pen.sq");
     let raw = f.floats("spatial_synth_packet", 0);
     let measured = *raw.last().unwrap() as usize;
     let p = &raw[..raw.len() - 1];

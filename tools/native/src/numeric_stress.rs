@@ -47,7 +47,7 @@ fn fbm(p: [f64; 3], dimension: usize) -> f64 {
 }
 #[test]
 fn full_width_random_noise_rotations_and_subnormal_normalization() {
-    let mut f = Fixture::new("tests/numeric-stress.blot");
+    let mut f = Fixture::new("tests/numeric-stress.sq");
     for initial in [0u32, 1, 0x80000001, u32::MAX] {
         let a = f.words("sequence", initial);
         assert_eq!(a.len(), 4096);
@@ -137,7 +137,7 @@ fn full_width_random_noise_rotations_and_subnormal_normalization() {
 }
 #[test]
 fn springs_conserve_or_dissipate_energy_and_variable_frames_account_time() {
-    let mut f = Fixture::new("tests/numeric-stress.blot");
+    let mut f = Fixture::new("tests/numeric-stress.sq");
     for damping in [0., 0.001, 0.25, 0.999, 1., 1.001, 2., 20.] {
         let dt = f32(1. / 60.);
         let direct = call(&mut f, "spring", [3., -2., 1., 6., damping, f32(dt * 240.)]);
@@ -187,7 +187,7 @@ fn springs_conserve_or_dissipate_energy_and_variable_frames_account_time() {
 }
 #[test]
 fn random_affines_camera_conventions_shadow_fits_hdr_and_audio() {
-    let mut f = Fixture::new("tests/numeric-stress.blot");
+    let mut f = Fixture::new("tests/numeric-stress.sq");
     let mut rng = R(0xa19c4037);
     for _ in 0..128 {
         rng.vector();
@@ -397,7 +397,7 @@ fn signed_root_loops_ordered_events_and_rounded_endpoints() {
         }
         panic!("missing Wasm memory declaration");
     }
-    let bytes = match build("tests/numeric-stress.blot", &[]) {
+    let bytes = match build("tests/numeric-stress.sq", &[]) {
         BuildResult::Built(bytes) => bytes,
         BuildResult::Rejected(errors) => panic!("numeric-stress: {errors:#?}"),
     };
@@ -481,7 +481,7 @@ fn signed_root_loops_ordered_events_and_rounded_endpoints() {
 #[test]
 fn ballistic_steering_240_steps_replay() {
     fn trajectory() -> Vec<f64> {
-        let mut f = Fixture::new("tests/numeric-stress.blot");
+        let mut f = Fixture::new("tests/numeric-stress.sq");
         let dt = f32(1. / 120.);
         let a = [0., f32(-9.8), 0.];
         let mut state = vec![1., 2., 3., 4., 5., -2., 0.];

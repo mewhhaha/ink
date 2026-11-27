@@ -152,7 +152,7 @@ fn euclid(g: &Grid, a: usize, b: usize) -> f64 {
 
 #[test]
 fn eight_neighbour_search_matches_dijkstra_without_corner_cutting() {
-    let mut f = Fixture::new("tests/navigation_grid8.blot");
+    let mut f = Fixture::new("tests/navigation_grid8.sq");
     let mut reached = 0;
     for seed in 1..=60u32 {
         let mut r = Random(seed);
@@ -206,7 +206,7 @@ fn eight_neighbour_search_matches_dijkstra_without_corner_cutting() {
 }
 #[test]
 fn theta_star_paths_see_every_segment_and_beat_the_grid_path() {
-    let mut f = Fixture::new("tests/navigation_grid8.blot");
+    let mut f = Fixture::new("tests/navigation_grid8.sq");
     let (mut shorter, mut checked) = (0, 0);
     for seed in 1..=60u32 {
         let mut r = Random(seed + 500);
@@ -248,7 +248,7 @@ fn theta_star_paths_see_every_segment_and_beat_the_grid_path() {
 }
 #[test]
 fn line_of_sight_matches_exact_segment_cell_intersection() {
-    let mut f = Fixture::new("tests/navigation_grid8.blot");
+    let mut f = Fixture::new("tests/navigation_grid8.sq");
     for seed in 1..=30u32 {
         let mut r = Random(seed + 900);
         let (w, h) = (4 + seed as usize % 9, 4 + seed as usize % 7);
@@ -280,7 +280,7 @@ fn line_of_sight_matches_exact_segment_cell_intersection() {
 }
 #[test]
 fn grid_search_adversarial_inputs() {
-    let mut f = Fixture::new("tests/navigation_grid8.blot");
+    let mut f = Fixture::new("tests/navigation_grid8.sq");
     let g = Grid {
         w: 5,
         h: 1,
@@ -354,7 +354,7 @@ fn field(f: &mut Fixture, g: &Grid, goals: &[usize], budget: usize) -> (bool, Ve
 }
 #[test]
 fn flow_fields_match_dijkstra_and_directions_descend() {
-    let mut f = Fixture::new("tests/navigation_grid8.blot");
+    let mut f = Fixture::new("tests/navigation_grid8.sq");
     for seed in 1..=40u32 {
         let mut r = Random(seed + 77);
         let (w, h) = (3 + seed as usize % 12, 3 + seed as usize % 9);

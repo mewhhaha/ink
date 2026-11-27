@@ -1,12 +1,12 @@
 use super::*;
 #[test]
 fn general_mechanisms_and_ring_snapshots() {
-    let mut example = Fixture::new("examples/mechanisms.blot");
+    let mut example = Fixture::new("examples/mechanisms.sq");
     assert_eq!(
         example.floats("dashboard", ()),
         [5.0, 1.0, 300.0, 48.0, 328.0, 48.0, 1.0, 2.0, 1.0]
     );
-    let mut f = Fixture::new("tests/general-mechanisms.blot");
+    let mut f = Fixture::new("tests/general-mechanisms.sq");
     for steps in 0..200 {
         let capacity = steps % 17;
         let mut values = Vec::new();
@@ -45,7 +45,7 @@ fn general_mechanisms_and_ring_snapshots() {
 }
 #[test]
 fn ui_numeric_controls_and_settings_id_uniqueness() {
-    let mut f = Fixture::new("tests/ui_boundaries.blot");
+    let mut f = Fixture::new("tests/ui_boundaries.sq");
     for a in [
         [0.0, f64::NAN, 1.0, 0.0],
         [0.0, 1.0, -1.0, 0.0],
@@ -54,7 +54,7 @@ fn ui_numeric_controls_and_settings_id_uniqueness() {
     ] {
         assert!(f.floats("invalid_slider", a).iter().all(|x| x.is_finite()));
     }
-    let mut f = Fixture::new("tests/tune.blot");
+    let mut f = Fixture::new("tests/tune.sq");
     assert_eq!(f.number("decode_ids", [9.0, 3.0, 5.0]), 3.0);
     assert_eq!(f.number("decode_ids", []), 0.0);
     for ids in [
@@ -67,7 +67,7 @@ fn ui_numeric_controls_and_settings_id_uniqueness() {
 }
 #[test]
 fn migrated_geometry_boundaries_and_workload_witnesses() {
-    let mut f = Fixture::new("tests/migrated_geometry.blot");
+    let mut f = Fixture::new("tests/migrated_geometry.sq");
     assert_eq!(
         f.floats("clear_segments", ()),
         [0.0, 0.0, 1.0, 1.0, 1.0, 0.0]

@@ -1,0 +1,497 @@
+//! GGPO-style rollback for deterministic peer-to-peer play. A caller's `step`
+//! is a pure function of its state and one frame of input lanes; this module
+//! owns only input rings, confirmation bookkeeping and the schedule of rollback.
+//! Nothing here owns the game state, the saved-state ring, the clock or the
+//! transport: callers pass their own `state` and snapshot `ring` owners with
+//! `own` and compile-known callbacks copy between them.
+//!
+//! Frame f is the state before f's inputs apply. Inputs are fixed-width U32
+//! lanes. A local sample taken while simulating frame f applies at f + delay;
+//! every peer starts with frames [0, delay) confirmed as zeros.
+//!
+//! Callbacks (all compile-known, passed by the caller):
+//!   predict player frame lane last_word -> word   (repeat_last by default)
+//!   step    state inputs                  -> state (inputs: players * lanes)
+//!   save    slot state ring               -> ring  (copy state into slot)
+//!   load    slot ring state               -> state (copy slot over state)
+//!   checksum slot ring                    -> word
+//! Slots run 0 .. snapshots config; slot of frame f is f % snapshots config.
+//!
+//! Key items: [`Config`], [`Rollback`], [`Header`], [`Outcome`], [`ring_size`].
+//!
+//! ```squid
+//! let cfg = $Config { players: 2, lanes: 1, window: 6, delay: 2, local: 0, interval: 4, redundancy: 4 }
+//! #[snapshots cfg, local_frame (make cfg)] // => #[7, 2]
+//! ```
+
+import * as array from "std/array"
+import * as hash from "../hash"
+
+const none = 0xFFFFFFFF
+const packet_magic = 0x52424B31
+const version = 1
+const bias = 0x80000000
+const sum_slots = 16
+const header_words = 11
+type Config is data = $Config {
+  players: U32, lanes: U32, window: U32, delay: U32, local: U32,
+  interval: U32, redundancy: U32,
+}
+type Rollback is data = $Rollback {
+  config: Config, ring: U32, current: U32, first_wrong: U32, desync: U32,
+  checked: U32, report_frame: U32, report_sum: U32,
+  rollbacks: U32, resimulated: U32, deepest: U32, stalls: U32,
+  inputs: #[U32], frames: #[U32], kinds: #[U32], last: #[U32],
+  next: #[U32], peer_next: #[U32], peer_frame: #[U32], peer_seen: #[U32], peer_advantage: #[U32],
+  scratch: #[U32],
+  mine_frames: #[U32], mine_sums: #[U32], theirs_frames: #[U32], theirs_sums: #[U32],
+}
+type Header is data = $Header {
+  sender: U32, current: U32, advantage: U32, check_frame: U32, check_sum: U32,
+  start: U32, count: U32,
+}
+// Why `advance` did not simulate a new frame.
+type Outcome is data = $Advanced | $Window | $Backlog
+
+func ring_size (config: Config) : U32 => 2 * (config.window + config.delay) + 4
+// Snapshot slots the caller's saved-state ring must hold.
+func snapshots (config: Config) : U32 => config.window + 1
+func slot (config: Config) -> (frame: U32) : U32 => if config.window == 4294967295 then frame else frame % (config.window + 1)
+func repeat_last (player: U32) -> (frame: U32) -> (lane: U32) -> (last: U32) : U32 => last
+
+func make (config: Config) : Rollback =>
+  if config.players == 0 or config.lanes == 0 or config.window == 0 or config.local >= config.players:
+    return panic "invalid rollback configuration"
+  if config.window > 0x3FFFFFFE or config.delay > 0x3FFFFFFE:
+    return panic "invalid rollback configuration"
+  let ring = ring_size config
+  if config.interval == 0 or config.redundancy == 0 or config.redundancy > ring:
+    return panic "invalid rollback configuration"
+  let players = config.players
+  if ring > 4294967295 / players or players * ring > 4294967295 / config.lanes or players > 4294967295 / sum_slots:
+    return panic "invalid rollback configuration"
+  let s = $Rollback {
+    config, ring, current: 0, first_wrong: none, desync: none,
+    checked: 0, report_frame: none, report_sum: 0,
+    rollbacks: 0, resimulated: 0, deepest: 0, stalls: 0,
+    inputs: array.fill (players * ring * config.lanes) 0,
+    frames: array.fill (players * ring) 0, kinds: array.fill (players * ring) 0,
+    last: array.fill (players * config.lanes) 0,
+    next: array.fill players config.delay, peer_next: array.fill players config.delay,
+    peer_frame: array.fill players 0, peer_seen: array.fill players 0,
+    peer_advantage: array.fill players bias,
+    scratch: array.fill (players * config.lanes) 0,
+    mine_frames: array.fill sum_slots 0, mine_sums: array.fill sum_slots 0,
+    theirs_frames: array.fill (players * sum_slots) 0, theirs_sums: array.fill (players * sum_slots) 0,
+  }
+  for player in 0 .. players:
+    for frame in 0 .. config.delay:
+      let at = player * ring + frame % ring
+      s.frames[at] := frame + 1
+      s.kinds[at] := 2
+  return s
+
+func current (s: Rollback) : U32 => s.current
+// First frame some player's confirmed input is missing. The state at any frame
+// up to and including it is final; frames before it never roll back.
+func frontier (s: Rollback) : U32 =>
+  let next = s.next
+  let players = s.config.players
+  let low = next[0]
+  if players == 2:
+    return min low next[1]
+  for player in 1 .. players:
+    low := min self next[player]
+  return low
+// Next frame whose local input the caller must supply is `local_frame - delay`
+// samples after the first; applications index their own samples by it.
+func local_frame (s: Rollback) : U32 => s.next[s.config.local]
+func settled (s: Rollback) : Bool => s.first_wrong == none and frontier s >= s.current
+func desynced (s: Rollback) : Bool => s.desync != none
+func desync_frame (s: Rollback) : U32 => s.desync
+
+// Read the input of `player` at `frame` as currently held (confirmed or the
+// prediction last simulated with); Nothing when the ring holds no such frame.
+func input_at (s: Rollback) -> (player: U32) -> (frame: U32) -> (lane: U32) : Maybe U32 =>
+  if player >= s.config.players or lane >= s.config.lanes:
+    return $Nothing
+  let at = player * s.ring + frame % s.ring
+  if s.frames[at] != frame + 1:
+    return $Nothing
+  return $Some s.inputs[at * s.config.lanes + lane]
+
+// Fill `scratch` with frame inputs, predicting unconfirmed players and
+// recording what was used so later arrivals can be compared against it.
+func resolve_inputs (predict: U32 -> U32 -> U32 -> U32 -> U32) -> (frame: U32) -> (s: own Rollback) : Rollback =>
+  let lanes = s.config.lanes
+  let ring = s.ring
+  let frame_slot = frame % ring
+  let stamp = frame + 1
+  for player in 0 .. s.config.players:
+    let at = player * ring + frame_slot
+    let player_base = player * lanes
+    let input_base = at * lanes
+    if s.frames[at] == stamp and s.kinds[at] == 2:
+      for lane in 0 .. lanes:
+        s.scratch[player_base + lane] := s.inputs[input_base + lane]
+    else:
+      for lane in 0 .. lanes:
+        let word = predict player frame lane s.last[player_base + lane]
+        s.scratch[player_base + lane] := word
+        s.inputs[input_base + lane] := word
+      s.frames[at] := stamp
+      s.kinds[at] := 1
+  return s
+
+// Store a confirmed input. Duplicates, old frames and frames beyond the ring
+// are ignored. A prediction already simulated that differs marks the frame for
+// rollback. Contiguous confirmed frames then extend the player's frontier.
+func confirm (player: U32) -> (frame: U32) -> (words: &[U32]) -> (offset: U32) -> (s: own Rollback) : Rollback =>
+  let lanes = s.config.lanes
+  if player >= s.config.players or offset > words.length or lanes > words.length - offset or frame == none:
+    return s
+  let low = frontier s
+  if frame < s.next[player] or (frame >= low and frame - low >= s.ring - 1):
+    return s
+  let at = player * s.ring + frame % s.ring
+  if s.frames[at] == frame + 1 and s.kinds[at] == 2:
+    return s
+  if s.frames[at] == frame + 1 and s.kinds[at] == 1 and frame < s.current:
+    for lane in 0 .. lanes:
+      if s.inputs[at * lanes + lane] != words[offset + lane]:
+        s.first_wrong := min s.first_wrong frame
+  for lane in 0 .. lanes:
+    s.inputs[at * lanes + lane] := words[offset + lane]
+  s.frames[at] := frame + 1
+  s.kinds[at] := 2
+  let ring = s.ring
+  for 0 .. ring:
+    let n = s.next[player]
+    let found = player * ring + n % ring
+    let f_word = s.frames[found]
+    let k_word = s.kinds[found]
+    if f_word != n + 1 or k_word != 2:
+      return s
+    for lane in 0 .. lanes:
+      s.last[player * lanes + lane] := s.inputs[found * lanes + lane]
+    s.next[player] := n + 1
+  return s
+
+func compare (frame: U32) -> (s: own Rollback) : Rollback =>
+  let at = (frame / s.config.interval) % sum_slots
+  if s.mine_frames[at] == frame + 1:
+    for player in 0 .. s.config.players:
+      let theirs = player * sum_slots + at
+      if player != s.config.local and s.theirs_frames[theirs] == frame + 1 and s.theirs_sums[theirs] != s.mine_sums[at]:
+        if s.desync == none or frame < s.desync:
+          s.desync := frame
+  return s
+
+// Checksum every newly final snapshot on the exchange interval and compare it
+// with reports already received. Runs once the confirmed frontier passes a frame.
+func record_sums (checksum: U32 -> b -> U32) -> (ring: b) -> (s: own Rollback) : Rollback =>
+  let window = s.config.window
+  let low = if s.current > window then s.current - window else 0
+  let top = min (frontier s + 1) s.current
+  for frame in max s.checked low .. top:
+    if frame % s.config.interval == 0:
+      let sum = checksum (slot s.config frame) ring
+      let at = (frame / s.config.interval) % sum_slots
+      s.mine_frames[at] := frame + 1
+      s.mine_sums[at] := sum
+      s.report_frame := frame
+      s.report_sum := sum
+      s := compare frame s
+  if top > s.checked:
+    s.checked := top
+  return s
+
+// Roll back to the earliest mispredicted frame and resimulate to the present
+// with the inputs now known. Depth never exceeds the window because frames
+// before the frontier cannot mismatch and snapshots cover [current - window,
+// current]. Also records newly final checksums. Call before `advance`, or alone
+// while draining the network after the last frame.
+func resolve (predict: U32 -> U32 -> U32 -> U32 -> U32) -> (step: own a -> #[U32] -> a) -> (save: U32 -> a -> own b -> b) -> (load: U32 -> b -> own a -> a) -> (checksum: U32 -> b -> U32) -> (s: own Rollback) -> (state: own a) -> (ring: own b) : (Rollback, a, b) =>
+  if s.first_wrong < s.current:
+    let from = s.first_wrong
+    s.rollbacks := s.rollbacks + 1
+    s.resimulated := s.resimulated + (s.current - from)
+    s.deepest := max s.deepest (s.current - from)
+    state := load (slot s.config from) ring state
+    for frame in from .. s.current:
+      if frame > from:
+        ring := save (slot s.config frame) state ring
+      s := resolve_inputs predict frame s
+      state := step state s.scratch
+  s.first_wrong := none
+  s := record_sums checksum ring s
+  return (s, state, ring)
+
+// One simulation tick. `local_input` is the caller's sample (lanes words) for
+// frame `local_frame s`. It is consumed only when a frame advances. The tick
+// stalls instead of overrunning when the rollback window is full or a peer has
+// not acknowledged enough of our inputs for the ring to keep them.
+func advance (predict: U32 -> U32 -> U32 -> U32 -> U32) -> (step: own a -> #[U32] -> a) -> (save: U32 -> a -> own b -> b) -> (load: U32 -> b -> own a -> a) -> (checksum: U32 -> b -> U32) -> (local_input: &[U32]) -> (s: own Rollback) -> (state: own a) -> (ring: own b) : (Rollback, a, b, Outcome) =>
+  if local_input.length != s.config.lanes:
+    return panic "rollback local input width mismatch"
+  let (resolved, state, ring) = resolve predict step save load checksum s state ring
+  s := resolved
+  let low = frontier s
+  if s.current > low and s.current - low >= s.config.window:
+    s.stalls := s.stalls + 1
+    return (s, state, ring, $Window)
+  let oldest = none
+  for player in 0 .. s.config.players:
+    if player != s.config.local:
+      oldest := min self s.peer_next[player]
+  if oldest != none and s.next[s.config.local] + 1 >= oldest + s.ring:
+    s.stalls := s.stalls + 1
+    return (s, state, ring, $Backlog)
+  s := confirm s.config.local s.next[s.config.local] local_input 0 s
+  ring := save (slot s.config s.current) state ring
+  s := resolve_inputs predict s.current s
+  state := step state s.scratch
+  s.current := s.current + 1
+  return (s, state, ring, $Advanced)
+
+func signed (word: U32) : F32 =>
+  if word >= bias then U32.to_f32 (word - bias) else 0.0 - U32.to_f32 (bias - word)
+// Frames we run ahead of `player`, estimated at the last packet from it. The
+// caller supplies the one-way latency in frames from its own clock. Zero until
+// a packet arrives.
+func advantage_word (s: Rollback) -> (player: U32) -> (latency: U32) : U32 =>
+  if player >= s.config.players or s.peer_frame[player] == 0:
+    return bias
+  return s.peer_seen[player] - (s.peer_frame[player] - 1 + latency) + bias
+func advantage (s: Rollback) -> (player: U32) -> (latency: U32) : F32 => signed (advantage_word s player latency)
+// Frames the caller should stall (skip `advance`, still `resolve`) to even out
+// the lead over the peer that is furthest behind: half the difference between
+// our advantage and the peer's reported one. Zero when not ahead.
+func recommend (s: Rollback) -> (latency: U32) : U32 =>
+  let wait = 0.0
+  for player in 0 .. s.config.players:
+    if player != s.config.local and s.peer_frame[player] != 0:
+      let gap = (advantage s player latency - signed s.peer_advantage[player]) / 2.0
+      wait := max self (floor gap)
+  return F32.to_u32 wait
+
+// Packet: magic, version, players, lanes, sender, sender frame, advantage,
+// report frame, report checksum, first input frame, input count, one ack per
+// player (first frame the sender still lacks), count * lanes input words, hash.
+// Inputs repeat from the receiver's acknowledgement, oldest first, at most
+// `redundancy` per packet, so any loss pattern still delivers progress.
+const packet_prefix_seed = hash.combine (hash.combine 0x9E3779B9 packet_magic) version
+
+func packet_prefix (config: Config) : U32 =>
+  return hash.combine (hash.combine (hash.combine packet_prefix_seed config.players) config.lanes) config.local
+
+private func packet_span (s: Rollback) -> (to: U32) : (U32, U32, U32) =>
+  let config = s.config
+  if to >= config.players or to == config.local:
+    return panic "rollback packet destination must be another player"
+  let local_next = s.next[config.local]
+  let floor_frame = if local_next > s.ring - 1 then local_next - (s.ring - 1) else 0
+  let start = min local_next (max s.peer_next[to] floor_frame)
+  let count = min (local_next - start) config.redundancy
+  return (start, count, header_words + config.players + count * config.lanes + 1)
+
+private func write_packet (out: own #[U32]) -> (prefix: U32) -> (s: Rollback) -> (to: U32) -> (latency: U32) -> (start: U32) -> (count: U32) -> (total: U32) : #[U32] =>
+  let config = s.config
+  let lanes = config.lanes
+  out[0] := packet_magic
+  out[1] := version
+  out[2] := config.players
+  out[3] := lanes
+  out[4] := config.local
+  out[5] := s.current
+  out[6] := advantage_word s to latency
+  out[7] := s.report_frame
+  out[8] := s.report_sum
+  out[9] := start
+  out[10] := count
+  for player in 0 .. config.players:
+    out[header_words + player] := s.next[player]
+  let payload_base = header_words + config.players
+  let local_base = config.local * s.ring
+  let ring_slot = start % s.ring
+  for i in 0 .. count:
+    let at = (local_base + ring_slot) * lanes
+    let dst = payload_base + i * lanes
+    for lane in 0 .. lanes:
+      out[dst + lane] := s.inputs[at + lane]
+    ring_slot := if self + 1 == s.ring then 0 else self + 1
+  let state = prefix
+  for i in 5 .. (total - 1):
+    state := hash.combine self out[i]
+  out[total - 1] := state
+  return out
+
+// Reuse the prefix only with the configuration it was built from.
+func encode_prepared_into (out: own #[U32]) -> (prefix: U32) -> (s: Rollback) -> (to: U32) -> (latency: U32) : #[U32] =>
+  let (start, count, total) = packet_span s to
+  let old_length = out.length
+  for _ in old_length .. total:
+    @storage.push out 0
+  if old_length > total:
+    @storage.truncate out total
+  return write_packet out prefix s to latency start count total
+
+func encode_into (out: own #[U32]) -> (s: Rollback) -> (to: U32) -> (latency: U32) : #[U32] =>
+  return encode_prepared_into out (packet_prefix s.config) s to latency
+
+func encode (s: Rollback) -> (to: U32) -> (latency: U32) : #[U32] =>
+  let config = s.config
+  if to >= config.players or to == config.local:
+    return panic "rollback packet destination must be another player"
+  let lanes = config.lanes
+  let local_next = s.next[config.local]
+  let floor_frame = if local_next > s.ring - 1 then local_next - (s.ring - 1) else 0
+  let start = min local_next (max s.peer_next[to] floor_frame)
+  let count = min (local_next - start) config.redundancy
+  let total = header_words + config.players + count * lanes + 1
+  let out = @array.fill total 0
+  out[0] := packet_magic
+  out[1] := version
+  out[2] := config.players
+  out[3] := lanes
+  out[4] := config.local
+  out[5] := s.current
+  out[6] := advantage_word s to latency
+  out[7] := s.report_frame
+  out[8] := s.report_sum
+  out[9] := start
+  out[10] := count
+  let state = packet_prefix_seed
+  for i in 2 .. header_words:
+    state := hash.combine self out[i]
+  for player in 0 .. config.players:
+    let ack = s.next[player]
+    out[header_words + player] := ack
+    state := hash.combine self ack
+  let payload_base = header_words + config.players
+  let local_base = config.local * s.ring
+  let slot = start % s.ring
+  for i in 0 .. count:
+    let at = (local_base + slot) * lanes
+    let dst = payload_base + i * lanes
+    for lane in 0 .. lanes:
+      let word = s.inputs[at + lane]
+      out[dst + lane] := word
+      state := hash.combine self word
+    slot := if self + 1 == s.ring then 0 else self + 1
+  out[total - 1] := state
+  return out
+
+// Strict structural validation: framing, configuration, sender, bounds and the
+// trailing hash. Nothing is applied. Header fields are returned for `receive`.
+func decode_header (config: Config) -> (packet: &[U32]) : Maybe Header =>
+  if config.players == 0 or config.lanes == 0 or config.interval == 0 or config.players > 4294967295 - header_words - 1:
+    return $Nothing
+  let count = packet.length
+  let fixed = header_words + config.players + 1
+  if count < fixed:
+    return $Nothing
+  if packet[0] != packet_magic or packet[1] != version or packet[2] != config.players or packet[3] != config.lanes:
+    return $Nothing
+  let sender = packet[4]
+  if sender >= config.players or sender == config.local:
+    return $Nothing
+  let inputs = packet[10]
+  if inputs > config.redundancy or packet[9] > 0xFFFFFFFF - inputs or inputs > 4294967295 / config.lanes:
+    return $Nothing
+  if count - fixed != inputs * config.lanes:
+    return $Nothing
+  let report = packet[7]
+  if report != none and report % config.interval != 0:
+    return $Nothing
+  let state = packet_prefix_seed
+  for i in 2 .. count - 1:
+    state := hash.combine self packet[i]
+  if state != packet[count - 1]:
+    return $Nothing
+  return $Some ($Header {
+    sender, current: packet[5], advantage: packet[6], check_frame: report,
+    check_sum: packet[8], start: packet[9], count: inputs,
+  })
+
+// Apply a valid packet; any malformed packet changes nothing and returns false.
+// Out-of-order, duplicated and overlapping packets are safe.
+func receive (packet: &[U32]) -> (s: own Rollback) : (Rollback, Bool) =>
+  let $Some header = decode_header s.config packet else:
+    return (s, false)
+  let sender = header.sender
+  if header.current + 1 > s.peer_frame[sender]:
+    s.peer_frame[sender] := header.current + 1
+    s.peer_seen[sender] := s.current
+    s.peer_advantage[sender] := header.advantage
+  let ack = packet[header_words + s.config.local]
+  s.peer_next[sender] := max self (min ack s.next[s.config.local])
+  let lanes = s.config.lanes
+  let base = header_words + s.config.players
+  let first = min header.count (max header.start s.next[sender] - header.start)
+  if first < header.count:
+    // Inputs have already passed framing, size and hash validation. Keep
+    // confirmation inside this loop so the boxed session is never passed
+    // through a call and rebound for each payload row.
+    let other_frontier = none
+    if s.config.players == 2:
+      other_frontier := s.next[s.config.local]
+    else:
+      for player in 0 .. s.config.players:
+        if player != sender:
+          other_frontier := min self s.next[player]
+    let ring = s.ring
+    let sender_base = sender * ring
+    let lane_base = sender * lanes
+    let next = s.next[sender]
+    let wrong = s.first_wrong
+    let last = none
+    for i in first .. header.count:
+      let frame = header.start + i
+      let low = min other_frontier next
+      if frame < next:
+        continue
+      if frame >= low and frame - low >= ring - 1:
+        break
+      let at = sender_base + frame % ring
+      let stamp = frame + 1
+      let previous = s.frames[at]
+      let kind = s.kinds[at]
+      if previous == stamp and kind == 2:
+        continue
+      let src = base + i * lanes
+      let dest = at * lanes
+      let compare_prediction = previous == stamp and kind == 1 and frame < s.current and frame < wrong
+      for lane in 0 .. lanes:
+        let word = packet[src + lane]
+        if compare_prediction and s.inputs[dest + lane] != word:
+          wrong := frame
+        s.inputs[dest + lane] := word
+      s.frames[at] := stamp
+      s.kinds[at] := 2
+      if frame == next:
+        last := at
+        next := self + 1
+        let cursor = at - sender_base + 1
+        for 1 .. ring:
+          if cursor == ring:
+            cursor := 0
+          let found = sender_base + cursor
+          if s.frames[found] != next + 1 or s.kinds[found] != 2:
+            break
+          last := found
+          next := self + 1
+          cursor := self + 1
+    if last != none:
+      let source = last * lanes
+      for lane in 0 .. lanes:
+        s.last[lane_base + lane] := s.inputs[source + lane]
+    s.next[sender] := next
+    if wrong < s.first_wrong:
+      s.first_wrong := wrong
+  if header.check_frame != none:
+    let at = (header.check_frame / s.config.interval) % sum_slots
+    s.theirs_frames[sender * sum_slots + at] := header.check_frame + 1
+    s.theirs_sums[sender * sum_slots + at] := header.check_sum
+    s := compare header.check_frame s
+  return (s, true)

@@ -13,4 +13,4 @@ application speed from a small fixture or reuse older ownership counters as new
 memory data. Run GPU witnesses headlessly and sequentially.
 
 Developer benchmark tools stay outside the distributed source package; source
-contracts are in [architecture](architecture.md) and [the library API](blot.md).
+contracts are in [architecture](architecture.md) and [the library API](squid.md).

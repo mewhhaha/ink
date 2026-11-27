@@ -29,7 +29,7 @@ fn slerp(f: &mut Fixture, a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
 }
 #[test]
 fn easing_endpoints_mirrors_steps_and_rounding() {
-    let mut f = Fixture::new("tests/tween.blot");
+    let mut f = Fixture::new("tests/tween.sq");
     let below = f32(1.0 - 2f64.powi(-24));
     for t in [f64::NEG_INFINITY, -1.0, -1e-30, 0.0, f64::NAN] {
         assert_eq!(f.floats("eases", t), vec![0.0; 12]);
@@ -70,7 +70,7 @@ fn easing_endpoints_mirrors_steps_and_rounding() {
 }
 #[test]
 fn tweens_spans_zero_duration_redirection_reversal_and_custom_values() {
-    let mut f = Fixture::new("tests/tween.blot");
+    let mut f = Fixture::new("tests/tween.sq");
     for [time, value, progress, done] in [
         [0.0, 2.0, 0.0, 0.0],
         [2.0, 2.0, 0.0, 0.0],
@@ -170,7 +170,7 @@ fn tweens_spans_zero_duration_redirection_reversal_and_custom_values() {
 }
 #[test]
 fn spherical_interpolation_constant_speed_short_arcs_and_eased_progress() {
-    let mut f = Fixture::new("tests/tween.blot");
+    let mut f = Fixture::new("tests/tween.sq");
     let id = [0.0, 0.0, 0.0, 1.0];
     for (a, b) in [
         (id, turn([0.0, 1.0, 0.0], 2.0)),

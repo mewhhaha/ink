@@ -53,7 +53,7 @@ fn args(parts: &[&[f64]]) -> Vec<f64> {
 }
 #[test]
 fn affine_transforms_preserve_shear_reflection_and_inverses() {
-    let mut f = Fixture::new("tests/transform.blot");
+    let mut f = Fixture::new("tests/transform.sq");
     near_all(&f.floats("identity", [0.0]), &args(&[&ID2, &ID3]), 1e-5);
     near_all(
         &f.floats("affine2", args(&[&ID2, &ID2, &[3.0, -4.0]]))[6..10],
@@ -242,7 +242,7 @@ fn affine_transforms_preserve_shear_reflection_and_inverses() {
 }
 #[test]
 fn pose_interpolation_endpoints_short_arcs_and_antipodal_quaternions() {
-    let mut f = Fixture::new("tests/transform.blot");
+    let mut f = Fixture::new("tests/transform.sq");
     let pi = std::f64::consts::PI;
     let a = [1.0, 2.0, 170.0 * pi / 180.0, 2.0, 3.0];
     let b = [5.0, -2.0, -170.0 * pi / 180.0, 4.0, 1.0];

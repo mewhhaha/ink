@@ -1,0 +1,946 @@
+//! Physically based GGX materials, direct lighting, clearcoat, and shading reference math.
+//!
+//! Key items: [`Material`], [`Light`], [`Sample`], [`Coat`], [`product`].
+
+import { Vec3 } from "std/vector"
+import * as math from "../math"
+import * as color from "../color"
+
+// A surface's base: `base` colour, `metallic` and perceptual `roughness`, the
+// light it `emission`s and what sets its face-on Fresnel reflectance `f0`:
+// the index of refraction `ior` and the KHR_materials_specular `specular`
+// weight and `specular_color` (an `ior` of 1.5 and a `specular` of 1 with a
+// white tint give 0.04, the glTF default).
+type Material is data = $Material { base: math.Color, metallic: F32, roughness: F32, emission: math.Color, ior: F32, specular: F32, specular_color: math.Color }
+type Light is data =
+  | $Directional { direction: Vec3, radiance: math.Color }
+  | $Point { position: Vec3, intensity: math.Color, range: F32 }
+  | $Spot { position: Vec3, direction: Vec3, intensity: math.Color, range: F32, inner_cos: F32, outer_cos: F32 }
+type Sample is data = $Sample { direction: Vec3, radiance: math.Color }
+const default_material = $Material { base: math.rgb 1.0 1.0 1.0, metallic: 0.0, roughness: 0.5, emission: math.rgb 0.0 0.0 0.0, ior: 1.5, specular: 1.0, specular_color: math.rgb 1.0 1.0 1.0 }
+
+func product (a: math.Color) => func (b: math.Color) => math.rgb (a.r * b.r) (a.g * b.g) (a.b * b.b)
+func add (a: math.Color) => func (b: math.Color) => math.rgb (a.r + b.r) (a.g + b.g) (a.b + b.b)
+func attenuation (distance: F32) => func (range: F32) =>
+  if not (is_finite distance and is_finite range) or range <= 0.0 or distance < 0.0 or distance >= range:
+    return 0.0
+  let ratio = distance / range
+  let fade = saturate (1.0 - ratio * ratio * ratio * ratio)
+  let d2 = distance * distance
+  if not (is_finite d2):
+    return 0.0
+  return fade * fade / max 0.0001 d2
+
+// A direction normalized as Vec3.normalized does, a zero vector staying
+// zero, with its length.
+private func toward (x: F32) => func (y: F32) => func (z: F32) =>
+  if not (is_finite x and is_finite y and is_finite z):
+    return (0.0, 0.0, 0.0, 0.0)
+  let length = sqrt (x * x + y * y + z * z)
+  if is_finite length and length > 0.0:
+    return (x / length, y / length, z / length, length)
+  let m = max (abs x) (max (abs y) (abs z))
+  if not (is_finite m) or m == 0.0:
+    return (0.0, 0.0, 0.0, 0.0)
+  let sx = x / m
+  let sy = y / m
+  let sz = z / m
+  let sl = sqrt (sx * sx + sy * sy + sz * sz)
+  if not (is_finite sl) or sl == 0.0:
+    return (0.0, 0.0, 0.0, 0.0)
+  return (sx / sl, sy / sl, sz / sl, m * sl)
+// How far inside a spot's cone unit direction l is from unit axis d.
+private func cone (dx: F32) => func (dy: F32) => func (dz: F32) => func (lx: F32) => func (ly: F32) => func (lz: F32) => func (inner_cos: F32) => func (outer_cos: F32) => return
+  saturate ((dx * (lx * (-1.0)) + dy * (ly * (-1.0)) + dz * (lz * (-1.0)) - outer_cos) / max 0.00001 (inner_cos - outer_cos))
+// Each kind of light samples in its own small kernel, so loops inline the
+// one they meet and keep the sample in locals.
+private func directional (direction: Vec3) => func (radiance: math.Color) =>
+  let (x, y, z, _) = toward direction.x direction.y direction.z
+  return $Sample { direction: $Vec3 { x: x * (-1.0), y: y * (-1.0), z: z * (-1.0) }, radiance }
+private func point_light (position: Vec3) => func (intensity: math.Color) => func (range: F32) => func (px: F32) => func (py: F32) => func (pz: F32) =>
+  if not (math.finite3 position and is_finite px and is_finite py and is_finite pz):
+    return $Sample { direction: math.zero3, radiance: $math.Color { r: 0.0, g: 0.0, b: 0.0, a: intensity.a } }
+  let (x, y, z, distance) = toward (position.x - px) (position.y - py) (position.z - pz)
+  let fade = attenuation distance range
+  let $math.Color { r, g, b, a } = intensity
+  return $Sample { direction: $Vec3 { x, y, z }, radiance: $math.Color { r: r * fade, g: g * fade, b: b * fade, a } }
+private func spot_light (position: Vec3) => func (direction: Vec3) => func (intensity: math.Color) => func (range: F32) => func (inner_cos: F32) => func (outer_cos: F32) => func (px: F32) => func (py: F32) => func (pz: F32) =>
+  if not (math.finite3 position and is_finite px and is_finite py and is_finite pz and is_finite inner_cos and is_finite outer_cos):
+    return $Sample { direction: math.zero3, radiance: $math.Color { r: 0.0, g: 0.0, b: 0.0, a: intensity.a } }
+  let (x, y, z, distance) = toward (position.x - px) (position.y - py) (position.z - pz)
+  let (dx, dy, dz, _) = toward direction.x direction.y direction.z
+  let inside = cone dx dy dz x y z inner_cos outer_cos
+  let fade = attenuation distance range * inside * inside
+  let $math.Color { r, g, b, a } = intensity
+  return $Sample { direction: $Vec3 { x, y, z }, radiance: $math.Color { r: r * fade, g: g * fade, b: b * fade, a } }
+func sample (light: Light) => func (point: Vec3) => case light of
+  $Directional { direction, radiance } => directional direction radiance
+  $Point { position, intensity, range } => point_light position intensity range point.x point.y point.z
+  $Spot { position, direction, intensity, range, inner_cos, outer_cos } => spot_light position direction intensity range inner_cos outer_cos point.x point.y point.z
+
+// ---------------------------------------------------------------- the base lobes
+
+// Face-on Fresnel reflectance of a dielectric before its tint: ((ior - 1) /
+// (ior + 1))^2 as two products and one division of exact operands, so that an
+// `ior` of 1.5 is the F32 nearest 0.04 and not a rounding above it.
+private func f0_ratio (ior: F32) : F32 =>
+  let down = max 1.0 ior - 1.0
+  let up = max 1.0 ior + 1.0
+  return down * down / (up * up)
+
+// A dielectric's face-on reflectance in one channel: `min(ratio * tint, 1) *
+// specular`, the `ior` clamped to at least 1 (no refraction, no reflection).
+func dielectric_f0 (ior: F32) -> (specular: F32) -> (tint: F32) : F32 =>
+  return min (f0_ratio ior * tint) 1.0 * specular
+
+// A channel's Fresnel reflectance at `schlick = (1 - vh)^5`: from the face-on
+// `f0`, which runs from the dielectric's to the base colour with `metallic`,
+// to `f90`, which runs from `specular` to 1 the same way.
+private func fresnel (base: F32) -> (tint: F32) -> (metallic: F32) -> (specular: F32) -> (ratio: F32) -> (f90: F32) -> (schlick: F32) : F32 =>
+  let f0 = F32.lerp (min (ratio * tint) 1.0 * specular) base metallic
+  return F32.lerp f0 f90 schlick
+
+// GGX normal distribution of squared alpha `a2`, and the height-correlated
+// Smith visibility, which includes the 1 / (4 nl nv) of the microfacet BRDF.
+private func ggx_distribution (nh: F32) -> (a2: F32) : F32 =>
+  let denominator = nh * nh * (a2 - 1.0) + 1.0
+  return a2 / (3.14159265359 * denominator * denominator)
+private func smith_visibility (nl: F32) -> (nv: F32) -> (a2: F32) : F32 =>
+  return 0.5 / max 0.000001 (nl * sqrt (nv * nv * (1.0 - a2) + a2) + nv * sqrt (nl * nl * (1.0 - a2) + a2))
+
+// A unit direction as Vec3.normalized makes one: a zero vector stays zero.
+private func unit (x: F32) -> (y: F32) -> (z: F32) : (F32, F32, F32) =>
+  let length = sqrt (x * x + y * y + z * z)
+  if length == 0.0:
+    return (x, y, z)
+  return (x / length, y / length, z / length)
+
+// GGX normal distribution, height-correlated Smith visibility and Schlick
+// Fresnel, with an energy-conserving Lambert diffuse lobe. V and L point out
+// of the surface. The response includes NoL and is scaled by radiance (rr,
+// rg, rb). It runs on scalar parts, normalizing as Vec3.normalized does, and
+// allocates only its result.
+private func reflected (material: Material) => func (nx: F32) => func (ny: F32) => func (nz: F32) => func (vx: F32) => func (vy: F32) => func (vz: F32) => func (lx: F32) => func (ly: F32) => func (lz: F32) => func (rr: F32) => func (rg: F32) => func (rb: F32) =>
+  let nn = sqrt (nx * nx + ny * ny + nz * nz)
+  if nn != 0.0:
+    nx := self / nn
+    ny := self / nn
+    nz := self / nn
+  let vn = sqrt (vx * vx + vy * vy + vz * vz)
+  if vn != 0.0:
+    vx := self / vn
+    vy := self / vn
+    vz := self / vn
+  let ln = sqrt (lx * lx + ly * ly + lz * lz)
+  if ln != 0.0:
+    lx := self / ln
+    ly := self / ln
+    lz := self / ln
+  let nl = saturate (nx * lx + ny * ly + nz * lz)
+  let facing = nx * vx + ny * vy + nz * vz
+  let nv = max 0.00001 facing
+  if nl <= 0.0 or facing <= 0.0:
+    return $math.Color { r: 0.0 * rr, g: 0.0 * rg, b: 0.0 * rb, a: 1.0 }
+  let hx = vx + lx
+  let hy = vy + ly
+  let hz = vz + lz
+  let hn = sqrt (hx * hx + hy * hy + hz * hz)
+  if hn != 0.0:
+    hx := self / hn
+    hy := self / hn
+    hz := self / hn
+  let nh = saturate (nx * hx + ny * hy + nz * hz)
+  let vh = saturate (vx * hx + vy * hy + vz * hz)
+  let rough = clamp 0.04 1.0 material.roughness
+  let a = rough * rough
+  let a2 = a * a
+  let distribution = ggx_distribution nh a2
+  let visibility = smith_visibility nl nv a2
+  let metallic = saturate material.metallic
+  let $math.Color { r: br, g: bg, b: bb } = material.base
+  let $math.Color { r: tr, g: tg, b: tb } = material.specular_color
+  let t = 1.0 - vh
+  let schlick = t * t * t * t * t
+  // Fresnel runs from f0, the dielectric's reflectance lerped to the base
+  // colour by metallic, to f90, the specular weight lerped to 1 the same way.
+  let ratio = f0_ratio material.ior
+  let f90 = F32.lerp material.specular 1.0 metallic
+  let fr = fresnel br tr metallic material.specular ratio f90 schlick
+  let fg = fresnel bg tg metallic material.specular ratio f90 schlick
+  let fb = fresnel bb tb metallic material.specular ratio f90 schlick
+  let diffuse = (1.0 - metallic) / 3.14159265359
+  let specular = distribution * visibility
+  return $math.Color {
+    r: (br * (1.0 - fr) * diffuse + fr * specular) * nl * rr,
+    g: (bg * (1.0 - fg) * diffuse + fg * specular) * nl * rg,
+    b: (bb * (1.0 - fb) * diffuse + fb * specular) * nl * rb,
+    a: 1.0,
+  }
+// Scaling by one radiance is exact, so brdf is the same response.
+func brdf (material: Material) => func (normal: Vec3) => func (view: Vec3) => func (light: Vec3) => return
+  reflected material normal.x normal.y normal.z view.x view.y view.z light.x light.y light.z 1.0 1.0 1.0
+func shade (material: Material) => func (normal: Vec3) => func (view: Vec3) => func (sample: Sample) =>
+  let $Sample { direction: l, radiance: c } = sample
+  return reflected material normal.x normal.y normal.z view.x view.y view.z l.x l.y l.z c.r c.g c.b
+
+// ---------------------------------------------------------------- layered surfaces
+
+// What a material adds to its base, each group off at weight 0 and costing
+// nothing then. `Coat`: a clear coat of `weight` and `roughness`. `Sheen`: a
+// cloth fuzz of tint `color` and `roughness`. `Anisotropy`: stretching of the
+// highlight along the tangent frame by `strength` in [-1, 1], the frame turned
+// about the normal by `rotation` radians. `Transmission`: `weight` of the
+// light passing through, a slab of `thickness` in world units (0 is thin
+// walled), whose `attenuation_color` is what remains after
+// `attenuation_distance` (0 is none) of travel. `Subsurface`: `amount` of
+// light scattered below the surface, of tint `color`; `thin` is how opaque
+// the slab is (1 opaque, 0 lets all the back light through).
+type Coat is data = $Coat { weight: F32, roughness: F32 }
+type Sheen is data = $Sheen { color: math.Color, roughness: F32 }
+type Anisotropy is data = $Anisotropy { strength: F32, rotation: F32 }
+type Transmission is data = $Transmission { weight: F32, thickness: F32, attenuation_color: math.Color, attenuation_distance: F32 }
+type Subsurface is data = $Subsurface { amount: F32, color: math.Color, thin: F32 }
+type Surface is data = $Surface { material: Material, coat: Coat, sheen: Sheen, anisotropy: Anisotropy, transmission: Transmission, subsurface: Subsurface }
+// Where a surface point is seen from: its shading `normal`, the geometric
+// `coat_normal` the coat uses (a zero vector means the shading normal), the
+// mesh `tangent` and its `handedness` (+-1) for anisotropy, and the unit
+// direction `view` toward the eye.
+type Frame is data = $Frame { normal: Vec3, coat_normal: Vec3, tangent: Vec3, handedness: F32, view: Vec3 }
+
+const no_coat = $Coat { weight: 0.0, roughness: 0.0 }
+const no_sheen = $Sheen { color: math.rgb 0.0 0.0 0.0, roughness: 0.5 }
+const no_anisotropy = $Anisotropy { strength: 0.0, rotation: 0.0 }
+const no_transmission = $Transmission { weight: 0.0, thickness: 0.0, attenuation_color: math.rgb 1.0 1.0 1.0, attenuation_distance: 0.0 }
+const no_subsurface = $Subsurface { amount: 0.0, color: math.rgb 1.0 1.0 1.0, thin: 1.0 }
+
+// A material with none of the extra lobes: `surface_response` of it is `brdf`.
+func plain (material: Material) : Surface =>
+  return $Surface { material, coat: no_coat, sheen: no_sheen, anisotropy: no_anisotropy, transmission: no_transmission, subsurface: no_subsurface }
+
+// A frame with no tangent that shades the coat with the shading normal.
+func facing (normal: Vec3) -> (view: Vec3) : Frame =>
+  return $Frame { normal, coat_normal: math.zero3, tangent: math.zero3, handedness: 1.0, view }
+
+// ---------------------------------------------------------------- anisotropy
+
+// Anisotropic GGX with alphas `at` along the tangent and `ab` along the
+// bitangent; `th`, `bh` and `nh` are the half vector's parts along the frame.
+// With at = ab = alpha it is the isotropic distribution (a2 = alpha^2).
+private func anisotropic_distribution (at: F32) -> (ab: F32) -> (th: F32) -> (bh: F32) -> (nh: F32) : F32 =>
+  let x = th / at
+  let y = bh / ab
+  let w = x * x + y * y + nh * nh
+  return 1.0 / (3.14159265359 * at * ab * w * w)
+// Its height-correlated visibility, from the light's and the view's parts
+// along the tangent, bitangent and normal. The same floor as the isotropic one.
+private func anisotropic_visibility (at: F32) -> (ab: F32) -> (tl: F32) -> (bl: F32) -> (nl: F32) -> (tv: F32) -> (bv: F32) -> (nv: F32) : F32 =>
+  let al = at * tl
+  let bl2 = ab * bl
+  let av = at * tv
+  let bv2 = ab * bv
+  let light = sqrt (al * al + bl2 * bl2 + nl * nl)
+  let view = sqrt (av * av + bv2 * bv2 + nv * nv)
+  return 0.5 / max 0.000001 (nv * light + nl * view)
+
+// A unit vector perpendicular to the unit normal: the cross product of the
+// normal and the coordinate axis it is least along.
+private func perpendicular (nx: F32) -> (ny: F32) -> (nz: F32) : (F32, F32, F32) =>
+  if abs nx <= abs ny and abs nx <= abs nz:
+    return unit 0.0 nz (0.0 - ny)
+  if abs ny <= abs nz:
+    return unit (0.0 - nz) 0.0 nx
+  return unit ny (0.0 - nx) 0.0
+
+// The anisotropy frame of the unit normal n: the tangent t, the given one
+// made perpendicular to n (a missing or parallel one is replaced by
+// `perpendicular`) and turned about n by `rotation` (t cos + n x t sin), and
+// the bitangent b = n x t * handedness. Returns t then b.
+private func anisotropic_frame (nx: F32) -> (ny: F32) -> (nz: F32) -> (tx: F32) -> (ty: F32) -> (tz: F32) -> (handedness: F32) -> (rotation: F32) : (F32, F32, F32, F32, F32, F32) =>
+  let (ux, uy, uz) = unit tx ty tz
+  let d = nx * ux + ny * uy + nz * uz
+  let ox = ux - nx * d
+  let oy = uy - ny * d
+  let oz = uz - nz * d
+  let length = sqrt (ox * ox + oy * oy + oz * oz)
+  if length <= 0.000001:
+    let (px, py, pz) = perpendicular nx ny nz
+    ox := px
+    oy := py
+    oz := pz
+  else:
+    ox := self / length
+    oy := self / length
+    oz := self / length
+  let rot = if not (is_finite rotation) then 0.0 else if abs rotation <= 8192.0 then rotation else if abs rotation > 1.0e7 then 0.0 else wrap tau rotation
+  if rot == 0.0:
+    return (ox, oy, oz, (ny * oz - nz * oy) * handedness, (nz * ox - nx * oz) * handedness, (nx * oy - ny * ox) * handedness)
+  let (s, c) = sin_cos rot
+  let rx = ox * c + (ny * oz - nz * oy) * s
+  let ry = oy * c + (nz * ox - nx * oz) * s
+  let rz = oz * c + (nx * oy - ny * ox) * s
+  return (rx, ry, rz, (ny * rz - nz * ry) * handedness, (nz * rx - nx * rz) * handedness, (nx * ry - ny * rx) * handedness)
+
+// ---------------------------------------------------------------- sheen
+
+// Charlie's sheen distribution of alpha `alpha`, (2 + 1/alpha) sin^(1/alpha) /
+// 2 pi with sin^2 = 1 - nh^2, and Neubelt's visibility.
+private func charlie_distribution (nh: F32) -> (alpha: F32) : F32 =>
+  let sin2 = max 0.0 (1.0 - nh * nh)
+  return (2.0 + 1.0 / alpha) * color.power sin2 (0.5 / alpha) / (2.0 * 3.14159265359)
+private func neubelt_visibility (nl: F32) -> (nv: F32) : F32 => 1.0 / (4.0 * (nl + nv - nl * nv))
+
+// The sheen lobe's scalar, `D V nl`, for roughness `rs` already clamped.
+private func sheen_lobe (nh: F32) -> (nl: F32) -> (nv: F32) -> (rs: F32) : F32 =>
+  return charlie_distribution nh (rs * rs) * neubelt_visibility nl nv * nl
+
+// The sheen's directional albedo for a white tint, seen at cosine `nv` with
+// roughness `roughness` (clamped to [0.07, 1]): the integral of `D V nl` over
+// the hemisphere of lights, capped at 1, as a 32 x 16 table interpolated
+// bilinearly. Columns are evenly spaced in sqrt(nv) (nv 0 to 1), rows in
+// sqrt((roughness - 0.07) / 0.93). Row j, column i is entry `32 j + i`;
+// the table at the end of this file is generated and checked by the native
+// reference tests.
+func sheen_albedo (nv: F32) -> (roughness: F32) : F32 =>
+  let snv = if is_finite nv then saturate nv else if nv > 0.0 then 1.0 else 0.0
+  let sr = if is_finite roughness then clamp 0.07 1.0 roughness else if roughness > 0.0 then 1.0 else 0.07
+  let x = sqrt snv * 31.0
+  let y = sqrt (saturate ((sr - 0.07) / 0.93)) * 15.0
+  let i = min 30 (F32.to_u32 x)
+  let j = min 14 (F32.to_u32 y)
+  let fx = x - U32.to_f32 i
+  let fy = y - U32.to_f32 j
+  let k = j * 32 + i
+  let low = F32.lerp sheen_table[k] sheen_table[k + 1] fx
+  let high = F32.lerp sheen_table[k + 32] sheen_table[k + 33] fx
+  return F32.lerp low high fy
+
+// What the layers under the sheen keep: 1 - max(tint) * albedo, never below 0.
+private func sheen_keep (tint: math.Color) -> (nv: F32) -> (roughness: F32) : F32 =>
+  let peak = max (max tint.r tint.g) tint.b
+  if peak <= 0.0:
+    return 1.0
+  return max 0.0 (1.0 - peak * sheen_albedo nv (clamp 0.07 1.0 roughness))
+
+// ---------------------------------------------------------------- subsurface
+
+// A wrapped cosine: (x + w) / (1 + w)^2 clamped to [0, 1].
+private func wrapped_cosine (x: F32) -> (w: F32) : F32 => saturate ((x + w) / ((1.0 + w) * (1.0 + w)))
+
+// One channel of the diffuse lobe with its subsurface: Lambert's `b (1 - f)
+// weight` (`weight` being (1 - metallic) / pi) times the lit part, which runs
+// from the clamped cosine to the wrapped one tinted by `c` as `amount` rises,
+// plus the back light `amount c (1 - thin) back b / pi 2`, `back` being the
+// fourth power of how much the view looks into the light that comes through.
+private func diffuse_channel (b: F32) -> (f: F32) -> (weight: F32) -> (amount: F32) -> (c: F32) -> (thin: F32) -> (signed: F32) -> (back: F32) : F32 =>
+  let positive = max signed 0.0
+  if amount <= 0.0:
+    return b * (1.0 - f) * weight * positive
+  let lit = (1.0 - amount) * positive + amount * wrapped_cosine signed 0.5 * saturate (c + positive)
+  return b * (1.0 - f) * weight * lit + amount * c * (1.0 - thin) * back * b / 3.14159265359 * 2.0
+
+// How much the view looks into the light that gets through: saturate(v .
+// -normalize(l + 0.2 n)) to the fourth power (as two squares).
+private func back_light (vx: F32) -> (vy: F32) -> (vz: F32) -> (lx: F32) -> (ly: F32) -> (lz: F32) -> (nx: F32) -> (ny: F32) -> (nz: F32) : F32 =>
+  let (gx, gy, gz) = unit (lx + 0.2 * nx) (ly + 0.2 * ny) (lz + 0.2 * nz)
+  let toward = saturate (0.0 - (vx * gx + vy * gy + vz * gz))
+  let square = toward * toward
+  return square * square
+
+// ---------------------------------------------------------------- the clear coat
+
+// The coat's GGX lobe with the same height-correlated Smith visibility as the
+// base lobe, at the coat's own alpha, for the unit coat normal c, half vector
+// h, light l and view v, the weight `weight` in [0, 1], the coat's roughness
+// and `schlick = (1 - vh)^5`. The coat's cosines are nlc = saturate(c . l) and
+// nvc = max(1e-5, c . v). Returns the coat's own response, `weight Fc(vh) D V
+// nlc` with Fc(vh) = 0.04 + 0.96 (1 - vh)^5, and what the layers below keep,
+// `1 - weight Fc(nvc)` with Fc(nvc) = 0.04 + 0.96 (1 - min(nvc, 1))^5, the coat's
+// Fresnel at the view and the same for every light.
+private func coat_lobe (weight: F32) -> (roughness: F32) -> (cx: F32) -> (cy: F32) -> (cz: F32) -> (hx: F32) -> (hy: F32) -> (hz: F32) -> (lx: F32) -> (ly: F32) -> (lz: F32) -> (vx: F32) -> (vy: F32) -> (vz: F32) -> (vh: F32) -> (schlick: F32) : (F32, F32) =>
+  let nlc = saturate (cx * lx + cy * ly + cz * lz)
+  let nvc = max 0.00001 (cx * vx + cy * vy + cz * vz)
+  let t = 1.0 - min nvc 1.0
+  let fv = 0.04 + 0.96 * (t * t * t * t * t)
+  let keep = 1.0 - weight * fv
+  if nlc <= 0.0:
+    return (0.0, keep)
+  let nhc = saturate (cx * hx + cy * hy + cz * hz)
+  let rc = clamp 0.04 1.0 roughness
+  let ac = rc * rc
+  let a2 = ac * ac
+  let fc = 0.04 + 0.96 * schlick
+  let visibility = smith_visibility nlc nvc a2
+  return (weight * fc * ggx_distribution nhc a2 * visibility * nlc, keep)
+
+// The coat's unit normal: the frame's, or its shading normal where it has none.
+private func coat_normal (frame: Frame) -> (nx: F32) -> (ny: F32) -> (nz: F32) : (F32, F32, F32) =>
+  let (cx, cy, cz) = unit frame.coat_normal.x frame.coat_normal.y frame.coat_normal.z
+  if cx == 0.0 and cy == 0.0 and cz == 0.0:
+    return (nx, ny, nz)
+  return (cx, cy, cz)
+
+// ---------------------------------------------------------------- one light, every lobe
+
+// The response of every lobe of a surface to one light, scaled by the
+// radiance (rr, rg, rb). A surface with no extra lobe (and no forced
+// anisotropy: `grain`) is `reflected` itself. Otherwise, per channel,
+//
+//   base = (diffuse * (1 - transmission) + specular) * sheen_keep * coat_keep
+//   result = (base + sheen + coat) * radiance
+//
+// where the diffuse lobe carries the subsurface's wrap and back light, the
+// specular lobe the anisotropic distribution and visibility when asked, the
+// sheen is not dimmed by the coat, and each lobe whose weight is 0 is skipped.
+// A back-facing view or a zero light vector has no response; a light behind the
+// surface only lights the subsurface's wrap and back light, and the coat by its
+// own normal.
+private func layered (surface: Surface) -> (frame: Frame) -> (light: Vec3) -> (grain: Bool) -> (rr: F32) -> (rg: F32) -> (rb: F32) : math.Color =>
+  let material = surface.material
+  let coat = saturate surface.coat.weight
+  let tint = surface.sheen.color
+  let peak = max (max tint.r tint.g) tint.b
+  let amount = saturate surface.subsurface.amount
+  let passing = saturate surface.transmission.weight
+  let bend = clamp (-1.0) 1.0 surface.anisotropy.strength
+  let aniso = grain or bend != 0.0
+  if (not aniso) and coat <= 0.0 and peak <= 0.0 and amount <= 0.0 and passing <= 0.0:
+    return reflected material frame.normal.x frame.normal.y frame.normal.z frame.view.x frame.view.y frame.view.z light.x light.y light.z rr rg rb
+  let (nx, ny, nz) = unit frame.normal.x frame.normal.y frame.normal.z
+  let (vx, vy, vz) = unit frame.view.x frame.view.y frame.view.z
+  let (lx, ly, lz) = unit light.x light.y light.z
+  let facing = nx * vx + ny * vy + nz * vz
+  if facing <= 0.0 or (lx == 0.0 and ly == 0.0 and lz == 0.0):
+    return $math.Color { r: 0.0 * rr, g: 0.0 * rg, b: 0.0 * rb, a: 1.0 }
+  let signed = nx * lx + ny * ly + nz * lz
+  let nl = saturate signed
+  let nv = max 0.00001 facing
+  let (hx, hy, hz) = unit (vx + lx) (vy + ly) (vz + lz)
+  let nh = saturate (nx * hx + ny * hy + nz * hz)
+  let vh = saturate (vx * hx + vy * hy + vz * hz)
+  let rough = clamp 0.04 1.0 material.roughness
+  let alpha = rough * rough
+  let shape = 0.0
+  if nl > 0.0:
+    if aniso:
+      let (tx, ty, tz, bx, by, bz) = anisotropic_frame nx ny nz frame.tangent.x frame.tangent.y frame.tangent.z frame.handedness surface.anisotropy.rotation
+      let at = F32.lerp alpha 1.0 (bend * bend)
+      shape := anisotropic_distribution at alpha (tx * hx + ty * hy + tz * hz) (bx * hx + by * hy + bz * hz) nh * anisotropic_visibility at alpha (tx * lx + ty * ly + tz * lz) (bx * lx + by * ly + bz * lz) nl (tx * vx + ty * vy + tz * vz) (bx * vx + by * vy + bz * vz) nv
+    else:
+      let a2 = alpha * alpha
+      shape := ggx_distribution nh a2 * smith_visibility nl nv a2
+  let metallic = saturate material.metallic
+  let ratio = f0_ratio material.ior
+  let f90 = F32.lerp material.specular 1.0 metallic
+  let t = 1.0 - vh
+  let schlick = t * t * t * t * t
+  let $math.Color { r: br, g: bg, b: bb } = material.base
+  let $math.Color { r: tr, g: tg, b: tb } = material.specular_color
+  let fr = fresnel br tr metallic material.specular ratio f90 schlick
+  let fg = fresnel bg tg metallic material.specular ratio f90 schlick
+  let fb = fresnel bb tb metallic material.specular ratio f90 schlick
+  let weight = (1.0 - metallic) / 3.14159265359
+  let sheen = 0.0
+  let sheen_keep = 1.0
+  if peak > 0.0:
+    let rs = clamp 0.07 1.0 surface.sheen.roughness
+    if nl > 0.0:
+      sheen := sheen_lobe nh nl nv rs
+    sheen_keep := max 0.0 (1.0 - peak * sheen_albedo nv rs)
+  let gloss = 0.0
+  let coat_keep = 1.0
+  if coat > 0.0:
+    let (cx, cy, cz) = coat_normal frame nx ny nz
+    let (g, k) = coat_lobe coat surface.coat.roughness cx cy cz hx hy hz lx ly lz vx vy vz vh schlick
+    gloss := g
+    coat_keep := k
+  let thin = saturate surface.subsurface.thin
+  let back = 0.0
+  if amount > 0.0 and thin < 1.0:
+    back := back_light vx vy vz lx ly lz nx ny nz
+  let $math.Color { r: sr, g: sg, b: sb } = surface.subsurface.color
+  let keep = 1.0 - passing
+  let diffuse_r = diffuse_channel br fr weight amount sr thin signed back
+  let diffuse_g = diffuse_channel bg fg weight amount sg thin signed back
+  let diffuse_b = diffuse_channel bb fb weight amount sb thin signed back
+  return $math.Color {
+    r: (((diffuse_r * keep + fr * shape * nl) * sheen_keep * coat_keep) + max 0.0 tint.r * sheen + gloss) * rr,
+    g: (((diffuse_g * keep + fg * shape * nl) * sheen_keep * coat_keep) + max 0.0 tint.g * sheen + gloss) * rg,
+    b: (((diffuse_b * keep + fb * shape * nl) * sheen_keep * coat_keep) + max 0.0 tint.b * sheen + gloss) * rb,
+    a: 1.0,
+  }
+
+// A surface's response to the light direction `light` (toward the light), per
+// unit radiance with NoL included, as `brdf` is for a material: the base lobes
+// layered with the surface's coat, sheen, anisotropy, subsurface and the
+// non-transmitted share of its transmission. A surface with none of those is
+// exactly `brdf`. `shade_surface` is the same response scaled by a sample's
+// radiance. A zero vector is no direction and a back-facing view or a
+// light below the horizon shade nothing (see `layered`).
+func surface_response (surface: Surface) -> (frame: Frame) -> (light: Vec3) : math.Color =>
+  return layered surface frame light false 1.0 1.0 1.0
+func shade_surface (surface: Surface) -> (frame: Frame) -> (sample: Sample) : math.Color =>
+  let $Sample { direction: l, radiance: c } = sample
+  return layered surface frame l false c.r c.g c.b
+
+// ---------------------------------------------------------------- the lobes alone
+
+// The clear coat for one light: its own response (weight * Fc(vh) * D * V * nlc,
+// with Smith's V at the coat normal's cosines to the light and the view, and Fc
+// from the half vector's cosine to the view) and what the layers below keep:
+// 1 - weight * Fc(nvc), the coat's Fresnel at the coat normal's cosine to the
+// view, the same for every light.
+func coat_response (coat: Coat) -> (frame: Frame) -> (light: Vec3) : (F32, F32) =>
+  let (nx, ny, nz) = unit frame.normal.x frame.normal.y frame.normal.z
+  let (cx, cy, cz) = coat_normal frame nx ny nz
+  let (vx, vy, vz) = unit frame.view.x frame.view.y frame.view.z
+  let (lx, ly, lz) = unit light.x light.y light.z
+  let (hx, hy, hz) = unit (vx + lx) (vy + ly) (vz + lz)
+  let vh = saturate (vx * hx + vy * hy + vz * hz)
+  let t = 1.0 - vh
+  let weight = saturate coat.weight
+  if weight <= 0.0:
+    return (0.0, 1.0)
+  return coat_lobe weight coat.roughness cx cy cz hx hy hz lx ly lz vx vy vz vh (t * t * t * t * t)
+
+// The coat's image-based light with the split-sum table's `split_x` and
+// `split_y` at the coat normal's cosine `nvc` to the view and the coat's
+// roughness: the weight of the sky reflection at the coat's roughness, `weight
+// * (0.04 split_x + split_y)`, and what the layers below keep, `1 - weight *
+// Fc(nvc)`, as for direct light, with Fc(nvc) = 0.04 + 0.96 (1 - clamp(nvc,
+// 1e-5, 1))^5.
+func coat_ibl (coat: Coat) -> (nvc: F32) -> (split_x: F32) -> (split_y: F32) : (F32, F32) =>
+  let weight = saturate coat.weight
+  let t = 1.0 - clamp 0.00001 1.0 nvc
+  let fc = 0.04 + 0.96 * (t * t * t * t * t)
+  return (weight * (0.04 * split_x + split_y), 1.0 - weight * fc)
+
+// The sheen for one light: the tint's response `tint * D * V * nl`, as a colour,
+// and what the layers below keep, `1 - max(tint) * sheen_albedo` (see
+// `sheen_albedo`), both zero response and 1 for a black tint.
+func sheen_response (sheen: Sheen) -> (frame: Frame) -> (light: Vec3) : (math.Color, F32) =>
+  let tint = sheen.color
+  let peak = max (max tint.r tint.g) tint.b
+  let off = math.rgba 0.0 0.0 0.0 1.0
+  if peak <= 0.0:
+    return (off, 1.0)
+  let (nx, ny, nz) = unit frame.normal.x frame.normal.y frame.normal.z
+  let (vx, vy, vz) = unit frame.view.x frame.view.y frame.view.z
+  let (lx, ly, lz) = unit light.x light.y light.z
+  let facing = nx * vx + ny * vy + nz * vz
+  if facing <= 0.0:
+    return (off, 1.0)
+  let nv = max 0.00001 facing
+  let nl = saturate (nx * lx + ny * ly + nz * lz)
+  let (hx, hy, hz) = unit (vx + lx) (vy + ly) (vz + lz)
+  let nh = saturate (nx * hx + ny * hy + nz * hz)
+  let rs = clamp 0.07 1.0 sheen.roughness
+  let lobe = sheen_lobe nh nl nv rs
+  return ($math.Color { r: max 0.0 tint.r * lobe, g: max 0.0 tint.g * lobe, b: max 0.0 tint.b * lobe, a: 1.0 }, sheen_keep tint nv rs)
+
+// What the layers below a sheen keep at view cosine `nv`, for image-based light.
+func sheen_scale (sheen: Sheen) -> (nv: F32) : F32 => sheen_keep sheen.color nv sheen.roughness
+
+// The base lobes with the anisotropic specular lobe, whatever the strength
+// (zero gives the isotropic lobe to F32 round-off): the response of
+// `material` to `light` per unit radiance with NoL included, the frame's
+// tangent and handedness standing for the mesh's and `anisotropy.rotation`
+// turning it about the normal.
+func aniso_response (material: Material) -> (anisotropy: Anisotropy) -> (frame: Frame) -> (light: Vec3) : math.Color =>
+  let surface = $Surface { material, coat: no_coat, sheen: no_sheen, anisotropy, transmission: no_transmission, subsurface: no_subsurface }
+  return layered surface frame light true 1.0 1.0 1.0
+
+// The tangent frame anisotropy uses: the frame's tangent made perpendicular to
+// the normal and turned by the rotation, then the bitangent.
+func aniso_frame (anisotropy: Anisotropy) -> (frame: Frame) : (Vec3, Vec3) =>
+  let (nx, ny, nz) = unit frame.normal.x frame.normal.y frame.normal.z
+  let (tx, ty, tz, bx, by, bz) = anisotropic_frame nx ny nz frame.tangent.x frame.tangent.y frame.tangent.z frame.handedness anisotropy.rotation
+  return ($Vec3 { x: tx, y: ty, z: tz }, $Vec3 { x: bx, y: by, z: bz })
+
+// The normal image-based light is looked up with: the shading normal bent toward
+// the direction the highlight is stretched, `normalize(mix(n, bent, |a|
+// clamp(5 r, 0, 1)))` where the bent normal is the view's part perpendicular
+// to the grain, the bitangent for a >= 0 and the tangent otherwise. The shading
+// normal where the mix vanishes.
+func bent_normal (material: Material) -> (anisotropy: Anisotropy) -> (frame: Frame) : Vec3 =>
+  let (nx, ny, nz) = unit frame.normal.x frame.normal.y frame.normal.z
+  let (vx, vy, vz) = unit frame.view.x frame.view.y frame.view.z
+  let (tx, ty, tz, bx, by, bz) = anisotropic_frame nx ny nz frame.tangent.x frame.tangent.y frame.tangent.z frame.handedness anisotropy.rotation
+  let a = clamp (-1.0) 1.0 anisotropy.strength
+  let gx = if a >= 0.0 then bx else tx
+  let gy = if a >= 0.0 then by else ty
+  let gz = if a >= 0.0 then bz else tz
+  let cx = gy * vz - gz * vy
+  let cy = gz * vx - gx * vz
+  let cz = gx * vy - gy * vx
+  let ex = cy * gz - cz * gy
+  let ey = cz * gx - cx * gz
+  let ez = cx * gy - cy * gx
+  let w = abs a * clamp 0.0 1.0 (5.0 * clamp 0.04 1.0 material.roughness)
+  let (mx, my, mz) = unit (F32.lerp nx ex w) (F32.lerp ny ey w) (F32.lerp nz ez w)
+  if mx == 0.0 and my == 0.0 and mz == 0.0:
+    return $Vec3 { x: nx, y: ny, z: nz }
+  return $Vec3 { x: mx, y: my, z: mz }
+
+// The direction reflected image-based light is looked up in: the view reflected
+// about the bent normal, `reflect(-v, bent_normal)`.
+func aniso_reflection (material: Material) -> (anisotropy: Anisotropy) -> (frame: Frame) : Vec3 =>
+  let n = bent_normal material anisotropy frame
+  let (vx, vy, vz) = unit frame.view.x frame.view.y frame.view.z
+  let d = 2.0 * (n.x * vx + n.y * vy + n.z * vz)
+  return $Vec3 { x: d * n.x - vx, y: d * n.y - vy, z: d * n.z - vz }
+
+// The diffuse lobe with the surface's subsurface for one light, per unit
+// radiance: `base (1 - F) (1 - metallic) / pi` times the clamped cosine
+// blended with the wrapped one (see `Subsurface`), plus the light that comes
+// through, `amount * color * (1 - thin) * back * base / pi * 2`. A surface with
+// no subsurface gives Lambert's lobe. `nl` is not clamped before the wrap, so a
+// light behind the surface still lights it, and `facing` still matters.
+func subsurface_response (material: Material) -> (subsurface: Subsurface) -> (frame: Frame) -> (light: Vec3) : math.Color =>
+  let (nx, ny, nz) = unit frame.normal.x frame.normal.y frame.normal.z
+  let (vx, vy, vz) = unit frame.view.x frame.view.y frame.view.z
+  let (lx, ly, lz) = unit light.x light.y light.z
+  if nx * vx + ny * vy + nz * vz <= 0.0 or (lx == 0.0 and ly == 0.0 and lz == 0.0):
+    return math.rgba 0.0 0.0 0.0 1.0
+  let signed = nx * lx + ny * ly + nz * lz
+  let (hx, hy, hz) = unit (vx + lx) (vy + ly) (vz + lz)
+  let vh = saturate (vx * hx + vy * hy + vz * hz)
+  let metallic = saturate material.metallic
+  let ratio = f0_ratio material.ior
+  let f90 = F32.lerp material.specular 1.0 metallic
+  let t = 1.0 - vh
+  let schlick = t * t * t * t * t
+  let $math.Color { r: br, g: bg, b: bb } = material.base
+  let $math.Color { r: tr, g: tg, b: tb } = material.specular_color
+  let weight = (1.0 - metallic) / 3.14159265359
+  let amount = saturate subsurface.amount
+  let thin = saturate subsurface.thin
+  let back = 0.0
+  if amount > 0.0:
+    back := back_light vx vy vz lx ly lz nx ny nz
+  let $math.Color { r: sr, g: sg, b: sb } = subsurface.color
+  return $math.Color {
+    r: diffuse_channel br (fresnel br tr metallic material.specular ratio f90 schlick) weight amount sr thin signed back,
+    g: diffuse_channel bg (fresnel bg tg metallic material.specular ratio f90 schlick) weight amount sg thin signed back,
+    b: diffuse_channel bb (fresnel bb tb metallic material.specular ratio f90 schlick) weight amount sb thin signed back,
+    a: 1.0,
+  }
+
+// ---------------------------------------------------------------- transmission and volume
+
+// The refraction of the unit direction `incident` entering a surface of unit
+// `normal` with the ratio of indices `eta` (incoming over outgoing), as GLSL's
+// and WGSL's refract: eta * i - (eta (n . i) + sqrt(k)) n with k = 1 - eta^2
+// (1 - (n . i)^2), and the zero vector where k < 0 (total internal reflection).
+func refract (incident: Vec3) -> (normal: Vec3) -> (eta: F32) : Vec3 =>
+  let d = normal.x * incident.x + normal.y * incident.y + normal.z * incident.z
+  let k = 1.0 - eta * eta * (1.0 - d * d)
+  if k < 0.0:
+    return math.zero3
+  let s = eta * d + sqrt k
+  return $Vec3 { x: eta * incident.x - s * normal.x, y: eta * incident.y - s * normal.y, z: eta * incident.z - s * normal.z }
+
+// The direction a ray from the eye takes through a volume of index `ior`:
+// `refract(-v, n, 1 / ior)` for the frame's unit shading normal and view (an
+// `ior` below 1 counts as 1), the zero vector at total internal reflection.
+func transmission_ray (ior: F32) -> (frame: Frame) : Vec3 =>
+  let n = frame.normal.normalized
+  let v = frame.view.normalized
+  return refract (v * (-1.0)) n (1.0 / max 1.0 ior)
+
+// Where that ray leaves a volume of `thickness_world` (the material's
+// thickness times the model's x-axis scale) from `point`: a thin-walled
+// surface (thickness 0) exits where it entered.
+func volume_exit (point: Vec3) -> (ray: Vec3) -> (thickness_world: F32) : Vec3 =>
+  return $Vec3 { x: point.x + ray.x * thickness_world, y: point.y + ray.y * thickness_world, z: point.z + ray.z * thickness_world }
+
+// What Beer-Lambert absorption leaves of white light after `thickness_world`
+// through a medium that leaves `color` after `distance`: `color` to the power
+// `thickness_world / distance` per channel. No distance (0 or less) or no
+// thickness is no attenuation.
+func volume_attenuation (color_at_distance: math.Color) -> (thickness_world: F32) -> (distance: F32) : math.Color =>
+  if distance <= 0.0 or thickness_world <= 0.0:
+    return math.rgb 1.0 1.0 1.0
+  let exponent = thickness_world / distance
+  return math.rgb (color.power color_at_distance.r exponent) (color.power color_at_distance.g exponent) (color.power color_at_distance.b exponent)
+
+// The mip level of the opaque picture a transmissive surface of `roughness`
+// and `ior` reads, as the glTF sample viewer picks it: `log2(width) * clamp(r
+// * clamp(2 ior - 2, 0, 1), 0, 1)` with r = clamp(roughness, 0.04, 1), at
+// most `last`, the picture's last level. `width` is the picture's width in pixels.
+func transmission_level (width: F32) -> (last: F32) -> (roughness: F32) -> (ior: F32) : F32 =>
+  let r = clamp 0.04 1.0 roughness
+  return min last (color.log2 width * clamp 0.0 1.0 (r * clamp 0.0 1.0 (2.0 * ior - 2.0)))
+
+// The light a transmissive surface shows from behind it: `weight * T` with, per
+// channel, `T = behind * base * attenuation * (1 - Fspec) * (1 - metallic)`,
+// `behind` the opaque picture read at the ray's exit (see `transmission_ray`,
+// `volume_exit`, `transmission_level`), `attenuation` from `volume_attenuation`
+// and Fspec = f0 * split_x + split_y, the split-sum table's value at the view's
+// cosine and the roughness. The diffuse lobe's own share is `1 - weight`.
+func transmit (surface: Surface) -> (behind: math.Color) -> (attenuation: math.Color) -> (split_x: F32) -> (split_y: F32) : math.Color =>
+  let material = surface.material
+  let weight = saturate surface.transmission.weight
+  let metallic = saturate material.metallic
+  let inv_m = 1.0 - metallic
+  let ratio = f0_ratio material.ior
+  let spec = material.specular
+  let $math.Color { r: br, g: bg, b: bb } = material.base
+  let $math.Color { r: tr, g: tg, b: tb } = material.specular_color
+  let f0r = F32.lerp (min (ratio * tr) 1.0 * spec) br metallic
+  let f0g = F32.lerp (min (ratio * tg) 1.0 * spec) bg metallic
+  let f0b = F32.lerp (min (ratio * tb) 1.0 * spec) bb metallic
+  return $math.Color {
+    r: weight * (behind.r * br * attenuation.r * (1.0 - (f0r * split_x + split_y)) * inv_m),
+    g: weight * (behind.g * bg * attenuation.g * (1.0 - (f0g * split_x + split_y)) * inv_m),
+    b: weight * (behind.b * bb * attenuation.b * (1.0 - (f0b * split_x + split_y)) * inv_m),
+    a: 1.0,
+  }
+
+// ---------------------------------------------------------------- parallax occlusion mapping
+
+// A height field is a function of the texture coordinates (u, v) to a height
+// in [0, 1], 1 the surface and 0 the deepest point `scale` below it, in the
+// units of (u, v). The view or light `Vec3` is a unit direction in tangent
+// space (z along the normal). Samples outside [0, 1] are clamped.
+
+// How many layers a march takes along a direction of tangent-space `cosine`:
+// `floor(mix(32, 8, |cosine|))`, with mix(a, b, t) = a + (b - a) t in F32,
+// 32 straight on and 8 at grazing angles.
+func parallax_layers (cosine: F32) : U32 =>
+  if not (is_finite cosine):
+    return 32
+  return F32.to_u32 (floor (F32.lerp 32.0 8.0 (saturate (abs cosine))))
+
+// The displaced coordinates: march N layers down from (u, v) at height 1,
+// layer k at depth k / N and at (u, v) + k step with step = -view.xy / z *
+// scale / N and z = max(view.z, 1e-4), from k = 0 until the first layer whose
+// ray height 1 - k / N is at or below the sampled height, then one linear
+// refinement between that sample and the one before it, where the gap
+// (sampled height - ray height) changes sign. A view that is not above the
+// surface (z <= 0) or a zero vector does not displace.
+func parallax_uv (height: F32 -> F32 -> F32) -> (u: F32) -> (v: F32) -> (view: Vec3) -> (scale: F32) : (F32, F32) =>
+  let (vx, vy, vz) = unit view.x view.y view.z
+  if vz <= 0.0:
+    return (u, v)
+  let n = parallax_layers vz
+  let count = U32.to_f32 n
+  let z = max 0.0001 vz
+  let du = (0.0 - vx) / z * scale / count
+  let dv = (0.0 - vy) / z * scale / count
+  let previous_u = u
+  let previous_v = v
+  let previous = 0.0
+  for i in 0 .. n + 1:
+    let k = U32.to_f32 i
+    let cu = u + du * k
+    let cv = v + dv * k
+    let gap = clamp 0.0 1.0 (height cu cv) - (1.0 - k / count)
+    if gap >= 0.0:
+      if i == 0:
+        return (cu, cv)
+      let w = gap / (gap - previous)
+      return (cu + (previous_u - cu) * w, cv + (previous_v - cv) * w)
+    previous_u := cu
+    previous_v := cv
+    previous := gap
+  return (previous_u, previous_v)
+
+// How much of the light reaches the surface point at (u, v), 0 (shadowed) to 1:
+// from the point at its height h, march toward the light, which rises 1 - h
+// over N = parallax_layers(light.z) layers, the layer k at (u, v) + k step with
+// step = light.xy / z * scale * (1 - h) / N and z = max(light.z, 1e-4); the
+// light's ray height there is h + (1 - h) k / N, and the shadow is
+// `1 - saturate(8 * max_k(max(sampled height - ray height, 0)))`. A light that
+// is not above the surface (z <= 0) or a zero vector is fully shadowed.
+const parallax_shadow_gain: F32 = 8.0
+func parallax_shadow (height: F32 -> F32 -> F32) -> (u: F32) -> (v: F32) -> (light: Vec3) -> (scale: F32) : F32 =>
+  let (lx, ly, lz) = unit light.x light.y light.z
+  if lz <= 0.0:
+    return 0.0
+  let n = parallax_layers lz
+  let count = U32.to_f32 n
+  let z = max 0.0001 lz
+  let start = clamp 0.0 1.0 (height u v)
+  let rise = 1.0 - start
+  let du = lx / z * scale * rise / count
+  let dv = ly / z * scale * rise / count
+  let blocked = 0.0
+  for i in 1 .. n + 1:
+    let k = U32.to_f32 i
+    blocked := max self (clamp 0.0 1.0 (height (u + du * k) (v + dv * k)) - (start + rise * (k / count)))
+  return 1.0 - saturate (blocked * parallax_shadow_gain)
+
+// The displaced coordinates and the self-shadow there.
+type Parallax is data = $Parallax { u: F32, v: F32, shadow: F32 }
+func parallax (height: F32 -> F32 -> F32) -> (u: F32) -> (v: F32) -> (view: Vec3) -> (light: Vec3) -> (scale: F32) : Parallax =>
+  let (displaced_u, displaced_v) = parallax_uv height u v view scale
+  return $Parallax { u: displaced_u, v: displaced_v, shadow: parallax_shadow height displaced_u displaced_v light scale }
+
+// A height field from a texture's red channel: `width` x `rows` heights, row
+// major from the top, read with bilinear filtering at texel centres
+// ((i + 0.5) / width) and repeat addressing.
+func grid_height (heights: #[F32]) -> (width: U32) -> (rows: U32) -> (u: F32) -> (v: F32) : F32 =>
+  if width == 0 or rows == 0 or not (is_finite u and is_finite v):
+    return 0.0
+  if (width > 65535 or rows > 65535) and rows > 4294967295 / width:
+    return 0.0
+  if heights.length < width * rows:
+    return 0.0
+  let w = U32.to_f32 width
+  let h = U32.to_f32 rows
+  let x = u * w - 0.5
+  let y = v * h - 0.5
+  if not (is_finite x and is_finite y):
+    return 0.0
+  let fx = floor x
+  let fy = floor y
+  let tx = x - fx
+  let ty = y - fy
+  let wx0 = wrap w fx
+  let wy0 = wrap h fy
+  let x0 = if is_finite wx0 and wx0 >= 0.0 and wx0 < w and wx0 < 4294967040.0 then min (width - 1) (F32.to_u32 wx0) else 0
+  let y0 = if is_finite wy0 and wy0 >= 0.0 and wy0 < h and wy0 < 4294967040.0 then min (rows - 1) (F32.to_u32 wy0) else 0
+  let x1 = if abs fx < 16777216.0 and width < 16777216
+    then (if x0 + 1 < width then x0 + 1 else 0)
+    else do:
+      let wx1 = wrap w (fx + 1.0)
+      break if is_finite wx1 and wx1 >= 0.0 and wx1 < w and wx1 < 4294967040.0 then min (width - 1) (F32.to_u32 wx1) else 0
+  let y1 = if abs fy < 16777216.0 and rows < 16777216
+    then (if y0 + 1 < rows then y0 + 1 else 0)
+    else do:
+      let wy1 = wrap h (fy + 1.0)
+      break if is_finite wy1 and wy1 >= 0.0 and wy1 < h and wy1 < 4294967040.0 then min (rows - 1) (F32.to_u32 wy1) else 0
+  let row0 = y0 * width
+  let row1 = y1 * width
+  let top = F32.lerp heights[row0 + x0] heights[row0 + x1] tx
+  let bottom = F32.lerp heights[row1 + x0] heights[row1 + x1] tx
+  return F32.lerp top bottom ty
+
+// ---------------------------------------------------------------- thin-film iridescence and dispersion
+
+private func iridescence_channel (film_ior: F32) -> (r12: F32) -> (phi12: F32) -> (p2: F32) -> (opd: F32) -> (wavelength: F32) -> (f0: F32) : F32 =>
+  let clamped = clamp 0.0 0.999 f0
+  let s = sqrt clamped
+  let base_ior = (1.0 + s) / max (1.0 - s) 0.001
+  let sum_23 = film_ior + base_ior
+  let r0_23 = if is_finite sum_23 then (film_ior - base_ior) / sum_23 else (film_ior * 0.5 - base_ior * 0.5) / (film_ior * 0.5 + base_ior * 0.5)
+  let r0_23_sq = r0_23 * r0_23
+  let r23 = r0_23_sq + (1.0 - r0_23_sq) * p2
+  let phi23 = if base_ior > film_ior then 3.14159265359 else 0.0
+  let raw_phi = 2.0 * 3.14159265359 * opd / wavelength + phi12 + phi23
+  let phi = if not (is_finite raw_phi) then 0.0 else if abs raw_phi <= 8192.0 then raw_phi else if abs raw_phi > 1.0e7 then 0.0 else wrap tau raw_phi
+  let r123 = clamp 0.0 0.999 (sqrt (max 0.0 (r12 * r23)))
+  let term = 2.0 * r123 * cos phi
+  let num = r12 + r23 + term
+  let den = max 0.0001 (1.0 + r12 * r23 + term)
+  return clamp 0.0 1.0 (num / den)
+
+// Belcour & Barla (2017) analytical Airy thin-film interference reflectance
+// (`KHR_materials_iridescence`), matching Pen's `lobe_iridescence_fresnel`.
+// Preserves signed interface reflection phases so zero thickness equals bare Fresnel.
+func iridescence_fresnel (outside_ior: F32) -> (film_ior: F32) -> (cos_theta1: F32) -> (thickness_nm: F32) -> (base_f0: math.Color) : math.Color =>
+  if not (is_finite outside_ior and is_finite film_ior and is_finite cos_theta1 and is_finite thickness_nm and is_finite base_f0.r and is_finite base_f0.g and is_finite base_f0.b) or outside_ior <= 0.0 or film_ior <= 0.0:
+    return base_f0
+  let c1 = saturate cos_theta1
+  let eta = outside_ior / max film_ior 1.0001
+  let sin2_t2 = eta * eta * max 0.0 (1.0 - c1 * c1)
+  if not (is_finite sin2_t2) or sin2_t2 >= 1.0:
+    return math.rgb 1.0 1.0 1.0
+  let cos_t2 = sqrt (1.0 - sin2_t2)
+  let sum_12 = outside_ior + film_ior
+  let r0_12 = if is_finite sum_12 then (outside_ior - film_ior) / sum_12 else (outside_ior * 0.5 - film_ior * 0.5) / (outside_ior * 0.5 + film_ior * 0.5)
+  let r0_12_sq = r0_12 * r0_12
+  let t1 = 1.0 - c1
+  let p1 = t1 * t1 * t1 * t1 * t1
+  let r12 = r0_12_sq + (1.0 - r0_12_sq) * p1
+  let phi12 = if film_ior > outside_ior then 3.14159265359 else 0.0
+  let t2 = 1.0 - cos_t2
+  let p2 = t2 * t2 * t2 * t2 * t2
+  let opd = 2.0 * film_ior * (max 0.0 thickness_nm) * cos_t2
+  if not (is_finite opd):
+    return base_f0
+  return math.rgb
+    (iridescence_channel film_ior r12 phi12 p2 opd 650.0 base_f0.r)
+    (iridescence_channel film_ior r12 phi12 p2 opd 510.0 base_f0.g)
+    (iridescence_channel film_ior r12 phi12 p2 opd 475.0 base_f0.b)
+
+// Per-channel RGB index-of-refraction spread for `KHR_materials_dispersion`
+// (`dispersion = 20 / abbe_number`), matching Pen's `lobe_dispersion_iors`.
+func dispersion_iors (ior: F32) -> (dispersion: F32) : Vec3 =>
+  let half_spread = (ior - 1.0) * 0.052356 * max 0.0 dispersion
+  return math.vec3 (max 1.0 (ior - half_spread)) ior (ior + half_spread)
+
+// ---------------------------------------------------------------- generated
+
+// The sheen's directional albedo table: 32 columns (sqrt(nv) 0 to 1) by 16
+// rows (sqrt((roughness - 0.07) / 0.93) 0 to 1). `tools/native/src/surface.rs`
+// regenerates it by quadrature (`INK_WRITE_SHEEN_TABLE=1 pen test-squid
+// --filter sheen_table`) and its test fails if the source differs.
+// sheen-table:begin
+const sheen_table: #[F32] = #[
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000,
+  1.00000000, 0.96609209, 0.66635188, 0.43914545, 0.27494452, 0.16243548, 0.08983930, 0.04608312,
+  0.02168285, 0.00923651, 0.00350696, 0.00116469, 0.00033065, 0.00007799, 0.00001475, 0.00000213,
+  0.00000022, 0.00000002, 0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000,
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000,
+  1.00000000, 0.99849743, 0.70382454, 0.47581233, 0.30694153, 0.18781249, 0.10823914, 0.05826881,
+  0.02901557, 0.01321075, 0.00542376, 0.00197461, 0.00062460, 0.00016736, 0.00003679, 0.00000637,
+  0.00000082, 0.00000007, 0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000,
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000,
+  1.00000000, 1.00000000, 0.79120667, 0.56797785, 0.39292684, 0.26082237, 0.16527702, 0.09938102,
+  0.05630328, 0.02980166, 0.01458949, 0.00652583, 0.00262752, 0.00093481, 0.00028706, 0.00007381,
+  0.00001526, 0.00000240, 0.00000026, 0.00000002, 0.00000000, 0.00000000, 0.00000000, 0.00000000,
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000,
+  1.00000000, 1.00000000, 0.87482038, 0.67105278, 0.50103574, 0.36310585, 0.25457281, 0.17199340,
+  0.11146346, 0.06891247, 0.04037954, 0.02224737, 0.01141374, 0.00538712, 0.00230358, 0.00087483,
+  0.00028734, 0.00007868, 0.00001703, 0.00000268, 0.00000027, 0.00000001, 0.00000000, 0.00000000,
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000,
+  1.00000000, 1.00000000, 0.91595046, 0.74369491, 0.59229018, 0.46187804, 0.35194184, 0.26139767,
+  0.18869614, 0.13193549, 0.08898340, 0.05760236, 0.03557141, 0.02079630, 0.01139987, 0.00578623,
+  0.00267422, 0.00109958, 0.00038892, 0.00011233, 0.00002426, 0.00000330, 0.00000018, 0.00000000,
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000,
+  1.00000000, 1.00000000, 0.90920665, 0.77150637, 0.64560985, 0.53219713, 0.43159173, 0.34378996,
+  0.26849076, 0.20512874, 0.15291174, 0.11086346, 0.07787063, 0.05273348, 0.03421768, 0.02110542,
+  0.01224284, 0.00658119, 0.00320904, 0.00137332, 0.00048788, 0.00012911, 0.00001932, 0.00000026,
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000,
+  1.00000000, 0.98102820, 0.86882158, 0.76205773, 0.66160758, 0.56814115, 0.48214657, 0.40394357,
+  0.33369393, 0.27141090, 0.21696873, 0.17011324, 0.13047412, 0.09757910, 0.07087035, 0.04972273,
+  0.03346384, 0.02139528, 0.01281466, 0.00703751, 0.00341839, 0.00137031, 0.00038154, 0.00002884,
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000,
+  0.98277184, 0.89634067, 0.81178558, 0.72985974, 0.65118486, 0.57627302, 0.50554118, 0.43932106,
+  0.37786569, 0.32135404, 0.26989436, 0.22352695, 0.18222671, 0.14590578, 0.11441668, 0.08755592,
+  0.06506831, 0.04665211, 0.03196491, 0.02063031, 0.01224544, 0.00638909, 0.00263055, 0.00053878,
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 1.00000000, 0.94502083,
+  0.87992735, 0.81491643, 0.75060375, 0.68749593, 0.62601584, 0.56651993, 0.50931011, 0.45464221,
+  0.40273167, 0.35375757, 0.30786537, 0.26516875, 0.22575081, 0.18966490, 0.15693516, 0.12755696,
+  0.10149724, 0.07869493, 0.05906142, 0.04248124, 0.02881280, 0.01788945, 0.00952070, 0.00349374,
+  1.00000000, 1.00000000, 1.00000000, 1.00000000, 0.98340343, 0.93834126, 0.89090605, 0.84200093,
+  0.79230903, 0.74236191, 0.69258323, 0.64331760, 0.59485042, 0.54742171, 0.50123597, 0.45646924,
+  0.41327429, 0.37178437, 0.33211591, 0.29437057, 0.25863659, 0.22498985, 0.19349450, 0.16420342,
+  0.13715847, 0.11239058, 0.08991975, 0.06975496, 0.05189404, 0.03632342, 0.02301797, 0.01194067,
+  0.96083395, 0.95130653, 0.92968785, 0.90165811, 0.86940935, 0.83430004, 0.79726916, 0.75899487,
+  0.71998297, 0.68062055, 0.64121042, 0.60199396, 0.56316703, 0.52489117, 0.48730163, 0.45051341,
+  0.41462561, 0.37972478, 0.34588747, 0.31318216, 0.28167071, 0.25140954, 0.22245055, 0.19484174,
+  0.16862782, 0.14385056, 0.12054914, 0.09876037, 0.07851887, 0.05985716, 0.04280577, 0.02739325,
+  0.85583864, 0.84815146, 0.83071649, 0.80812013, 0.78212586, 0.75382052, 0.72394998, 0.69304750,
+  0.66150557, 0.62961961, 0.59761598, 0.56567085, 0.53392314, 0.50248383, 0.47144269, 0.44087321,
+  0.41083638, 0.38138354, 0.35255851, 0.32439934, 0.29693967, 0.27020975, 0.24423731, 0.21904830,
+  0.19466745, 0.17111876, 0.14842596, 0.12661285, 0.10570369, 0.08572354, 0.06669855, 0.04865633,
+  0.77679509, 0.77036767, 0.75580614, 0.73695585, 0.71529142, 0.69171744, 0.66685106, 0.64112984,
+  0.61487218, 0.58831418, 0.56163327, 0.53496417, 0.50840985, 0.48204943, 0.45594386, 0.43014016,
+  0.40467461, 0.37957512, 0.35486313, 0.33055503, 0.30666328, 0.28319735, 0.26016440, 0.23756984,
+  0.21541786, 0.19371178, 0.17245440, 0.15164825, 0.13129592, 0.11140024, 0.09196451, 0.07299265,
+  0.71697164, 0.71142504, 0.69887748, 0.68266018, 0.66404822, 0.64382094, 0.62250753, 0.60048076,
+  0.57800943, 0.55529039, 0.53246921, 0.50965395, 0.48692483, 0.46434101, 0.44194562, 0.41976940,
+  0.39783347, 0.37615137, 0.35473071, 0.33357435, 0.31268135, 0.29204771, 0.27166689, 0.25153028,
+  0.23162749, 0.21194660, 0.19247427, 0.17319591, 0.15409562, 0.13515622, 0.11635915, 0.09768477,
+  0.67144043, 0.66652196, 0.65541313, 0.64108069, 0.62465867, 0.60683840, 0.58808760, 0.56873412,
+  0.54901274, 0.52909382, 0.50910171, 0.48912709, 0.46923564, 0.44947405, 0.42987455, 0.41045811,
+  0.39123696, 0.37221637, 0.35339603, 0.33477118, 0.31633332, 0.29807086, 0.27996951, 0.26201260,
+  0.24418128, 0.22645456, 0.20880934, 0.19122031, 0.17365971, 0.15609709, 0.13849886, 0.12083050,
+  0.63657542, 0.63211312, 0.62205054, 0.60909083, 0.59426633, 0.57820518, 0.56133123, 0.54394050,
+  0.52624394, 0.50839359, 0.49049941, 0.47264056, 0.45487327, 0.43723644, 0.41975565, 0.40244617,
+  0.38531519, 0.36836348, 0.35158661, 0.33497592, 0.31851919, 0.30220115, 0.28600380, 0.26990667,
+  0.25388683, 0.23791896, 0.22197516, 0.20602478, 0.19003399, 0.17396535, 0.15777709, 0.14142957,
+]
+// sheen-table:end

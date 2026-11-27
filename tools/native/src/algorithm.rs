@@ -13,7 +13,7 @@ fn unpack(values: &[u32]) -> Vec<Vec<u32>> {
 }
 #[test]
 fn adversarial_sort_and_snapshot_copies() {
-    let mut f = Fixture::new("tests/algorithm-stress.blot");
+    let mut f = Fixture::new("tests/algorithm-stress.sq");
     let mut rng = Random(u32::MAX);
     for n in [0usize, 1, 2, 15, 16, 17, 31, 257, 4096] {
         let cases: Vec<Vec<u32>> = vec![
@@ -51,7 +51,7 @@ fn adversarial_sort_and_snapshot_copies() {
 }
 #[test]
 fn spatial_dense_flat_crossing_refits_match_exhaustive_bounds() {
-    let mut f = Fixture::new("tests/algorithm-stress.blot");
+    let mut f = Fixture::new("tests/algorithm-stress.sq");
     let mut rng = Random(813);
     for n in [0usize, 1, 7, 16, 127, 512] {
         for mode in [0, 1, 2] {
@@ -120,7 +120,7 @@ fn spatial_dense_flat_crossing_refits_match_exhaustive_bounds() {
 }
 #[test]
 fn placement_chunks_spacing_terrain_borders_and_long_tile_walks() {
-    let mut f = Fixture::new("tests/algorithm-stress.blot");
+    let mut f = Fixture::new("tests/algorithm-stress.sq");
     for seed in [0u32, 16777217, u32::MAX] {
         for spacing in [0.0, 0.7, 2.5] {
             let mut place = |z, depth| {
@@ -187,7 +187,7 @@ fn placement_chunks_spacing_terrain_borders_and_long_tile_walks() {
 }
 #[test]
 fn degenerate_segments_contact_reversals_and_debug_packing() {
-    let mut f = Fixture::new("tests/algorithm-stress.blot");
+    let mut f = Fixture::new("tests/algorithm-stress.sq");
     for scale in [0.001, 1.0, 1000.0] {
         assert_eq!(
             f.floats(
@@ -261,7 +261,7 @@ fn degenerate_segments_contact_reversals_and_debug_packing() {
 }
 #[test]
 fn host_carried_rigid_and_character_state_replays_600_ticks() {
-    let mut f = Fixture::new("tests/algorithm-stress.blot");
+    let mut f = Fixture::new("tests/algorithm-stress.sq");
     for mode in [0.0, 1.0] {
         let mut state = if mode == 0.0 {
             vec![
@@ -307,7 +307,7 @@ fn host_carried_rigid_and_character_state_replays_600_ticks() {
 }
 #[test]
 fn broad_phase_matches_exhaustive_active_resting_and_layer_pairs() {
-    let mut f = Fixture::new("tests/algorithm-stress.blot");
+    let mut f = Fixture::new("tests/algorithm-stress.sq");
     let mut rng = Random(0xabcdef01);
     for count in [0usize, 1, 16, 64, 128, 512] {
         let sources: Vec<[f64; 9]> = (0..count)
@@ -379,7 +379,7 @@ fn broad_phase_matches_exhaustive_active_resting_and_layer_pairs() {
 }
 #[test]
 fn dense_bodies_and_snapshots_keep_committed_memory_bounded() {
-    let mut f = Fixture::new("tests/algorithm-stress.blot");
+    let mut f = Fixture::new("tests/algorithm-stress.sq");
     for count in [16usize, 32, 64] {
         let state = f.floats("dense_bodies", count);
         assert_eq!(state[0], count as f64);
@@ -416,7 +416,7 @@ fn dense_bodies_and_snapshots_keep_committed_memory_bounded() {
         ("spatial_dense_refit", indices, 4 * 1024 * 1024),
         ("scene_dense", ids, 12 * 1024 * 1024),
     ] {
-        let mut f = Fixture::new("tests/algorithm-stress.blot");
+        let mut f = Fixture::new("tests/algorithm-stress.sq");
         let after: Vec<u32> = before
             .iter()
             .enumerate()

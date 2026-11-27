@@ -1,5 +1,5 @@
 // Detail-page controller: examples drawer, lazy source viewer and the
-// Blot ABI 8 Wasm runner.
+// Squid ABI 8 Wasm runner.
 
 const TRAP_SITE_OFFSET = 772;
 const DRAWER_MS = 280;
@@ -105,8 +105,8 @@ function initExamplesDrawer() {
 initExamplesDrawer();
 
 // Share this module's cache-busting tag with the highlighter.
-const { escapeHtml, highlightBlot } = await import(
-  `./blot-highlight.js${new URL(import.meta.url).search}`
+const { escapeHtml, highlightSquid } = await import(
+  `./squid-highlight.js${new URL(import.meta.url).search}`
 );
 
 // ── On-demand source disclosure ─────────────────────────────────────────────
@@ -124,7 +124,7 @@ function initSourceDisclosures() {
         const resp = await fetch(details.dataset.src);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         rawSource = await resp.text();
-        codeEl.innerHTML = highlightBlot(rawSource);
+        codeEl.innerHTML = highlightSquid(rawSource);
         if (copyBtn) copyBtn.disabled = false;
       } catch (err) {
         loaded = false;
@@ -153,7 +153,7 @@ function initSourceDisclosures() {
   }
 }
 
-// ── Blot ABI 8 Wasm runner ──────────────────────────────────────────────────
+// ── Squid ABI 8 Wasm runner ──────────────────────────────────────────────────
 function formatF32(v) {
   if (!Number.isFinite(v)) return String(v);
   const rounded = Math.fround(v);
@@ -164,7 +164,7 @@ function formatF32(v) {
 }
 
 function readTrapTable(mod) {
-  const sections = WebAssembly.Module.customSections(mod, 'blot:traps');
+  const sections = WebAssembly.Module.customSections(mod, 'squid:traps');
   if (!sections.length) return [];
   const bytes = new Uint8Array(sections[0]);
   if (bytes.length < 5 || bytes[0] !== 1) return [];
@@ -197,7 +197,7 @@ function formatTrap(err, traps, mem) {
   return err?.message ?? String(err);
 }
 
-function readBlotArray(mem, ptr, kind) {
+function readSquidArray(mem, ptr, kind) {
   if (!mem) throw new Error('missing guest memory');
   if (ptr === 0 || (ptr & 3) !== 0) {
     throw new Error(`invalid array pointer (${ptr})`);
@@ -321,7 +321,7 @@ function initWasmRunner() {
     }
     const callHtml = fn.param === 'Unit'
       ? `<span class="tok-fn">${escapeHtml(fn.name)}</span> <span class="tok-punc">()</span>`
-      : `<span class="tok-fn">${escapeHtml(fn.name)}</span> ${highlightBlot(parsed.display)}`;
+      : `<span class="tok-fn">${escapeHtml(fn.name)}</span> ${highlightSquid(parsed.display)}`;
     outEl.className = 'runner-out';
     outEl.innerHTML = `<span class="runner-time">Running</span> ${callHtml}<span class="runner-time">…</span>`;
 
@@ -331,11 +331,11 @@ function initWasmRunner() {
       if (runId !== latestRunId) return;
       const inst = await WebAssembly.instantiate(mod, {});
       const exp = inst.exports;
-      const mem = exp['blot:memory'] || exp.memory;
-      const reset = exp['blot:reset'];
-      const enter = exp['blot:ownership_enter'];
-      const leave = exp['blot:ownership_leave'];
-      const finish = exp['blot:finish_invocation'];
+      const mem = exp['squid:memory'] || exp.memory;
+      const reset = exp['squid:reset'];
+      const enter = exp['squid:ownership_enter'];
+      const leave = exp['squid:ownership_leave'];
+      const finish = exp['squid:finish_invocation'];
 
       if (typeof reset === 'function') reset(0);
       if (typeof enter === 'function') enter();
@@ -349,10 +349,10 @@ function initWasmRunner() {
         else if (fn.result === 'U32') formatted = String(raw >>> 0);
         else if (fn.result === 'Bool') formatted = raw ? 'true' : 'false';
         else if (fn.result === 'ArrayF32') {
-          const vals = readBlotArray(mem, raw >>> 0, 'ArrayF32');
+          const vals = readSquidArray(mem, raw >>> 0, 'ArrayF32');
           formatted = `#[${Array.from(vals).map(formatF32).join(', ')}]`;
         } else if (fn.result === 'ArrayU32') {
-          const vals = readBlotArray(mem, raw >>> 0, 'ArrayU32');
+          const vals = readSquidArray(mem, raw >>> 0, 'ArrayU32');
           formatted = `#[${Array.from(vals).join(', ')}]`;
         }
         outcome = 0;
@@ -378,7 +378,7 @@ function initWasmRunner() {
         outEl.innerHTML = `${callHtml}\ncleanup error: ${escapeHtml(cleanupErr)}`;
       } else {
         outEl.className = 'runner-out';
-        outEl.innerHTML = `${callHtml}\n<span class="tok-op">=&gt;</span> ${highlightBlot(formatted)}\n<span class="runner-time">(${elapsed} ms)</span>`;
+        outEl.innerHTML = `${callHtml}\n<span class="tok-op">=&gt;</span> ${highlightSquid(formatted)}\n<span class="runner-time">(${elapsed} ms)</span>`;
       }
     } catch (err) {
       if (runId !== latestRunId) return;

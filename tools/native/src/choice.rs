@@ -46,7 +46,7 @@ fn reference(weights: &[f64], seed: u32) -> Vec<u32> {
 }
 #[test]
 fn weighted_choices_preserve_full_random_state_proportions_and_replay() {
-    let mut f = Fixture::new("tests/placement_choice.blot");
+    let mut f = Fixture::new("tests/placement_choice.sq");
     for weights in [
         vec![0.0, 1.0, 2.0, 7.0],
         vec![1.0, 1.0, 1.0],
@@ -93,7 +93,7 @@ fn weighted_choices_preserve_full_random_state_proportions_and_replay() {
 }
 #[test]
 fn indexed_ground_matches_linear_queries_and_extent_cells() {
-    let mut f = Fixture::new("tests/navigation_ground.blot");
+    let mut f = Fixture::new("tests/navigation_ground.sq");
     for mode in [0, 1, 2] {
         for count in [1, 3, 4, 8, 64, 512] {
             for seed in 1..=3 {
@@ -137,7 +137,7 @@ fn indexed_ground_matches_linear_queries_and_extent_cells() {
 }
 #[test]
 fn retained_packets_keep_id_words_and_only_dirty_draws() {
-    let mut f = Fixture::new("tests/pen-instances.blot");
+    let mut f = Fixture::new("tests/pen-instances.sq");
     assert_eq!(
         f.floats("unchanged_retained", ()),
         f.floats("unchanged_host", ())

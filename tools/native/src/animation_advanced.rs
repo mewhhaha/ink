@@ -5,7 +5,7 @@ use super::*;
 type V = [f64; 3];
 type Q = [f64; 4];
 
-const FIXTURE: &str = "tests/animation_advanced_reference.blot";
+const FIXTURE: &str = "tests/animation_advanced_reference.sq";
 
 fn add(a: V, b: V) -> V {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]

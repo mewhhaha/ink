@@ -132,7 +132,7 @@ fn assert_all_finite(name: &str, iter: usize, input: &[f64], output: &[f64]) {
 
 #[test]
 fn fuzz_math_shapes_physics_and_acoustics_never_trap_or_poison() {
-    let mut f = Fixture::new("tests/fuzz_harness.blot");
+    let mut f = Fixture::new("tests/fuzz_harness.sq");
     let mut rng = Rng::new(0x1A2B_3C4D_5E6F_7789);
 
     for i in 0..200 {
@@ -167,7 +167,7 @@ fn fuzz_math_shapes_physics_and_acoustics_never_trap_or_poison() {
 
 #[test]
 fn fuzz_nav_ai_anim_ui_audio_and_render_math_never_trap_or_poison() {
-    let mut f = Fixture::new("tests/fuzz_harness.blot");
+    let mut f = Fixture::new("tests/fuzz_harness.sq");
     let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
 
     for i in 0..160 {
@@ -201,7 +201,7 @@ fn fuzz_nav_ai_anim_ui_audio_and_render_math_never_trap_or_poison() {
 
 #[test]
 fn fuzz_wire_packets_codecs_sort_and_frozen_map_differential() {
-    let mut f = Fixture::new("tests/fuzz_harness.blot");
+    let mut f = Fixture::new("tests/fuzz_harness.sq");
     let mut rng = Rng::new(0xD1B5_4A32_D192_ED03);
 
     // Wire decoders & codecs on arbitrary / truncated / extreme word buffers.

@@ -1,0 +1,483 @@
+//! Web Testing Library-style semantic role queries, user-event simulators and
+//! pure-Squid accessibility auditing over ink/ui/tree frames.
+//!
+//! Works inside any pure Squid test (`pen test-squid`) with zero host required.
+//!
+//! Key items: [`Finding`], [`Query`], [`any_role`], [`by_role`], [`with_name`].
+
+import * as array from "std/array"
+import * as i18n from "../i18n"
+import * as sort from "../sort"
+import * as text from "../text"
+import * as window from "../events"
+import * as tree from "./tree"
+import * as vocabulary from "./vocabulary"
+
+// Semantic role aliases matching AccessKit / browser DOM promotion:
+// - `role_listbox` matches a `role_list` with at least one focusable `role_listitem` child
+// - `role_option` matches a focusable `role_listitem`
+const role_listbox: U32 = 100
+const role_option: U32 = 101
+
+const filter_any: U32 = 0
+const filter_false: U32 = 1
+const filter_true: U32 = 2
+
+const finding_unnamed: U32 = 0
+const finding_focus: U32 = 1
+const finding_size: U32 = 2
+const finding_duplicate_id: U32 = 3
+
+type Finding is data = $Finding {
+  kind: U32,
+  node: U32,
+  measure: F32,
+}
+
+type Query is data = $Query {
+  role: U32,
+  match_role: Bool,
+  name: tree.Span,
+  has_name: Bool,
+  name_contains: Bool,
+  ignore_case: Bool,
+  checked: U32,
+  selected: U32,
+  expanded: U32,
+  disabled_filter: U32,
+  focused_filter: U32,
+  value_text: tree.Span,
+  has_value_text: Bool,
+  scope: U32,
+  include_hidden: Bool,
+}
+
+func any_role () : Query =>
+  return $Query {
+    role: 0,
+    match_role: false,
+    name: tree.no_span,
+    has_name: false,
+    name_contains: false,
+    ignore_case: false,
+    checked: vocabulary.state_none,
+    selected: vocabulary.state_none,
+    expanded: vocabulary.state_none,
+    disabled_filter: filter_any,
+    focused_filter: filter_any,
+    value_text: tree.no_span,
+    has_value_text: false,
+    scope: 0,
+    include_hidden: false,
+  }
+
+func by_role (role: U32) : Query =>
+  let q = any_role ()
+  q.role := role
+  q.match_role := true
+  return q
+
+func with_name (span: tree.Span) -> (q: Query) : Query =>
+  q.name := span
+  q.has_name := true
+  q.name_contains := false
+  return q
+
+func with_name_contains (span: tree.Span) -> (q: Query) : Query =>
+  q.name := span
+  q.has_name := true
+  q.name_contains := true
+  return q
+
+func case_insensitive (q: Query) : Query =>
+  q.ignore_case := true
+  return q
+
+func with_checked (state: U32) -> (q: Query) : Query =>
+  q.checked := state
+  return q
+
+func with_selected (state: U32) -> (q: Query) : Query =>
+  q.selected := state
+  return q
+
+func with_expanded (state: U32) -> (q: Query) : Query =>
+  q.expanded := state
+  return q
+
+func with_disabled (yes: Bool) -> (q: Query) : Query =>
+  q.disabled_filter := if yes then filter_true else filter_false
+  return q
+
+func with_focused (yes: Bool) -> (q: Query) : Query =>
+  q.focused_filter := if yes then filter_true else filter_false
+  return q
+
+func with_value_text (span: tree.Span) -> (q: Query) : Query =>
+  q.value_text := span
+  q.has_value_text := true
+  return q
+
+func within (scope_id: U32) -> (q: Query) : Query =>
+  q.scope := scope_id
+  return q
+
+func including_hidden (q: Query) : Query =>
+  q.include_hidden := true
+  return q
+
+private func contains_exact (haystack: &[U32]) -> (needle: &[U32]) : Bool =>
+  if needle.length == 0:
+    return true
+  if needle.length > haystack.length:
+    return false
+  let limit = haystack.length - needle.length + 1
+  for start in 0 .. limit:
+    let ok = true
+    for j in 0 .. needle.length:
+      if haystack[start + j] != needle[j]:
+        ok := false
+        break
+    if ok:
+      return true
+  return false
+
+private func text_matches (actual: &[U32]) -> (wanted: &[U32]) -> (partial: Bool) -> (icase: Bool) : Bool =>
+  if partial:
+    return if icase then i18n.contains_ignore_case actual wanted else contains_exact actual wanted
+  return if icase then i18n.same_ignore_case actual wanted else text.same actual wanted
+
+// Compute tree inclusion (not hidden, ancestors included, first occurrence per id) in O(N log N).
+private func compute_included (nodes: &[tree.StoredNode]) -> (parents: &[U32]) : #[Bool] =>
+  let n = nodes.length
+  let kept = array.fill n false
+  if n == 0:
+    return kept
+  let ids = array.fill n 0
+  for i in 0 .. n:
+    ids[i] := nodes[i].id
+  let order = sort.order_u32 ids
+  let is_dup = array.fill n false
+  for k in 1 .. n:
+    let cur_i = order[k]
+    let prev_i = order[k - 1]
+    if ids[cur_i] == ids[prev_i]:
+      is_dup[cur_i] := true
+  for i in 0 .. n:
+    let node = nodes[i]
+    if not is_dup[i] and not node.hidden:
+      let p = parents[i]
+      if node.parent == 0:
+        kept[i] := true
+      else:
+        if p < i:
+          kept[i] := kept[p]
+        else:
+          if p < n:
+            kept[i] := not (tree.hidden_at nodes parents i)
+  return kept
+
+private func compute_disabled (nodes: &[tree.StoredNode]) -> (parents: &[U32]) : #[Bool] =>
+  let n = nodes.length
+  let dis = array.fill n false
+  for i in 0 .. n:
+    let node = nodes[i]
+    if node.disabled:
+      dis[i] := true
+    else:
+      if node.parent != 0:
+        let p = parents[i]
+        if p < i:
+          dis[i] := dis[p]
+        else:
+          let at = p
+          let is_dis = false
+          for 0 .. 63:
+            if at >= n:
+              break
+            if nodes[at].disabled:
+              is_dis := true
+              break
+            if nodes[at].parent == 0:
+              break
+            at := parents[at]
+          dis[i] := is_dis
+  return dis
+
+private func active_modal (nodes: &[tree.StoredNode]) -> (kept: &[Bool]) -> (dis: &[Bool]) : U32 =>
+  let modal = 0
+  for i in 0 .. nodes.length:
+    if kept[i] and not dis[i] and nodes[i].role == vocabulary.role_dialog and nodes[i].modal:
+      modal := nodes[i].id
+  return modal
+
+private func role_matches_fast (wanted: U32) -> (nodes: &[tree.StoredNode]) -> (is_listbox: &[Bool]) -> (idx: U32) : Bool =>
+  let node = nodes[idx]
+  if wanted == role_listbox:
+    return is_listbox[idx]
+  if wanted == role_option:
+    return node.role == vocabulary.role_listitem and node.focusable
+  return node.role == wanted
+
+// Return all nodes matching `q`. Respects visibility, ancestor hiding, and open modal traps.
+func query_all (q: Query) -> (qpool: &[U32]) -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : #[tree.StoredNode] =>
+  let n = nodes.length
+  let parents = tree.parents_of nodes
+  let pview = &parents[0..parents.length]
+  let kept = compute_included nodes pview
+  let kview = &kept[0..kept.length]
+  let dis = compute_disabled nodes pview
+  let dview = &dis[0..dis.length]
+  let modal = active_modal nodes kview dview
+  let is_listbox = array.fill n false
+  if q.match_role and q.role == role_listbox:
+    for j in 0 .. n:
+      if kept[j] and nodes[j].role == vocabulary.role_listitem and nodes[j].focusable:
+        let p = parents[j]
+        if p < n and nodes[p].role == vocabulary.role_list:
+          is_listbox[p] := true
+  let lbview = &is_listbox[0..is_listbox.length]
+  let wanted_name = if q.has_name then tree.text qpool q.name else &tree.no_text[0..0]
+  let wanted_val = if q.has_value_text then tree.text qpool q.value_text else &tree.no_text[0..0]
+  let out: #[tree.StoredNode] = #[]
+  for i in 0 .. n:
+    let node = nodes[i]
+    let in_modal = modal == 0 or tree.within_at nodes pview modal i
+    let visible = kept[i] and in_modal
+    let ok = q.include_hidden or visible
+    if ok and q.scope != 0:
+      ok := node.id != q.scope and tree.within_at nodes pview q.scope i
+    if ok and q.match_role:
+      ok := role_matches_fast q.role nodes lbview i
+    if ok and q.has_name:
+      let actual = tree.text labels node.name
+      ok := text_matches actual wanted_name q.name_contains q.ignore_case
+    if ok and q.has_value_text:
+      let actual = tree.text labels node.value_text
+      ok := text_matches actual wanted_val false q.ignore_case
+    if ok and q.checked != vocabulary.state_none:
+      ok := node.checked == q.checked
+    if ok and q.selected != vocabulary.state_none:
+      ok := node.selected == q.selected
+    if ok and q.expanded != vocabulary.state_none:
+      ok := node.expanded == q.expanded
+    if ok and q.disabled_filter != filter_any:
+      ok := if q.disabled_filter == filter_true then dis[i] else not dis[i]
+    if ok and q.focused_filter != filter_any:
+      ok := if q.focused_filter == filter_true then node.focused else not node.focused
+    if ok:
+      @storage.push out node
+  return out
+
+func get_all (q: Query) -> (qpool: &[U32]) -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : #[tree.StoredNode] =>
+  let matches = query_all q qpool labels nodes
+  if matches.length == 0:
+    return panic "get_all: no accessible node matched query"
+  return matches
+
+func query_one (q: Query) -> (qpool: &[U32]) -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : Maybe tree.StoredNode =>
+  let matches = query_all q qpool labels nodes
+  if matches.length == 0:
+    return $Nothing
+  if matches.length > 1:
+    return panic "query_one: multiple accessible nodes matched query"
+  return $Some matches[0]
+
+func get_one (q: Query) -> (qpool: &[U32]) -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : tree.StoredNode =>
+  let matches = query_all q qpool labels nodes
+  if matches.length == 0:
+    return panic "get_one: no accessible node matched query"
+  if matches.length > 1:
+    return panic "get_one: multiple accessible nodes matched query"
+  return matches[0]
+
+// ── Direct Testing-Library Shorthands ────────────────────────────────────────
+
+func query_all_by_role (role: U32) -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : #[tree.StoredNode] =>
+  return query_all (by_role role) (&tree.no_text[0..0]) labels nodes
+
+func get_all_by_role (role: U32) -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : #[tree.StoredNode] =>
+  return get_all (by_role role) (&tree.no_text[0..0]) labels nodes
+
+func query_by_role (role: U32) -> name -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : Maybe tree.StoredNode =>
+  let qpool = array.generate name.length (func i => array.at i name)
+  let q = with_name ($tree.Span { start: 0, count: qpool.length }) (by_role role)
+  return query_one q (&qpool[0..qpool.length]) labels nodes
+
+func get_by_role (role: U32) -> name -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : tree.StoredNode =>
+  let qpool = array.generate name.length (func i => array.at i name)
+  let q = with_name ($tree.Span { start: 0, count: qpool.length }) (by_role role)
+  return get_one q (&qpool[0..qpool.length]) labels nodes
+
+func get_by_role_within (scope_id: U32) -> (role: U32) -> name -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : tree.StoredNode =>
+  let qpool = array.generate name.length (func i => array.at i name)
+  let q = within scope_id (with_name ($tree.Span { start: 0, count: qpool.length }) (by_role role))
+  return get_one q (&qpool[0..qpool.length]) labels nodes
+
+func get_by_label_text name -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : tree.StoredNode =>
+  let qpool = array.generate name.length (func i => array.at i name)
+  let q = with_name ($tree.Span { start: 0, count: qpool.length }) (any_role ())
+  return get_one q (&qpool[0..qpool.length]) labels nodes
+
+// ── User-Event Simulation (Respects Visibility, Enabled, Modal, Actions) ─────
+
+// Produce a UiAction event for `target_id` iff the node is visible, enabled,
+// inside any open modal, and advertises `action`.
+func user_action (action: U32) -> (value: F32) -> (target_id: U32) -> (nodes: &[tree.StoredNode]) : Maybe window.Event =>
+  if not (is_finite value):
+    return $Nothing
+  let parents = tree.parents_of nodes
+  let pview = &parents[0..parents.length]
+  let kept = compute_included nodes pview
+  let kview = &kept[0..kept.length]
+  let dis = compute_disabled nodes pview
+  let dview = &dis[0..dis.length]
+  let modal = active_modal nodes kview dview
+  for i in 0 .. nodes.length:
+    let node = nodes[i]
+    if node.id == target_id and kept[i]:
+      if dis[i] or not node.focusable:
+        return $Nothing
+      if modal != 0 and not (tree.within_at nodes pview modal i):
+        return $Nothing
+      if not (tree.offers node action):
+        return $Nothing
+      return $Some ($window.UiAction { node: target_id, action, value })
+  return $Nothing
+
+private func require_action (action: U32) -> (value: F32) -> (target: tree.StoredNode) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  let $Some ev = user_action action value target.id nodes else:
+    return panic "user action rejected: target is hidden, disabled, outside open modal, or does not support action"
+  return ev
+
+func user_activate (target: tree.StoredNode) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  return require_action vocabulary.action_activate 0.0 target nodes
+
+func user_focus (target: tree.StoredNode) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  return require_action vocabulary.action_focus 0.0 target nodes
+
+func user_blur (target: tree.StoredNode) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  return require_action vocabulary.action_blur 0.0 target nodes
+
+func user_increment (target: tree.StoredNode) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  return require_action vocabulary.action_increment 0.0 target nodes
+
+func user_decrement (target: tree.StoredNode) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  return require_action vocabulary.action_decrement 0.0 target nodes
+
+func user_set_value (value: F32) -> (target: tree.StoredNode) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  return require_action vocabulary.action_set_value value target nodes
+
+func user_expand (target: tree.StoredNode) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  return require_action vocabulary.action_expand 0.0 target nodes
+
+func user_collapse (target: tree.StoredNode) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  return require_action vocabulary.action_collapse 0.0 target nodes
+
+func user_click_role (role: U32) -> name -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  let target = get_by_role role name labels nodes
+  return user_activate target nodes
+
+func user_set_value_role (role: U32) -> name -> (value: F32) -> (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : window.Event =>
+  let target = get_by_role role name labels nodes
+  return user_set_value value target nodes
+
+// Turn a codepoint array/slice into committed TextInput events.
+func user_type codes : #[window.Event] =>
+  let out: #[window.Event] = #[]
+  for i in 0 .. codes.length:
+    @storage.push out ($window.TextInput { character: array.at i codes, composing: 0 })
+  return out
+
+// ── Pure-Squid Accessibility Tree Audit ───────────────────────────────────────
+
+private func named_role (role: U32) : Bool =>
+  return (role == vocabulary.role_button
+    or role == vocabulary.role_checkbox
+    or role == vocabulary.role_switch
+    or role == vocabulary.role_slider
+    or role == vocabulary.role_spinbutton
+    or role == vocabulary.role_menuitem
+    or role == vocabulary.role_tab
+    or role == vocabulary.role_radio
+    or role == vocabulary.role_textbox
+    or role == vocabulary.role_image
+    or role == vocabulary.role_dialog)
+
+private func drawn (node: tree.StoredNode) : Bool =>
+  return (node.width > 0.0 and node.height > 0.0
+    and is_finite node.x and is_finite node.y and is_finite node.width and is_finite node.height)
+
+// Mirror pen_runtime::audit::audit in pure Squid: checks unnamed controls/images/dialogs,
+// duplicate IDs, < 24x24 hit targets, multi-focus, excluded focus, empty modals and
+// focus escaped outside an open modal.
+func audit_tree (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : #[Finding] =>
+  let n = nodes.length
+  let parents = tree.parents_of nodes
+  let pview = &parents[0..parents.length]
+  let kept = compute_included nodes pview
+  let findings: #[Finding] = #[]
+  // Inclusion deduplicates IDs, so check inherited visibility and visible duplicates in O(N log N).
+  let visible = array.fill n false
+  let vis_ids: #[U32] = #[]
+  let vis_indices: #[U32] = #[]
+  for i in 0 .. n:
+    let node = nodes[i]
+    let is_vis = if node.hidden
+      then false
+      else if node.parent == 0
+        then true
+        else if parents[i] < i
+          then visible[parents[i]]
+          else not (tree.hidden_at nodes pview i)
+    visible[i] := is_vis
+    if is_vis:
+      @storage.push vis_ids node.id
+      @storage.push vis_indices i
+  let vis_dup = array.fill n false
+  if vis_ids.length > 1:
+    let vis_order = sort.order_u32 vis_ids
+    for k in 1 .. vis_order.length:
+      if vis_ids[vis_order[k]] == vis_ids[vis_order[k - 1]]:
+        vis_dup[vis_indices[vis_order[k]]] := true
+  for i in 0 .. n:
+    if vis_dup[i]:
+      @storage.push findings ($Finding { kind: finding_duplicate_id, node: nodes[i].id, measure: 0.0 })
+  // Unnamed nodes and WCAG 2.2 24x24 minimum target sizes.
+  let focused_count = 0
+  for i in 0 .. n:
+    let node = nodes[i]
+    if kept[i]:
+      let name = tree.text labels node.name
+      let value = tree.text labels node.value_text
+      let interactive = node.focusable or node.actions != 0
+      let is_words = node.role == vocabulary.role_text or node.role == vocabulary.role_heading or node.role == vocabulary.role_status
+      let silent = if is_words then (name.length == 0 and value.length == 0) else (name.length == 0 and (named_role node.role or interactive))
+      if silent:
+        @storage.push findings ($Finding { kind: finding_unnamed, node: node.id, measure: 0.0 })
+      if interactive and drawn node:
+        let least = min node.width node.height
+        if least < 24.0:
+          @storage.push findings ($Finding { kind: finding_size, node: node.id, measure: least })
+      if node.focused:
+        focused_count := self + 1
+        if focused_count > 1:
+          @storage.push findings ($Finding { kind: finding_focus, node: node.id, measure: 0.0 })
+    else:
+      if node.focused:
+        @storage.push findings ($Finding { kind: finding_focus, node: node.id, measure: 0.0 })
+  let dis = compute_disabled nodes pview
+  let modal = active_modal nodes (&kept[0..n]) (&dis[0..n])
+  if modal != 0:
+    let holds = false
+    for j in 0 .. n:
+      if kept[j]:
+        let node = nodes[j]
+        let inside = tree.within_at nodes pview modal j
+        if inside and node.id != modal and node.focusable and not dis[j]:
+          holds := true
+        if node.focused and (not inside or dis[j] or not node.focusable):
+          @storage.push findings ($Finding { kind: finding_focus, node: node.id, measure: 0.0 })
+    if not holds:
+      @storage.push findings ($Finding { kind: finding_focus, node: modal, measure: 0.0 })
+  return findings

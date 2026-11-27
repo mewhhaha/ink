@@ -1,5 +1,5 @@
 use crate::*;
-use blot_host::{
+use squid_host::{
     Argument,
     kernels::{KernelConfig, KernelPool},
 };
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn prepared_client_executes_ordered_waves_and_validates_before_effects() {
-    let module = compiled("tests/fixtures/simd_workers.blot", &[]);
+    let module = compiled("tests/fixtures/simd_workers.sq", &[]);
     let mut cfg = KernelConfig::default();
     cfg.workers = 4;
     cfg.deadline = Some(std::time::Duration::from_secs(5));
@@ -108,7 +108,7 @@ fn prepared_client_executes_ordered_waves_and_validates_before_effects() {
 
 #[test]
 fn kernel_kits_match_scalar_references_on_four_worker_pool() {
-    let module = compiled("tests/concurrency_kits.blot", &[]);
+    let module = compiled("tests/concurrency_kits.sq", &[]);
     let mut guest = Fixture::from_module(&module);
 
     let run_case = |guest: &mut Fixture,

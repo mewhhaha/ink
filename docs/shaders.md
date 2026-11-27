@@ -1,6 +1,6 @@
 # Core shaders
 
-Five standalone WGSL sources accompany the Blot modules. Copy or read them from
+Five standalone WGSL sources accompany the Squid modules. Copy or read them from
 `shaders/` in the checkout or package. Applications create their own GPU
 resources, bind groups and pipelines. Each file has a `vertex` entry point; all
 except `shadow.wgsl` also have a `fragment` entry point.
@@ -81,6 +81,6 @@ defaults to `true` for an ordinary unorm target. Set it to `false` for an sRGB
 attachment, where hardware supplies the transfer function, or to retain linear
 output. Apply the transfer function once.
 
-`pen test-blot --filter shaders` compiles the sources, creates pipelines and checks
+`pen test-squid --filter shaders` compiles the sources, creates pipelines and checks
 offscreen pixels using Rust/wgpu. It needs a WebGPU adapter; a Vulkan
 software adapter suffices. The test tooling stays outside the package.

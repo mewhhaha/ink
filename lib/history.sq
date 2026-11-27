@@ -1,0 +1,76 @@
+//! Separate named ring slots and metadata [capacity, head, count]. Old handles
+//! alias current storage. A retained historical value requires explicit copying.
+//! Element payloads are fixed-layout rows; variable data uses caller-owned
+//! pools plus spans/borrowed views/links, never owning array fields.
+//!
+//! Key items: [`Buffer`], [`Metadata`], [`Sample`], [`empty`], [`metadata`].
+//!
+//! ```squid
+//! let ring: Buffer U32 = empty ()
+//! let meta = metadata 3
+//! let (ring, meta) = push 10 ring meta
+//! let (ring, meta) = push 20 ring meta
+//! let (ring, meta) = push 30 ring meta
+//! let (ring, meta) = push 40 ring meta
+//! values ring meta // => #[20, 30, 40]
+//! ```
+
+import * as array from "std/array"
+
+type Buffer a = #[a]
+type Metadata = #[U32]
+type Sample a is data = $Sample { at: F32, value: a }
+func empty () : Buffer a => #[]
+func metadata (capacity: U32) : Metadata => #[capacity, 0, 0]
+func slot_at head -> index -> capacity => return
+  if index >= capacity - head then index - (capacity - head) else head + index
+func get (buffer: Buffer a) -> (meta: Metadata) -> (index: U32) =>
+  if index >= meta[2]:
+    return panic "history index outside buffer"
+  return buffer[slot_at meta[1] index meta[0]]
+func push value -> (buffer: own Buffer a) -> (meta: own Metadata) =>
+  if meta[0] == 0:
+    return (buffer, meta)
+  let slot = slot_at meta[1] meta[2] meta[0]
+  if slot == buffer.length:
+    @storage.push buffer value
+  else:
+    buffer[slot] := value
+  if meta[2] == meta[0]:
+    meta[1] := slot_at meta[1] 1 meta[0]
+  else:
+    meta[2] := meta[2] + 1
+  return (buffer, meta)
+func drop (count: U32) -> (buffer: Buffer a) -> (meta: own Metadata) : Metadata =>
+  let removed = min count meta[2]
+  if meta[0] > 0:
+    meta[1] := slot_at meta[1] removed meta[0]
+  meta[2] := meta[2] - removed
+  return meta
+func values (buffer: Buffer a) -> (meta: Metadata) => array.generate meta[2] (func i => get buffer meta i)
+func sample now -> value -> (buffer: own Buffer (Sample a)) -> (own meta) =>
+  if not (is_finite now):
+    return panic "history timestamp must be finite"
+  if meta[2] > 0 and now < (get buffer meta (meta[2] - 1)).at:
+    return panic "history timestamps must not go backwards"
+  return push ($Sample {at: now, value}) buffer meta
+func expire cutoff -> (buffer: Buffer (Sample a)) -> (own meta) =>
+  if not (is_finite cutoff):
+    return panic "history cutoff must be finite"
+  let count = 0
+  for i in 0 .. meta[2]:
+    if (get buffer meta i).at >= cutoff:
+      break
+    count := self + 1
+  return drop count buffer meta
+func shift delta -> (buffer: own Buffer (Sample a)) -> meta =>
+  if not (is_finite delta):
+    return panic "history shift must be finite"
+  for i in 0 .. meta[2]:
+    let slot = slot_at meta[1] i meta[0]
+    if not (is_finite (buffer[slot].at + delta)):
+      return panic "history shift overflows timestamp"
+  for i in 0 .. meta[2]:
+    let slot = slot_at meta[1] i meta[0]
+    buffer[slot].at := buffer[slot].at + delta
+  return buffer
