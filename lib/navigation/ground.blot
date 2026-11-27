@@ -184,13 +184,101 @@ func valid (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32) =>
 func make_into (storage: own Storage) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32): (Maybe Stored, Storage) =>
   if not (valid boxes rounds radius):
     return ($Nothing, storage)
+  if boxes.length <= few and rounds.length <= few - boxes.length:
+    return small_snapshot_views storage boxes rounds radius
   let (starts, items, shapes, slack, left, front, size, columns, rows) = with_built boxes rounds radius (func (ground: Read) =>
-    return (array.map identity ground.cells.starts, array.map identity ground.cells.items, array.map identity ground.shapes,
+    let sc = ground.cells.starts.length
+    let ic = ground.cells.items.length
+    let shc = ground.shapes.length
+    let s_out: #[U32] = @storage.with_capacity sc
+    for i in 0 .. sc:
+      @storage.push s_out ground.cells.starts[i]
+    let i_out: #[U32] = @storage.with_capacity ic
+    for i in 0 .. ic:
+      @storage.push i_out ground.cells.items[i]
+    let sh_out: #[F32] = @storage.with_capacity shc
+    for i in 0 .. shc:
+      @storage.push sh_out ground.shapes[i]
+    return (s_out, i_out, sh_out,
       ground.slack, ground.cells.left, ground.cells.front, ground.cells.size, ground.cells.columns, ground.cells.rows))
   let cells = $spatial.Cells {left, front, size, columns, rows, starts: &starts[0..starts.length], items: &items[0..items.length]}
   let built = $Ground {boxes, rounds, radius, cells, shapes: &shapes[0..shapes.length], slack}
   let (next, storage) = store storage built
   return ($Some next, storage)
+
+private func small_snapshot_views (storage: own Storage) -> (in_boxes: &[Box]) -> (in_rounds: &[Round]) -> (radius: F32) : (Maybe Stored, Storage) =>
+  let box_count = in_boxes.length
+  let round_count = in_rounds.length
+  let edge = radius + radius * 0.00001 + 1e-20
+  let total = box_count + round_count
+  let scale = 0.0
+  for i in 0 .. round_count:
+    let b = round_bounds edge in_rounds[i]
+    if b.low.x <= b.high.x and b.low.z <= b.high.z:
+      scale := max self (max (max (abs b.low.x) (abs b.high.x)) (max (abs b.low.z) (abs b.high.z)))
+  for i in 0 .. box_count:
+    let b = box_bounds edge in_boxes[i]
+    if b.low.x <= b.high.x and b.low.z <= b.high.z:
+      scale := max self (max (max (abs b.low.x) (abs b.high.x)) (max (abs b.low.z) (abs b.high.z)))
+  let slack = scale * 0.00001
+  let $Storage {boxes, rounds, words, shapes} = storage
+  let box_start = boxes.length
+  let round_start = rounds.length
+  let start = words.length
+  let item_start = start + 2
+  let shape_start = shapes.length
+  @storage.push words 0
+  @storage.push words 0
+  for i in 0 .. box_count:
+    @storage.push boxes in_boxes[i]
+  for i in 0 .. round_count:
+    @storage.push rounds in_rounds[i]
+  let left = 3.402823466e38
+  let front = 3.402823466e38
+  let items: U32 = 0
+  for i in 0 .. round_count:
+    let r = in_rounds[i]
+    let b = round_bounds edge r
+    let lx = b.low.x - slack
+    let lz = b.low.z - slack
+    let hx = b.high.x + slack
+    let hz = b.high.z + slack
+    if is_finite lx and is_finite lz and is_finite hx and is_finite hz and lx <= hx and lz <= hz:
+      left := min self lx
+      front := min self lz
+      @storage.push words i
+      items := self + 1
+      @storage.push shapes r.x
+      @storage.push shapes r.z
+      @storage.push shapes r.radius
+      @storage.push shapes (r.radius * r.radius)
+  for i in 0 .. box_count:
+    let bx = in_boxes[i]
+    let b = box_bounds edge bx
+    let lx = b.low.x - slack
+    let lz = b.low.z - slack
+    let hx = b.high.x + slack
+    let hz = b.high.z + slack
+    if is_finite lx and is_finite lz and is_finite hx and is_finite hz and lx <= hx and lz <= hz:
+      left := min self lx
+      front := min self lz
+      @storage.push words (round_count + i)
+      items := self + 1
+      @storage.push shapes bx.left
+      @storage.push shapes bx.right
+      @storage.push shapes bx.front
+      @storage.push shapes bx.back
+  words[start + 1] := items
+  let next = $Stored {
+    boxes: $Span {start: box_start, count: box_count, capacity: box_count},
+    rounds: $Span {start: round_start, count: round_count, capacity: round_count},
+    starts: $Span {start, count: 2, capacity: 2},
+    items: $Span {start: item_start, count: items, capacity: items},
+    shapes: $Span {start: shape_start, count: items * 4, capacity: items * 4},
+    radius, slack, left: if items == 0 then 0.0 else left, front: if items == 0 then 0.0 else front,
+    size: if items == 0 then 1.0 else 3e38, columns: 1, rows: 1,
+  }
+  return ($Some next, $Storage {boxes, rounds, words, shapes})
 func snapshot_into (storage: own Storage) -> (box_count: U32) -> (round_count: U32) -> (box_at: U32 -> Box) -> (round_at: U32 -> Round) -> (radius: F32) : (Maybe Stored, Storage) =>
   if not (is_finite radius and radius >= 0.0 and radius <= 1000000.0):
     return ($Nothing, storage)

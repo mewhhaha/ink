@@ -156,7 +156,25 @@ exact-sized buffers. `@array.fill n 0` defaults `0` to `U32`; bind a typed
 local (`let zero64: U64 = 0`) when filling `#[U64]`. On polymorphic text views,
 indexed `for i in 0 .. len: text.at i` avoids iterator overhead compared to
 `for code in text:`. Over-inlining medium helpers into hot loops can bloat Wasm
-locals and spill registers in the host compiler.
+locals and spill registers in the host compiler. Any tuple, record, or nominal
+type larger than 16 words (`box_words = 16`; `#[T]` is 2 words, `&[T]` is 4
+words) is heap-boxed and prevents the compiler from inlining functions that
+return it — keep hot return values (such as `Maybe audio.Prepared` or flat pool
+descriptors) at or below 16 words, or write directly into caller-owned arrays.
+Updating a scalar field directly on an `own` nominal wrapper that also holds
+`#[...]` array fields (e.g. `pool.flags := 1`) can trigger `RESULT_NOT_OWNED`
+when returning the wrapper; destructure the wrapper, update the local, and
+reconstruct it on return. Mutating fields on a local copy of a boxed (>16-word)
+struct allocates a fresh boxed copy, whereas mutating `output[i].field := v`
+writes directly into the array slot. `KnownClosure` currently specializes bare
+top-level function references passed directly to a callee, not record-field
+functions (such as `map.u32.equal`) or function parameters forwarded through
+intermediate helpers; hoist curried calls (`let eq = equal a`) out of hot loops
+to avoid allocating a partial closure per iteration. In tight scalar loops with
+known final length, pre-sized `@array.fill` + indexed `arr[k] := v` +
+`@storage.truncate` avoids per-iteration capacity checks from `@storage.push`.
+Top-level `let` bindings that build mutable arrays re-evaluate on every
+reference; keep reusable fixtures local to the caller when measuring.
 
 ## Math, transforms and time
 
@@ -440,17 +458,21 @@ Brush edits take destination face pool first; Stored brushes hold fixed
 placement and spans. Editor drag origins require independently copied faces.
 
 Scene Sources carry world pose, collider, optional rigid/walker and borrowed
-planes. Source indices address caller rows; unique positive U32 IDs determine
-query/contact ordering. `scene.access` takes named geometry, proxy, BVH and slot
-owners. `build_into destination sources` takes and returns a Scene. Geometry
-can contain authored payloads. Clear it only after its borrowers have finished.
-`update sources current changed_indices` returns the updated scene. Report every
-pose, shape, body kind, layer and collider edit. Source count or collider
-presence changes rebuild the tree. Dirty hull updates reuse compatible geometry
-spans. Retaining an old scene requires independent geometry, proxy and tree
-pools and an explicit nested-payload copy policy.
+planes. Persistent authored source storage splits optional `Rigid`/`Walker`
+payloads into a separate `scene.Bodies` side pool so static `SourceRow` entries
+stay compact (`physics.source_rigid`, `physics.set_rigid`). Source indices
+address caller rows; unique positive U32 IDs determine query/contact ordering.
+`scene.access` takes named geometry, proxy, BVH and slot owners. `build_into
+destination sources` takes and returns a Scene. Geometry can contain authored
+payloads. Clear it only after its borrowers have finished. `update sources
+current changed_indices` returns the updated scene. Report every pose, shape,
+body kind, layer and collider edit. Source count or collider presence changes
+rebuild the tree. Dirty hull updates reuse compatible geometry spans.
+Retaining an old scene requires independent geometry, proxy and tree pools and
+an explicit nested-payload copy policy.
 
-Spatial build/copy take named destinations. Refit takes parallel dirty indices
+Spatial build/copy take named destinations and store compact `2N - 1`-node
+trees without power-of-two padding. Refit takes parallel dirty indices
 and bounds, ignores invalid indices, keeps the last duplicate and traps on
 length mismatch. Rebind the index from the result. Query results retain source
 order. Closest ties choose smaller source index. Closest lower bounds must

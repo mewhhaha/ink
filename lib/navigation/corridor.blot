@@ -72,95 +72,182 @@ private func portal_run (links: &[U32]) -> (start: U32) -> (count: U32) -> (firs
 // Polygons that are `none` or out of range, nonfinite points and a zero limit
 // are `invalid`/`exhausted` without touching the mesh.
 func search_into (work: own Work) -> (m: mesh.Mesh) -> (start: mesh.Spot) -> (goal: mesh.Spot) -> (limit: U32) : (Work, Route) =>
-  @storage.truncate work.corridor 0
+  let $Work { costs, parents, states, heap: h, corridor, portals, path } = work
+  @storage.truncate corridor 0
   let n = m.polys.length
   if start.poly >= n or goal.poly >= n or not (is_finite start.x and is_finite start.z and is_finite goal.x and is_finite goal.z):
-    return (work, $Route { status: invalid, cost: 0.0, expanded: 0 })
+    return ($Work { costs, parents, states, heap: h, corridor, portals, path }, $Route { status: invalid, cost: 0.0, expanded: 0 })
   if start.poly == goal.poly:
-    @storage.push work.corridor start.poly
-    return (work, $Route { status: found, cost: distance start.x start.z goal.x goal.z, expanded: 0 })
+    @storage.push corridor start.poly
+    return ($Work { costs, parents, states, heap: h, corridor, portals, path }, $Route { status: found, cost: distance start.x start.z goal.x goal.z, expanded: 0 })
   if limit == 0:
-    return (work, $Route { status: exhausted, cost: 0.0, expanded: 0 })
-  let old_n = work.costs.length
+    return ($Work { costs, parents, states, heap: h, corridor, portals, path }, $Route { status: exhausted, cost: 0.0, expanded: 0 })
+  let old_n = costs.length
   let common = min old_n n
   for i in 0 .. common:
-    work.costs[i] := 3e38
-    work.parents[i] := mesh.none
-    work.states[i] := 0
-  for _ in common .. n:
-    @storage.push work.costs 3e38
-    @storage.push work.parents mesh.none
-    @storage.push work.states 0
+    costs[i] := 3e38
+    parents[i] := mesh.none
+    states[i] := 0
+  if n > common:
+    @storage.reserve costs (n - common)
+    @storage.reserve parents (n - common)
+    @storage.reserve states (n - common)
+    for _ in common .. n:
+      @storage.push costs 3e38
+      @storage.push parents mesh.none
+      @storage.push states 0
   if old_n > n:
-    @storage.truncate work.costs n
-    @storage.truncate work.parents n
-    @storage.truncate work.states n
-  work.heap := heap.clear work.heap
-  let g0 = distance start.x start.z m.centers[start.poly * 3] m.centers[start.poly * 3 + 2]
-  work.costs[start.poly] := g0
-  work.heap := heap.push work.heap (g0 + distance m.centers[start.poly * 3] m.centers[start.poly * 3 + 2] goal.x goal.z) g0 start.poly
-  let expanded = 0
-  let status = unreachable
-  let total = 0.0
+    @storage.truncate costs n
+    @storage.truncate parents n
+    @storage.truncate states n
+  let $heap.Heap { keys, ties, ids } = h
+  @storage.truncate keys 0
+  @storage.truncate ties 0
+  @storage.truncate ids 0
   let links = m.links
   let corners = m.corners
   let verts = m.vertices
   let centers = m.centers
+  let polys = m.polys
+  let gx = goal.x
+  let gz = goal.z
+  let s3 = start.poly * 3
+  let scx = centers[s3]
+  let scz = centers[s3 + 2]
+  let g0 = distance start.x start.z scx scz
+  costs[start.poly] := g0
+  @storage.push keys (g0 + distance scx scz gx gz)
+  @storage.push ties g0
+  @storage.push ids start.poly
+  let expanded = 0
+  let status = unreachable
+  let total = 0.0
   for 0 .. 4294967295:
-    if work.heap.ids.length == 0:
+    let h_len = ids.length
+    if h_len == 0:
       break
-    let p = work.heap.ids[0]
-    work.heap := heap.pop work.heap
-    if work.states[p] == 2:
+    let p = ids[0]
+    let last = h_len - 1
+    let moved_k = keys[last]
+    let moved_t = ties[last]
+    let moved_i = ids[last]
+    @storage.truncate keys last
+    @storage.truncate ties last
+    @storage.truncate ids last
+    if last > 0:
+      let k: U32 = 0
+      for 0 .. 32:
+        let left = (k << 1) + 1
+        if left >= last:
+          break
+        let child = left
+        let ck = keys[left]
+        let ct = ties[left]
+        let ci = ids[left]
+        let right = left + 1
+        if right < last:
+          let rk = keys[right]
+          let rt = ties[right]
+          let ri = ids[right]
+          if rk < ck or (rk == ck and (rt > ct or (rt == ct and ri < ci))):
+            child := right
+            ck := rk
+            ct := rt
+            ci := ri
+        if not (ck < moved_k or (ck == moved_k and (ct > moved_t or (ct == moved_t and ci < moved_i)))):
+          break
+        keys[k] := ck
+        ties[k] := ct
+        ids[k] := ci
+        k := child
+      keys[k] := moved_k
+      ties[k] := moved_t
+      ids[k] := moved_i
+    if states[p] == 2:
       continue
     if expanded >= limit:
       status := exhausted
       break
-    work.states[p] := 2
+    states[p] := 2
     expanded := self + 1
+    let p3 = p * 3
+    let cx = centers[p3]
+    let cz = centers[p3 + 2]
+    let base_cost = costs[p]
     if p == goal.poly:
       status := found
-      total := work.costs[p] + distance centers[p * 3] centers[p * 3 + 2] goal.x goal.z
+      let dxg = cx - gx
+      let dzg = cz - gz
+      total := base_cost + sqrt (dxg * dxg + dzg * dzg)
       break
-    let poly = m.polys[p]
+    let poly = polys[p]
     let p_start = poly.start
     let p_count = poly.count
-    let cx = centers[p * 3]
-    let cz = centers[p * 3 + 2]
-    let base_cost = work.costs[p]
     let previous = if p_count == 0 then mesh.none else links[p_start + p_count - 1]
     for i in 0 .. p_count:
       let q = links[p_start + i]
       let repeats = q == previous
       previous := q
-      if q == mesh.none or repeats or work.states[q] == 2:
+      if q == mesh.none or repeats or states[q] == 2:
         continue
-      let (_, end) = portal_run links p_start p_count i q
-      let a = corners[p_start + i]
-      let b = corners[p_start + end]
-      let mx = (verts[a * 3] + verts[b * 3]) * 0.5
-      let mz = (verts[a * 3 + 2] + verts[b * 3 + 2]) * 0.5
-      let qx = centers[q * 3]
-      let qz = centers[q * 3 + 2]
-      let step = distance cx cz mx mz + distance mx mz qx qz
+      let next_edge = if i + 1 == p_count then 0 else i + 1
+      let end = next_edge
+      if links[p_start + next_edge] == q:
+        let (_, run_end) = portal_run links p_start p_count i q
+        end := run_end
+      let a3 = corners[p_start + i] * 3
+      let b3 = corners[p_start + end] * 3
+      let mx = (verts[a3] + verts[b3]) * 0.5
+      let mz = (verts[a3 + 2] + verts[b3 + 2]) * 0.5
+      let q3 = q * 3
+      let qx = centers[q3]
+      let qz = centers[q3 + 2]
+      let dx1 = cx - mx
+      let dz1 = cz - mz
+      let dx2 = mx - qx
+      let dz2 = mz - qz
+      let step = sqrt (dx1 * dx1 + dz1 * dz1) + sqrt (dx2 * dx2 + dz2 * dz2)
       let cost = base_cost + step
-      if cost < work.costs[q]:
-        work.costs[q] := cost
-        work.parents[q] := p
-        work.heap := heap.push work.heap (cost + distance qx qz goal.x goal.z) cost q
+      if cost < costs[q]:
+        costs[q] := cost
+        parents[q] := p
+        let dxg = qx - gx
+        let dzg = qz - gz
+        let key = cost + sqrt (dxg * dxg + dzg * dzg)
+        let k = ids.length
+        @storage.push keys key
+        @storage.push ties cost
+        @storage.push ids q
+        for 0 .. 32:
+          if k == 0:
+            break
+          let parent = (k - 1) >> 1
+          let pk = keys[parent]
+          let pt = ties[parent]
+          let pi = ids[parent]
+          if not (key < pk or (key == pk and (cost > pt or (cost == pt and q < pi)))):
+            break
+          keys[k] := pk
+          ties[k] := pt
+          ids[k] := pi
+          k := parent
+        keys[k] := key
+        ties[k] := cost
+        ids[k] := q
   if status != found:
-    return (work, $Route { status, cost: 0.0, expanded })
+    return ($Work { costs, parents, states, heap: $heap.Heap { keys, ties, ids }, corridor, portals, path }, $Route { status, cost: 0.0, expanded })
   let length = 1
   let p = goal.poly
   for 0 .. n:
     if p == start.poly:
       break
-    p := work.parents[p]
+    p := parents[p]
     length := self + 1
+  @storage.reserve corridor length
   for _ in 0 .. length:
-    @storage.push work.corridor 0
+    @storage.push corridor 0
   p := goal.poly
   for k in 0 .. length:
-    work.corridor[length - 1 - k] := p
-    p := work.parents[p]
-  return (work, $Route { status: found, cost: total, expanded })
+    corridor[length - 1 - k] := p
+    p := parents[p]
+  return ($Work { costs, parents, states, heap: $heap.Heap { keys, ties, ids }, corridor, portals, path }, $Route { status: found, cost: total, expanded })
