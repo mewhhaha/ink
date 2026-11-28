@@ -1,3 +1,4 @@
+import * as bytes from "std/bytes"
 import * as simd from "std/simd"
 import { Vec2, Vec3 } from "std/vector"
 import * as test from "std/test"
@@ -292,4 +293,97 @@ test "comptime decode_lanes roundtrips and restores defaults":
   use bits.bits_array "camera roundtrip" cam_e cam_r
   use test.is_nothing "truncated" truncated
   use test.is_nothing "trailing" trailing
+  return ()
+
+type BinaryPacket is data = $BinaryPacket {
+  tag: U8,
+  active: Bool,
+  @[$Skip]
+  cached: U32 = 42,
+  u32_val: U32,
+  i32_val: I32,
+  u64_val: U64,
+  i64_val: I64,
+  f32_val: F32,
+  f64_val: F64,
+  pos: Vec3,
+  tint: math.Color,
+}
+
+@[test.suite]
+test "comptime slice and flat U8 byte-lane codecs":
+  let rec = $LaneRecord {
+    active: true,
+    transient: 55,
+    pos: math.vec2 (-1.5) 2.25,
+    count: 9,
+    ratio: 0.5,
+    tint: math.rgba 0.25 0.5 0.75 1.0,
+  }
+  let encoded = codec.encode_lanes rec
+  let slice_dec: Maybe LaneRecord = codec.decode_lanes_slice (&encoded[0..encoded.length])
+  let $Some slice_restored = slice_dec else:
+    use test.fail "decode_lanes_slice" "restored"
+    return ()
+  use test.eq "slice skip default" 77 slice_restored.transient
+  use bits.bits_array "slice roundtrip" encoded (codec.encode_lanes slice_restored)
+  let bad_slice: Maybe LaneRecord = codec.decode_lanes_slice (&encoded[0..3])
+  use test.is_nothing "slice truncated" bad_slice
+
+  let tagged_site = $TaggedSite { ring: 16777217, sector: 7, kind: 4294967295, age: -0.125, work: 100, impact: 0.375, delivered: 4 }
+  let words = codec.encode_record 1 1 tagged_site
+  let rec_slice: Maybe TaggedSite = codec.decode_record_slice 1 1 (&words[0..words.length])
+  let $Some rec_restored = rec_slice else:
+    use test.fail "decode_record_slice" "restored"
+    return ()
+  use test.eq "record slice ring and skip" #[16777217, 999] #[rec_restored.ring, rec_restored.cached_score]
+
+  let neg_zero_f32 = F32.from_bits 0x80000000
+  let tiny_f32 = F32.from_bits 1
+  let neg_zero_f64 = F64.from_bits 0x8000000000000000
+  let pkt = $BinaryPacket {
+    tag: 0xAB,
+    active: true,
+    cached: 999,
+    u32_val: 0x12345678,
+    i32_val: -123456,
+    u64_val: 0x0102030405060708,
+    i64_val: -9876543210123,
+    f32_val: neg_zero_f32,
+    f64_val: neg_zero_f64,
+    pos: math.vec3 tiny_f32 (-2.5) 3.75,
+    tint: math.rgba 0.125 0.25 0.5 1.0,
+  }
+  let width = codec.byte_count pkt
+  let raw = codec.encode_bytes pkt
+  use test.eq "byte width matches encoded length" width raw.length
+  use test.eq "expected byte width" 66 width
+  let bdec: Maybe BinaryPacket = codec.decode_bytes raw
+  let $Some brest = bdec else:
+    use test.fail "decode_bytes" "restored"
+    return ()
+  let bsdec: Maybe BinaryPacket = codec.decode_bytes_slice (&raw[0..raw.length])
+  let $Some bsrest = bsdec else:
+    use test.fail "decode_bytes_slice" "restored"
+    return ()
+  use test.eq "bytes skip default" 42 brest.cached
+  use test.eq "bytes u32/i32" #[0x12345678, I32.to_u32 (-123456)] #[brest.u32_val, I32.to_u32 brest.i32_val]
+  use test.holds "bytes u64/i64" (brest.u64_val == 0x0102030405060708 and brest.i64_val == -9876543210123)
+  use test.eq "bytes neg zero f32 bits" 0x80000000 (F32.to_bits brest.f32_val)
+  use test.holds "bytes neg zero f64 bits" (F64.to_bits brest.f64_val == 0x8000000000000000)
+  use test.holds "bytes slice re-encode matches" (bytes.equal raw (codec.encode_bytes bsrest))
+  let trunc_b: Maybe BinaryPacket = codec.decode_bytes_slice (&raw[0..10])
+  use test.is_nothing "bytes truncated" trunc_b
+  let bad_bool = copy raw
+  bad_bool[1] := 2
+  let bad_bool_dec: Maybe BinaryPacket = codec.decode_bytes bad_bool
+  use test.is_nothing "bytes bad bool" bad_bool_dec
+  let bad_nan = copy raw
+  // f32_val starts at byte offset 1+1+4+4+8+8 = 26
+  bad_nan[26] := 0x00
+  bad_nan[27] := 0x00
+  bad_nan[28] := 0xC0
+  bad_nan[29] := 0x7F
+  let bad_nan_dec: Maybe BinaryPacket = codec.decode_bytes bad_nan
+  use test.is_nothing "bytes rejects NaN f32" bad_nan_dec
   return ()

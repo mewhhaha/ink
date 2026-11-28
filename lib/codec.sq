@@ -481,6 +481,464 @@ func decode_lanes (values: #[F32]): Maybe t =>
     return $Nothing
   return $Some built
 
+// Strict wrapper over `decode_lanes` matching `lanes.Codec`'s trap contract.
+func require_lanes (values: #[F32]): t =>
+  let decoded: Maybe t = decode_lanes values
+  let $Some built = decoded else:
+    return panic "invalid Ink numeric lanes"
+  return built
+
+// Zero-copy `&[F32]` slice flat-lane readers paired with `decode_lanes`.
+type LaneSliceDecode a is trait = {
+  from_lane_slice: &[F32] -> U32 -> Maybe (a, U32),
+}
+
+func read_lane_slice (values: &[F32]) -> (at: U32): Maybe (a, U32) where { LaneSliceDecode a } =>
+  LaneSliceDecode.from_lane_slice values at
+
+func slice_available (values: &[F32]) -> (at: U32) -> (width: U32): Bool =>
+  at <= values.length and width <= values.length - at
+
+func slice_finite (values: &[F32]) -> (at: U32) -> (width: U32): Bool =>
+  if not (slice_available values at width):
+    return false
+  for i in at .. at + width:
+    if not (is_finite values[i]):
+      return false
+  return true
+
+func read_lane_slice_f32 (values: &[F32]) -> (at: U32): Maybe (F32, U32) =>
+  if not (slice_finite values at 1):
+    return $Nothing
+  return $Some (values[at], at + 1)
+
+const F32.LaneSliceDecode: LaneSliceDecode F32 = {
+  from_lane_slice: read_lane_slice_f32,
+}
+
+func read_lane_slice_u32 (values: &[F32]) -> (at: U32): Maybe (U32, U32) =>
+  if not (slice_available values at 1):
+    return $Nothing
+  let value = values[at]
+  if not (value >= 0.0 and value < 4294967296.0 and floor value == value):
+    return $Nothing
+  return $Some (F32.to_u32 value, at + 1)
+
+const U32.LaneSliceDecode: LaneSliceDecode U32 = {
+  from_lane_slice: read_lane_slice_u32,
+}
+
+func read_lane_slice_bool (values: &[F32]) -> (at: U32): Maybe (Bool, U32) =>
+  if not (slice_available values at 1):
+    return $Nothing
+  let value = values[at]
+  if value != 0.0 and value != 1.0:
+    return $Nothing
+  return $Some (value == 1.0, at + 1)
+
+const Bool.LaneSliceDecode: LaneSliceDecode Bool = {
+  from_lane_slice: read_lane_slice_bool,
+}
+
+func read_lane_slice_vec2 (values: &[F32]) -> (at: U32): Maybe (Vec2, U32) =>
+  if not (slice_finite values at 2):
+    return $Nothing
+  return $Some ($Vec2 { x: values[at], y: values[at + 1] }, at + 2)
+
+const Vec2.LaneSliceDecode: LaneSliceDecode Vec2 = {
+  from_lane_slice: read_lane_slice_vec2,
+}
+
+func read_lane_slice_vec3 (values: &[F32]) -> (at: U32): Maybe (Vec3, U32) =>
+  if not (slice_finite values at 3):
+    return $Nothing
+  return $Some ($Vec3 { x: values[at], y: values[at + 1], z: values[at + 2] }, at + 3)
+
+const Vec3.LaneSliceDecode: LaneSliceDecode Vec3 = {
+  from_lane_slice: read_lane_slice_vec3,
+}
+
+func read_lane_slice_vec4 (values: &[F32]) -> (at: U32): Maybe (math.Vec4, U32) =>
+  if not (slice_finite values at 4):
+    return $Nothing
+  return $Some ($math.Vec4 { x: values[at], y: values[at + 1], z: values[at + 2], w: values[at + 3] }, at + 4)
+
+const Vec4.LaneSliceDecode: LaneSliceDecode math.Vec4 = {
+  from_lane_slice: read_lane_slice_vec4,
+}
+
+func read_lane_slice_quat (values: &[F32]) -> (at: U32): Maybe (math.Quat, U32) =>
+  if not (slice_finite values at 4):
+    return $Nothing
+  return $Some ($math.Quat { x: values[at], y: values[at + 1], z: values[at + 2], w: values[at + 3] }, at + 4)
+
+const Quat.LaneSliceDecode: LaneSliceDecode math.Quat = {
+  from_lane_slice: read_lane_slice_quat,
+}
+
+func read_lane_slice_color (values: &[F32]) -> (at: U32): Maybe (math.Color, U32) =>
+  if not (slice_finite values at 4):
+    return $Nothing
+  return $Some ($math.Color { r: values[at], g: values[at + 1], b: values[at + 2], a: values[at + 3] }, at + 4)
+
+const Color.LaneSliceDecode: LaneSliceDecode math.Color = {
+  from_lane_slice: read_lane_slice_color,
+}
+
+func decode_lanes_slice (values: &[F32]): Maybe t =>
+  let at: U32 = 0
+  let built: t = #for field in #fields t:
+    #if field.has_tag $Skip:
+      break field.default
+    #else:
+      let $Some (value, next) = LaneSliceDecode.from_lane_slice values at else:
+        return $Nothing
+      at := next
+      break value
+  if at != values.length:
+    return $Nothing
+  return $Some built
+
+// Flat little-endian `#[U8]` byte-lane codecs for compact binary wire formats.
+// IEEE-754 F32/F64 lanes preserve exact finite bit patterns (signed zero,
+// subnormals) and reject NaN/Inf on decode.
+type ByteEncode a is trait = {
+  byte_width: a -> U32,
+  push_bytes: a -> own #[U8] -> #[U8],
+}
+
+type ByteDecode a is trait = {
+  from_bytes: #[U8] -> U32 -> Maybe (a, U32),
+}
+
+type ByteSliceDecode a is trait = {
+  from_byte_slice: &[U8] -> U32 -> Maybe (a, U32),
+}
+
+func push_le_u32 (word: U32) -> (out: own #[U8]): #[U8] =>
+  @storage.push out (U32.to_u8 (word & 0xFF))
+  @storage.push out (U32.to_u8 ((word >> 8) & 0xFF))
+  @storage.push out (U32.to_u8 ((word >> 16) & 0xFF))
+  @storage.push out (U32.to_u8 ((word >> 24) & 0xFF))
+  return out
+
+func push_le_u64 (word: U64) -> (out: own #[U8]): #[U8] =>
+  out := push_le_u32 (U64.to_u32 word) self
+  return push_le_u32 (U64.to_u32 (word >> 32)) out
+
+func bytes_available (values: #[U8]) -> (at: U32) -> (width: U32): Bool =>
+  at <= values.length and width <= values.length - at
+
+func byte_slice_available (values: &[U8]) -> (at: U32) -> (width: U32): Bool =>
+  at <= values.length and width <= values.length - at
+
+func read_le_u32 (values: #[U8]) -> (at: U32): U32 =>
+  U8.to_u32 values[at] | (U8.to_u32 values[at + 1] << 8) | (U8.to_u32 values[at + 2] << 16) | (U8.to_u32 values[at + 3] << 24)
+
+func read_le_u32_slice (values: &[U8]) -> (at: U32): U32 =>
+  U8.to_u32 values[at] | (U8.to_u32 values[at + 1] << 8) | (U8.to_u32 values[at + 2] << 16) | (U8.to_u32 values[at + 3] << 24)
+
+func read_le_u64 (values: #[U8]) -> (at: U32): U64 =>
+  U32.to_u64 (read_le_u32 values at) | (U32.to_u64 (read_le_u32 values (at + 4)) << 32)
+
+func read_le_u64_slice (values: &[U8]) -> (at: U32): U64 =>
+  U32.to_u64 (read_le_u32_slice values at) | (U32.to_u64 (read_le_u32_slice values (at + 4)) << 32)
+
+func push_byte_u8 (v: U8) -> (out: own #[U8]): #[U8] =>
+  @storage.push out v
+  return out
+func read_byte_u8 (values: #[U8]) -> (at: U32): Maybe (U8, U32) =>
+  if not (bytes_available values at 1):
+    return $Nothing
+  return $Some (values[at], at + 1)
+func read_byte_slice_u8 (values: &[U8]) -> (at: U32): Maybe (U8, U32) =>
+  if not (byte_slice_available values at 1):
+    return $Nothing
+  return $Some (values[at], at + 1)
+const U8.ByteEncode: ByteEncode U8 = { byte_width: func _ => 1, push_bytes: push_byte_u8 }
+const U8.ByteDecode: ByteDecode U8 = { from_bytes: read_byte_u8 }
+const U8.ByteSliceDecode: ByteSliceDecode U8 = { from_byte_slice: read_byte_slice_u8 }
+
+func push_byte_bool (v: Bool) -> (out: own #[U8]): #[U8] =>
+  let b: U8 = if v then 1 else 0
+  @storage.push out b
+  return out
+func read_byte_bool (values: #[U8]) -> (at: U32): Maybe (Bool, U32) =>
+  if not (bytes_available values at 1) or values[at] > 1:
+    return $Nothing
+  return $Some (values[at] == 1, at + 1)
+func read_byte_slice_bool (values: &[U8]) -> (at: U32): Maybe (Bool, U32) =>
+  if not (byte_slice_available values at 1) or values[at] > 1:
+    return $Nothing
+  return $Some (values[at] == 1, at + 1)
+const Bool.ByteEncode: ByteEncode Bool = { byte_width: func _ => 1, push_bytes: push_byte_bool }
+const Bool.ByteDecode: ByteDecode Bool = { from_bytes: read_byte_bool }
+const Bool.ByteSliceDecode: ByteSliceDecode Bool = { from_byte_slice: read_byte_slice_bool }
+
+func read_byte_u32 (values: #[U8]) -> (at: U32): Maybe (U32, U32) =>
+  if not (bytes_available values at 4):
+    return $Nothing
+  return $Some (read_le_u32 values at, at + 4)
+func read_byte_slice_u32 (values: &[U8]) -> (at: U32): Maybe (U32, U32) =>
+  if not (byte_slice_available values at 4):
+    return $Nothing
+  return $Some (read_le_u32_slice values at, at + 4)
+const U32.ByteEncode: ByteEncode U32 = { byte_width: func _ => 4, push_bytes: push_le_u32 }
+const U32.ByteDecode: ByteDecode U32 = { from_bytes: read_byte_u32 }
+const U32.ByteSliceDecode: ByteSliceDecode U32 = { from_byte_slice: read_byte_slice_u32 }
+
+func push_byte_i32 (v: I32) -> (out: own #[U8]): #[U8] => push_le_u32 (I32.to_u32 v) out
+func read_byte_i32 (values: #[U8]) -> (at: U32): Maybe (I32, U32) =>
+  if not (bytes_available values at 4):
+    return $Nothing
+  return $Some (U32.to_i32 (read_le_u32 values at), at + 4)
+func read_byte_slice_i32 (values: &[U8]) -> (at: U32): Maybe (I32, U32) =>
+  if not (byte_slice_available values at 4):
+    return $Nothing
+  return $Some (U32.to_i32 (read_le_u32_slice values at), at + 4)
+const I32.ByteEncode: ByteEncode I32 = { byte_width: func _ => 4, push_bytes: push_byte_i32 }
+const I32.ByteDecode: ByteDecode I32 = { from_bytes: read_byte_i32 }
+const I32.ByteSliceDecode: ByteSliceDecode I32 = { from_byte_slice: read_byte_slice_i32 }
+
+func read_byte_u64 (values: #[U8]) -> (at: U32): Maybe (U64, U32) =>
+  if not (bytes_available values at 8):
+    return $Nothing
+  return $Some (read_le_u64 values at, at + 8)
+func read_byte_slice_u64 (values: &[U8]) -> (at: U32): Maybe (U64, U32) =>
+  if not (byte_slice_available values at 8):
+    return $Nothing
+  return $Some (read_le_u64_slice values at, at + 8)
+const U64.ByteEncode: ByteEncode U64 = { byte_width: func _ => 8, push_bytes: push_le_u64 }
+const U64.ByteDecode: ByteDecode U64 = { from_bytes: read_byte_u64 }
+const U64.ByteSliceDecode: ByteSliceDecode U64 = { from_byte_slice: read_byte_slice_u64 }
+
+func push_byte_i64 (v: I64) -> (out: own #[U8]): #[U8] => push_le_u64 (I64.to_u64 v) out
+func read_byte_i64 (values: #[U8]) -> (at: U32): Maybe (I64, U32) =>
+  if not (bytes_available values at 8):
+    return $Nothing
+  return $Some (U64.to_i64 (read_le_u64 values at), at + 8)
+func read_byte_slice_i64 (values: &[U8]) -> (at: U32): Maybe (I64, U32) =>
+  if not (byte_slice_available values at 8):
+    return $Nothing
+  return $Some (U64.to_i64 (read_le_u64_slice values at), at + 8)
+const I64.ByteEncode: ByteEncode I64 = { byte_width: func _ => 8, push_bytes: push_byte_i64 }
+const I64.ByteDecode: ByteDecode I64 = { from_bytes: read_byte_i64 }
+const I64.ByteSliceDecode: ByteSliceDecode I64 = { from_byte_slice: read_byte_slice_i64 }
+
+func push_le_f32 (v: F32) -> (out: own #[U8]): #[U8] =>
+  use lanes.require (is_finite v)
+  return push_le_u32 (F32.to_bits v) out
+func read_byte_f32 (values: #[U8]) -> (at: U32): Maybe (F32, U32) =>
+  if not (bytes_available values at 4):
+    return $Nothing
+  let v = F32.from_bits (read_le_u32 values at)
+  if not (is_finite v):
+    return $Nothing
+  return $Some (v, at + 4)
+func read_byte_slice_f32 (values: &[U8]) -> (at: U32): Maybe (F32, U32) =>
+  if not (byte_slice_available values at 4):
+    return $Nothing
+  let v = F32.from_bits (read_le_u32_slice values at)
+  if not (is_finite v):
+    return $Nothing
+  return $Some (v, at + 4)
+const F32.ByteEncode: ByteEncode F32 = { byte_width: func _ => 4, push_bytes: push_le_f32 }
+const F32.ByteDecode: ByteDecode F32 = { from_bytes: read_byte_f32 }
+const F32.ByteSliceDecode: ByteSliceDecode F32 = { from_byte_slice: read_byte_slice_f32 }
+
+func push_le_f64 (v: F64) -> (out: own #[U8]): #[U8] =>
+  use lanes.require (F64.is_finite v)
+  return push_le_u64 (F64.to_bits v) out
+func read_byte_f64 (values: #[U8]) -> (at: U32): Maybe (F64, U32) =>
+  if not (bytes_available values at 8):
+    return $Nothing
+  let v = F64.from_bits (read_le_u64 values at)
+  if not (F64.is_finite v):
+    return $Nothing
+  return $Some (v, at + 8)
+func read_byte_slice_f64 (values: &[U8]) -> (at: U32): Maybe (F64, U32) =>
+  if not (byte_slice_available values at 8):
+    return $Nothing
+  let v = F64.from_bits (read_le_u64_slice values at)
+  if not (F64.is_finite v):
+    return $Nothing
+  return $Some (v, at + 8)
+const F64.ByteEncode: ByteEncode F64 = { byte_width: func _ => 8, push_bytes: push_le_f64 }
+const F64.ByteDecode: ByteDecode F64 = { from_bytes: read_byte_f64 }
+const F64.ByteSliceDecode: ByteSliceDecode F64 = { from_byte_slice: read_byte_slice_f64 }
+
+func push_byte_vec2 (v: Vec2) -> (out: own #[U8]): #[U8] =>
+  out := push_le_f32 v.x self
+  return push_le_f32 v.y out
+func read_byte_vec2 (values: #[U8]) -> (at: U32): Maybe (Vec2, U32) =>
+  let $Some (x, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (y, at) = read_byte_f32 values at else:
+    return $Nothing
+  return $Some ($Vec2 { x, y }, at)
+func read_byte_slice_vec2 (values: &[U8]) -> (at: U32): Maybe (Vec2, U32) =>
+  let $Some (x, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (y, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  return $Some ($Vec2 { x, y }, at)
+const Vec2.ByteEncode: ByteEncode Vec2 = { byte_width: func _ => 8, push_bytes: push_byte_vec2 }
+const Vec2.ByteDecode: ByteDecode Vec2 = { from_bytes: read_byte_vec2 }
+const Vec2.ByteSliceDecode: ByteSliceDecode Vec2 = { from_byte_slice: read_byte_slice_vec2 }
+
+func push_byte_vec3 (v: Vec3) -> (out: own #[U8]): #[U8] =>
+  out := push_le_f32 v.x self
+  out := push_le_f32 v.y self
+  return push_le_f32 v.z out
+func read_byte_vec3 (values: #[U8]) -> (at: U32): Maybe (Vec3, U32) =>
+  let $Some (x, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (y, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (z, at) = read_byte_f32 values at else:
+    return $Nothing
+  return $Some ($Vec3 { x, y, z }, at)
+func read_byte_slice_vec3 (values: &[U8]) -> (at: U32): Maybe (Vec3, U32) =>
+  let $Some (x, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (y, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (z, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  return $Some ($Vec3 { x, y, z }, at)
+const Vec3.ByteEncode: ByteEncode Vec3 = { byte_width: func _ => 12, push_bytes: push_byte_vec3 }
+const Vec3.ByteDecode: ByteDecode Vec3 = { from_bytes: read_byte_vec3 }
+const Vec3.ByteSliceDecode: ByteSliceDecode Vec3 = { from_byte_slice: read_byte_slice_vec3 }
+
+func push_byte_vec4 (v: math.Vec4) -> (out: own #[U8]): #[U8] =>
+  out := push_le_f32 v.x self
+  out := push_le_f32 v.y self
+  out := push_le_f32 v.z self
+  return push_le_f32 v.w out
+func read_byte_vec4 (values: #[U8]) -> (at: U32): Maybe (math.Vec4, U32) =>
+  let $Some (x, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (y, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (z, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (w, at) = read_byte_f32 values at else:
+    return $Nothing
+  return $Some ($math.Vec4 { x, y, z, w }, at)
+func read_byte_slice_vec4 (values: &[U8]) -> (at: U32): Maybe (math.Vec4, U32) =>
+  let $Some (x, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (y, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (z, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (w, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  return $Some ($math.Vec4 { x, y, z, w }, at)
+const Vec4.ByteEncode: ByteEncode math.Vec4 = { byte_width: func _ => 16, push_bytes: push_byte_vec4 }
+const Vec4.ByteDecode: ByteDecode math.Vec4 = { from_bytes: read_byte_vec4 }
+const Vec4.ByteSliceDecode: ByteSliceDecode math.Vec4 = { from_byte_slice: read_byte_slice_vec4 }
+
+func push_byte_quat (q: math.Quat) -> (out: own #[U8]): #[U8] =>
+  out := push_le_f32 q.x self
+  out := push_le_f32 q.y self
+  out := push_le_f32 q.z self
+  return push_le_f32 q.w out
+func read_byte_quat (values: #[U8]) -> (at: U32): Maybe (math.Quat, U32) =>
+  let $Some (x, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (y, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (z, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (w, at) = read_byte_f32 values at else:
+    return $Nothing
+  return $Some ($math.Quat { x, y, z, w }, at)
+func read_byte_slice_quat (values: &[U8]) -> (at: U32): Maybe (math.Quat, U32) =>
+  let $Some (x, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (y, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (z, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (w, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  return $Some ($math.Quat { x, y, z, w }, at)
+const Quat.ByteEncode: ByteEncode math.Quat = { byte_width: func _ => 16, push_bytes: push_byte_quat }
+const Quat.ByteDecode: ByteDecode math.Quat = { from_bytes: read_byte_quat }
+const Quat.ByteSliceDecode: ByteSliceDecode math.Quat = { from_byte_slice: read_byte_slice_quat }
+
+func push_byte_color (c: math.Color) -> (out: own #[U8]): #[U8] =>
+  out := push_le_f32 c.r self
+  out := push_le_f32 c.g self
+  out := push_le_f32 c.b self
+  return push_le_f32 c.a out
+func read_byte_color (values: #[U8]) -> (at: U32): Maybe (math.Color, U32) =>
+  let $Some (r, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (g, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (b, at) = read_byte_f32 values at else:
+    return $Nothing
+  let $Some (a, at) = read_byte_f32 values at else:
+    return $Nothing
+  return $Some ($math.Color { r, g, b, a }, at)
+func read_byte_slice_color (values: &[U8]) -> (at: U32): Maybe (math.Color, U32) =>
+  let $Some (r, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (g, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (b, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  let $Some (a, at) = read_byte_slice_f32 values at else:
+    return $Nothing
+  return $Some ($math.Color { r, g, b, a }, at)
+const Color.ByteEncode: ByteEncode math.Color = { byte_width: func _ => 16, push_bytes: push_byte_color }
+const Color.ByteDecode: ByteDecode math.Color = { from_bytes: read_byte_color }
+const Color.ByteSliceDecode: ByteSliceDecode math.Color = { from_byte_slice: read_byte_slice_color }
+
+func byte_count (value: t): U32 =>
+  let count: U32 = 0
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      count := self + ByteEncode.byte_width value.(field)
+  return count
+
+func encode_bytes (value: t): #[U8] =>
+  let out: #[U8] = Array.with_capacity (byte_count value)
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      out := ByteEncode.push_bytes value.(field) self
+  return out
+
+func decode_bytes (values: #[U8]): Maybe t =>
+  let at: U32 = 0
+  let built: t = #for field in #fields t:
+    #if field.has_tag $Skip:
+      break field.default
+    #else:
+      let $Some (value, next) = ByteDecode.from_bytes values at else:
+        return $Nothing
+      at := next
+      break value
+  if at != values.length:
+    return $Nothing
+  return $Some built
+
+func decode_bytes_slice (values: &[U8]): Maybe t =>
+  let at: U32 = 0
+  let built: t = #for field in #fields t:
+    #if field.has_tag $Skip:
+      break field.default
+    #else:
+      let $Some (value, next) = ByteSliceDecode.from_byte_slice values at else:
+        return $Nothing
+      at := next
+      break value
+  if at != values.length:
+    return $Nothing
+  return $Some built
+
 // Count non-Skip fields of a record type at compile time.
 func record_field_count (value: t): U32 =>
   let count: U32 = 0
@@ -556,6 +1014,53 @@ func decode_record (version: U32) -> (tag: U32) -> (words: #[U32]): Maybe t =>
       #else:
         id := this_ordinal
       let $Some (value, next) = read_field words cursor id else:
+        return $Nothing
+      cursor := next
+      break value
+  if cursor != words.length:
+    return $Nothing
+  return $Some built
+
+// Zero-copy slice header check + cursor reader paired with `encode_record`.
+func check_header_slice (version: U32) -> (tag: U32) -> (expected_fields: U32) -> (words: &[U32]): Bool =>
+  return words.length >= 3 and words[0] == version and words[1] == tag and words[2] == expected_fields
+
+func read_field_slice (words: &[U32]) -> (cursor: U32) -> (expected_id: U32): Maybe (a, U32) where { Codec a } =>
+  if cursor > words.length or words.length - cursor < 2:
+    return $Nothing
+  if words[cursor] != expected_id:
+    return $Nothing
+  let width = words[cursor + 1]
+  let start = cursor + 2
+  if width > words.length - start:
+    return $Nothing
+  let field_words = array.generate width (func i => words[start + i])
+  let decoded: Maybe a = Codec.decode field_words
+  let $Some value = decoded else:
+    return $Nothing
+  return $Some (value, start + width)
+
+func decode_record_slice (version: U32) -> (tag: U32) -> (words: &[U32]): Maybe t =>
+  let expected: U32 = 0
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      expected := self + 1
+  if not (check_header_slice version tag expected words):
+    return $Nothing
+  let cursor: U32 = 3
+  let ordinal: U32 = 1
+  let built: t = #for field in #fields t:
+    let this_ordinal = ordinal
+    ordinal := self + 1
+    #if field.has_tag $Skip:
+      break field.default
+    #else:
+      let id: U32 = 0
+      #if field.has_tag $FieldId:
+        id := field.tag $FieldId
+      #else:
+        id := this_ordinal
+      let $Some (value, next) = read_field_slice words cursor id else:
         return $Nothing
       cursor := next
       break value
